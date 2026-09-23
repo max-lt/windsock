@@ -1,13 +1,13 @@
 [package]
-name = "chunking"
+name = "pack"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
 model.workspace = true
+chunking.workspace = true
 blake3.workspace = true
-fastcdc.workspace = true
-ruzstd.workspace = true
+postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

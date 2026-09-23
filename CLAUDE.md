@@ -24,6 +24,7 @@ The daemon crate is `windsockd`.
 
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
+- `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
 
 ## Invariants
 
@@ -61,7 +62,7 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Chunking | `fastcdc` v5, `v2020` module |
 | Compression | `ruzstd`, level `Fastest` (standard zstd frames) |
 | Hex encoding | `hex` |
-| Serialization | `serde` |
+| Serialization | `serde`, `postcard` |
 | Errors | `thiserror` |
 
 Add a crate to this table when a milestone adds it.
@@ -81,6 +82,7 @@ Add a crate to this table when a milestone adds it.
 - Use `tempfile` for filesystem tests. Use `tokio::test` for async tests.
 - Name tests by behavior: `test_hex_roundtrip`, `test_parse_rejects_non_hex`.
 - Test public behavior. Do not copy the implementation logic into the test.
+- A golden test pins each storage format. It must not depend on the zstd encoder output.
 
 ## Bug fixes
 

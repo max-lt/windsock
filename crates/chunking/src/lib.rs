@@ -9,6 +9,7 @@ use std::io::Read;
 use model::ChunkId;
 use ruzstd::decoding::StreamingDecoder;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+use serde::{Deserialize, Serialize};
 
 /// Minimum chunk size, except for the last chunk of an input.
 pub const MIN_SIZE: usize = 16 * 1024;
@@ -28,7 +29,7 @@ pub struct Chunk<'a> {
 }
 
 /// How a chunk is stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
     None,
     Zstd,

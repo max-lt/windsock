@@ -10,10 +10,12 @@ publish = false
 [workspace.dependencies]
 model = { path = "crates/model" }
 chunking = { path = "crates/chunking" }
+pack = { path = "crates/pack" }
 
 blake3 = { version = "1", features = ["pure"] }
 fastcdc = "5"
 hex = "0.4"
+postcard = { version = "1", features = ["alloc"] }
 ruzstd = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

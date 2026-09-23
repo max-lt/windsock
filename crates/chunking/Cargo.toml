@@ -1,0 +1,12 @@
+[package]
+name = "chunking"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+model.workspace = true
+blake3.workspace = true
+fastcdc.workspace = true
+ruzstd.workspace = true
+thiserror.workspace = true

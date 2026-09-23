@@ -23,6 +23,7 @@ All crates live in `crates/<name>`. Crate names have no project prefix.
 The daemon crate is `windsockd`.
 
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
+- `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 
 ## Invariants
 
@@ -46,10 +47,19 @@ The daemon crate is `windsockd`.
 ## Dependencies
 
 No C dependencies. Read the `build.rs` of a crate before you add it.
-Two points are open: the TLS provider for B2, and the compression crate. See `../windsock-todo.md`.
+Check after each new dependency. The build must pass with no C compiler:
+
+```bash
+cargo clean && CC=/usr/bin/false CXX=/usr/bin/false cargo build
+```
+
+The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 
 | Purpose | Crate |
 |---|---|
+| Hashing | `blake3` with feature `pure` (the default build compiles C and asm) |
+| Chunking | `fastcdc` v5, `v2020` module |
+| Compression | `ruzstd`, level `Fastest` (standard zstd frames) |
 | Hex encoding | `hex` |
 | Serialization | `serde` |
 | Errors | `thiserror` |

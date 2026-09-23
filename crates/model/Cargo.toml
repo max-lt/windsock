@@ -1,0 +1,10 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true

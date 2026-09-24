@@ -25,6 +25,7 @@ The daemon crate is `windsockd`.
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
+- `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
 
 ## Invariants
 
@@ -61,9 +62,12 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Hashing | `blake3` with feature `pure` (the default build compiles C and asm) |
 | Chunking | `fastcdc` v5, `v2020` module |
 | Compression | `ruzstd`, level `Fastest` (standard zstd frames) |
+| Async | `tokio`, `async-trait` |
+| Buffers | `bytes` |
 | Hex encoding | `hex` |
 | Serialization | `serde`, `postcard` |
 | Errors | `thiserror` |
+| Tests | `tempfile` |
 
 Add a crate to this table when a milestone adds it.
 

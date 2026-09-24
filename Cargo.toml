@@ -11,14 +11,19 @@ publish = false
 model = { path = "crates/model" }
 chunking = { path = "crates/chunking" }
 pack = { path = "crates/pack" }
+remote = { path = "crates/remote" }
 
+async-trait = "0.1"
 blake3 = { version = "1", features = ["pure"] }
+bytes = "1"
 fastcdc = "5"
 hex = "0.4"
 postcard = { version = "1", features = ["alloc"] }
 ruzstd = "0.9"
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 thiserror = "2"
+tokio = "1"
 
 [profile.release]
 strip = true

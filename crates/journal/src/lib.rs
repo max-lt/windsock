@@ -4,6 +4,10 @@
 //! write. One entry per seq, so the chain cannot fork. A reader follows a chain
 //! from its frontier up to the first missing seq.
 //!
+//! Each entry also records the last entry of every other chain its writer had
+//! integrated (`seen`). `prev` and `seen` form a causal DAG with no merge
+//! entries: the next entry of a node is the join.
+//!
 //! `nodes/<n>` is an empty marker, written once, so readers can list the nodes.
 
 mod chain;
@@ -20,7 +24,9 @@ use remote::{Remote, RemoteError};
 use tracing::{debug, warn};
 
 pub use chain::{ChainError, Frontier};
-pub use entry::{Action, Entry, EntryHash, LOG_PREFIX, NODES_PREFIX, entry_key, node_key};
+pub use entry::{
+    Action, Entry, EntryHash, LOG_PREFIX, Link, NODES_PREFIX, Seen, entry_key, node_key,
+};
 
 use clock::HybridClock;
 
@@ -83,6 +89,21 @@ impl<R: Remote> Journal<R> {
             .unwrap_or(Frontier::GENESIS)
     }
 
+    /// Last entry of every other chain this journal has read.
+    fn seen(&self) -> Seen {
+        self.frontiers
+            .iter()
+            .filter(|(node, frontier)| **node != self.node && frontier.next_seq > 0)
+            .map(|(node, frontier)| {
+                let link = Link {
+                    seq: frontier.next_seq - 1,
+                    hash: frontier.last_hash,
+                };
+                (*node, link)
+            })
+            .collect()
+    }
+
     /// Appends an action to the own chain. Returns once the entry is in the remote.
     ///
     /// When another process with the same identity took the seq, this reads
@@ -95,6 +116,7 @@ impl<R: Remote> Journal<R> {
                 frontier.next_seq,
                 frontier.last_hash,
                 self.clock.tick(),
+                self.seen(),
                 action.clone(),
             );
             let bytes = postcard::to_allocvec(&entry).expect("an entry always serializes");
@@ -215,6 +237,14 @@ mod tests {
         }
     }
 
+    async fn overwrite(remote: &MemoryRemote, entry: &Entry) {
+        let bytes = postcard::to_allocvec(entry).unwrap();
+        remote
+            .put(&entry.remote_key(), Bytes::from(bytes))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_append_stores_a_signed_entry() {
         let remote = Arc::new(MemoryRemote::default());
@@ -225,8 +255,9 @@ mod tests {
         let stored = remote.get(&entry.remote_key()).await.unwrap().unwrap();
         let decoded: Entry = postcard::from_bytes(&stored).unwrap();
         assert_eq!(decoded, entry);
-        assert!(decoded.verify());
+        assert!(decoded.signature_is_valid());
         assert_eq!(entry.seq, 0);
+        assert!(entry.seen.is_empty());
         assert_eq!(a.frontier(a.node()).next_seq, 1);
         assert!(remote.get(&node_key(a.node())).await.unwrap().is_some());
     }
@@ -247,6 +278,26 @@ mod tests {
         assert!(entries.iter().all(|e| e.node == a.node()));
         assert_eq!(b.frontier(a.node()).next_seq, 3);
         assert!(b.sync_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_entry_records_what_the_writer_had_seen() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let mut b = journal(&remote, 2);
+        a.append(put("x")).await.unwrap();
+        let last_of_a = a.append(put("y")).await.unwrap();
+
+        b.sync_all().await.unwrap();
+        let from_b = b.append(put("z")).await.unwrap();
+        let from_a = a.append(put("w")).await.unwrap();
+
+        let expected = Link {
+            seq: 1,
+            hash: last_of_a.hash(),
+        };
+        assert_eq!(from_b.seen, Seen::from([(a.node(), expected)]));
+        assert!(from_a.seen.is_empty(), "a never read b");
     }
 
     #[tokio::test]
@@ -308,12 +359,8 @@ mod tests {
         let mut a = journal(&remote, 1);
         a.append(put("x")).await.unwrap();
         let mut forged = a.append(put("y")).await.unwrap();
-        forged.action = put("forged");
-        let bytes = postcard::to_allocvec(&forged).unwrap();
-        remote
-            .put(&forged.remote_key(), Bytes::from(bytes))
-            .await
-            .unwrap();
+        forged.action = Some(put("forged"));
+        overwrite(&remote, &forged).await;
 
         let mut b = journal(&remote, 2);
         let result = b.sync_node(a.node()).await;
@@ -321,11 +368,28 @@ mod tests {
         assert!(matches!(
             result,
             Err(JournalError::Chain {
-                source: ChainError::BadSignature { seq: 1 },
+                source: ChainError::ActionMismatch { seq: 1 },
                 ..
             })
         ));
         assert_eq!(b.frontier(a.node()), Frontier::GENESIS);
+    }
+
+    #[tokio::test]
+    async fn test_redacted_entry_keeps_the_chain_readable() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        a.append(put("x")).await.unwrap();
+        let secret = a.append(put("secret")).await.unwrap();
+        overwrite(&remote, &secret.redacted()).await;
+        a.append(put("z")).await.unwrap();
+
+        let mut b = journal(&remote, 2);
+        let entries = b.sync_node(a.node()).await.unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].action, None);
+        assert_eq!(entries[2].action, Some(put("z")));
     }
 
     #[tokio::test]
@@ -353,12 +417,8 @@ mod tests {
     async fn test_reader_stops_at_a_gap() {
         let remote = Arc::new(MemoryRemote::default());
         let a = journal(&remote, 1);
-        let orphan = Entry::sign(&key(1), 1, [0u8; 32], 5, put("x"));
-        let bytes = postcard::to_allocvec(&orphan).unwrap();
-        remote
-            .put(&orphan.remote_key(), Bytes::from(bytes))
-            .await
-            .unwrap();
+        let orphan = Entry::sign(&key(1), 1, [0u8; 32], 5, Seen::new(), put("x"));
+        overwrite(&remote, &orphan).await;
 
         let mut b = journal(&remote, 2);
 

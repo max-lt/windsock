@@ -26,7 +26,8 @@ The daemon crate is `windsockd`.
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
 - `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
-- `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), chain validation, HLC.
+- `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
+  chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `protocol-check`: Stateright model of the journal write and sync protocol. Its two slow tests are
   `#[ignore]`: run them in release on a build machine, never on the laptop.
 
@@ -36,6 +37,9 @@ The daemon crate is `windsockd`.
 - Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once.
 - Windsock never deletes a remote object.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
+- An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
+- An entry lists in `seen` the last entry of every other chain its writer had read. The index
+  applies an entry only after everything in its `seen`.
 - Write order: pack and manifest, then log entry. Each step is durable before the next step.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.

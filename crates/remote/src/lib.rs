@@ -24,6 +24,8 @@ pub enum RemoteError {
         end: u64,
         len: u64,
     },
+    #[error("object already exists: {0:?}")]
+    AlreadyExists(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -35,6 +37,9 @@ pub enum RemoteError {
 pub trait Remote: Send + Sync {
     /// Stores `data` at `key`. Replaces an existing object.
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError>;
+
+    /// Stores `data` at `key` when no object exists there. Two concurrent creates have one winner.
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError>;
 
     /// Returns the object at `key`, or `None` if it does not exist.
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError>;
@@ -165,6 +170,57 @@ mod tests {
                 }
 
                 #[tokio::test]
+                async fn test_create_writes_a_new_key() {
+                    let (_guard, remote) = $make;
+                    remote.create("log/a", Bytes::from("data")).await.unwrap();
+
+                    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "data");
+                }
+
+                #[tokio::test]
+                async fn test_create_keeps_the_existing_object() {
+                    let (_guard, remote) = $make;
+                    remote.put("log/a", Bytes::from("old")).await.unwrap();
+
+                    let result = remote.create("log/a", Bytes::from("new")).await;
+
+                    assert!(matches!(result, Err(RemoteError::AlreadyExists(_))));
+                    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "old");
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn test_concurrent_creates_have_one_winner() {
+                    let (_guard, remote) = $make;
+                    let remote = std::sync::Arc::new(remote);
+                    let mut tasks = tokio::task::JoinSet::new();
+
+                    for i in 0..8u8 {
+                        let remote = remote.clone();
+                        tasks.spawn(async move {
+                            remote
+                                .create("log/a", Bytes::from(vec![i]))
+                                .await
+                                .map(|()| i)
+                        });
+                    }
+
+                    let mut winners = Vec::new();
+                    while let Some(result) = tasks.join_next().await {
+                        match result.unwrap() {
+                            Ok(i) => winners.push(i),
+                            Err(RemoteError::AlreadyExists(_)) => {}
+                            Err(e) => panic!("{e}"),
+                        }
+                    }
+
+                    assert_eq!(winners.len(), 1);
+                    assert_eq!(
+                        remote.get("log/a").await.unwrap().unwrap(),
+                        vec![winners[0]]
+                    );
+                }
+
+                #[tokio::test]
                 async fn test_invalid_key_is_rejected() {
                     let (_guard, remote) = $make;
 
@@ -174,7 +230,14 @@ mod tests {
                                 remote.put(key, Bytes::new()).await,
                                 Err(RemoteError::InvalidKey(_))
                             ),
-                            "{key:?} was accepted"
+                            "{key:?} was accepted by put"
+                        );
+                        assert!(
+                            matches!(
+                                remote.create(key, Bytes::new()).await,
+                                Err(RemoteError::InvalidKey(_))
+                            ),
+                            "{key:?} was accepted by create"
                         );
                     }
 

@@ -23,6 +23,21 @@ impl Remote for MemoryRemote {
         Ok(())
     }
 
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        check_key(key)?;
+        let mut objects = self
+            .objects
+            .write()
+            .expect("no panic while the lock is held");
+
+        if objects.contains_key(key) {
+            return Err(RemoteError::AlreadyExists(key.to_string()));
+        }
+
+        objects.insert(key.to_string(), data);
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
         let objects = self

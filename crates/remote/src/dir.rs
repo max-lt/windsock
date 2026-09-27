@@ -1,4 +1,4 @@
-use std::io::SeekFrom;
+use std::io::{ErrorKind, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Remote in a local directory. Key `a/b` is the file `<root>/a/b`.
 ///
-/// Unlike S3, keys `a` and `a/b` cannot both exist.
+/// Unlike S3, keys `a` and `a/b` cannot both exist. `create` uses a hard link,
+/// so the filesystem must support them.
 pub struct DirRemote {
     root: PathBuf,
 }
@@ -33,10 +34,39 @@ impl DirRemote {
     }
 }
 
+fn parent_of(path: &Path) -> &Path {
+    path.parent().expect("a checked key has a parent in root")
+}
+
+/// Writes `data` to a fsynced temporary file next to `path`.
+///
+/// The dot prefix keeps a partial write out of `list`: keys never start with a dot.
+async fn write_temp(path: &Path, data: &[u8]) -> Result<PathBuf, RemoteError> {
+    let parent = parent_of(path);
+    tokio::fs::create_dir_all(parent).await?;
+
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".tmp.{}.{seq}", std::process::id()));
+
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(data).await?;
+    file.sync_all().await?;
+    Ok(tmp)
+}
+
+/// Without this, a crash can lose the new directory entry.
+async fn sync_parent(path: &Path) -> Result<(), RemoteError> {
+    tokio::fs::File::open(parent_of(path))
+        .await?
+        .sync_all()
+        .await?;
+    Ok(())
+}
+
 async fn open_file(path: &Path) -> Result<Option<tokio::fs::File>, RemoteError> {
     match tokio::fs::File::open(path).await {
         Ok(file) => Ok(Some(file)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -46,21 +76,28 @@ impl Remote for DirRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         check_key(key)?;
         let path = self.root.join(key);
-        let parent = path.parent().expect("a checked key has a parent in root");
-        tokio::fs::create_dir_all(parent).await?;
+        let tmp = write_temp(&path, &data).await?;
 
-        // The dot prefix keeps a partial write out of `list`: keys never start with a dot.
-        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".tmp.{}.{seq}", std::process::id()));
-
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(&data).await?;
-        file.sync_all().await?;
         tokio::fs::rename(&tmp, &path).await?;
+        sync_parent(&path).await
+    }
 
-        // Without this, a crash can lose the new directory entry.
-        tokio::fs::File::open(parent).await?.sync_all().await?;
-        Ok(())
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        check_key(key)?;
+        let path = self.root.join(key);
+        let tmp = write_temp(&path, &data).await?;
+
+        // link() fails when the target exists, so two creates have one winner.
+        let linked = tokio::fs::hard_link(&tmp, &path).await;
+        tokio::fs::remove_file(&tmp).await?;
+
+        match linked {
+            Ok(()) => sync_parent(&path).await,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                Err(RemoteError::AlreadyExists(key.to_string()))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
@@ -68,7 +105,7 @@ impl Remote for DirRemote {
 
         match tokio::fs::read(self.root.join(key)).await {
             Ok(data) => Ok(Some(Bytes::from(data))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -103,7 +140,7 @@ impl Remote for DirRemote {
         while let Some(dir) = dirs.pop() {
             let mut entries = match tokio::fs::read_dir(&dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
 

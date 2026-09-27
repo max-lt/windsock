@@ -1,0 +1,19 @@
+[package]
+name = "journal"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+model.workspace = true
+remote.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+ed25519-dalek.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -12,4 +12,4 @@ tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

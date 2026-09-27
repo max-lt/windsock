@@ -26,16 +26,19 @@ The daemon crate is `windsockd`.
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
 - `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
-- `protocol-check`: Stateright model of the journal write and sync protocol. Its tests are `#[ignore]`:
-  run them in release on a build machine, never on the laptop.
+- `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), chain validation, HLC.
+- `protocol-check`: Stateright model of the journal write and sync protocol. Its two slow tests are
+  `#[ignore]`: run them in release on a build machine, never on the laptop.
 
 ## Invariants
 
 - The remote is the source of truth. Local state is a cache. A proxy can rebuild it from the remote.
-- Remote objects are immutable, except `heads/<node_id>`. One proxy writes each head.
+- Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once.
 - Windsock never deletes a remote object.
-- Write order: pack and manifest, then log entry, then head. Each step is durable before the next step.
+- A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
+- Write order: pack and manifest, then log entry. Each step is durable before the next step.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
+- The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.
 
 ## Code style
 
@@ -69,6 +72,8 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Hex encoding | `hex` |
 | Serialization | `serde`, `postcard` |
 | Errors | `thiserror` |
+| Signatures | `ed25519-dalek` v2 |
+| Logging | `tracing` |
 | Tests | `tempfile` |
 | Model checking | `stateright` |
 

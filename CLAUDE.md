@@ -26,6 +26,8 @@ The daemon crate is `windsockd`.
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
 - `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
+- `protocol-check`: Stateright model of the journal write and sync protocol. Its tests are `#[ignore]`:
+  run them in release on a build machine, never on the laptop.
 
 ## Invariants
 
@@ -68,6 +70,7 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Serialization | `serde`, `postcard` |
 | Errors | `thiserror` |
 | Tests | `tempfile` |
+| Model checking | `stateright` |
 
 Add a crate to this table when a milestone adds it.
 

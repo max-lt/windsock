@@ -64,8 +64,8 @@ impl Frontier {
             return Err(ChainError::BadSignature { seq: entry.seq });
         }
 
-        if !entry.action_is_intact() {
-            return Err(ChainError::ActionMismatch { seq: entry.seq });
+        if !entry.actions_are_intact() {
+            return Err(ChainError::ActionsMismatch { seq: entry.seq });
         }
 
         Ok(Frontier {
@@ -93,8 +93,8 @@ pub enum ChainError {
     SelfLink { seq: u64 },
     #[error("entry {seq} has an invalid signature")]
     BadSignature { seq: u64 },
-    #[error("entry {seq} carries an action that was not signed")]
-    ActionMismatch { seq: u64 },
+    #[error("entry {seq} carries actions that were not signed")]
+    ActionsMismatch { seq: u64 },
 }
 
 #[cfg(test)]
@@ -122,7 +122,7 @@ mod tests {
     }
 
     fn sign(seed: u8, seq: u64, prev: EntryHash, hlc: u64) -> Entry {
-        Entry::sign(&key(seed), seq, prev, hlc, Seen::new(), put())
+        Entry::sign(&key(seed), seq, prev, hlc, Seen::new(), vec![put()])
     }
 
     #[test]
@@ -194,7 +194,7 @@ mod tests {
                 hash: [0u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(1), 0, [0u8; 32], 10, seen, put());
+        let entry = Entry::sign(&key(1), 0, [0u8; 32], 10, seen, vec![put()]);
 
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),
@@ -214,16 +214,16 @@ mod tests {
     }
 
     #[test]
-    fn test_swapped_action_is_rejected() {
+    fn test_swapped_actions_are_rejected() {
         let mut entry = sign(1, 0, [0u8; 32], 10);
-        entry.action = Some(Action::Delete {
+        entry.actions = Some(vec![Action::Delete {
             bucket: "b".into(),
             key: "k".into(),
-        });
+        }]);
 
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),
-            Err(ChainError::ActionMismatch { seq: 0 })
+            Err(ChainError::ActionsMismatch { seq: 0 })
         );
     }
 

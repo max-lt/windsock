@@ -13,12 +13,14 @@ chunking = { path = "crates/chunking" }
 pack = { path = "crates/pack" }
 remote = { path = "crates/remote" }
 journal = { path = "crates/journal" }
+index = { path = "crates/index" }
 
 async-trait = "0.1"
 blake3 = { version = "1", features = ["pure"] }
 bytes = "1"
 ed25519-dalek = "2"
 fastcdc = "5"
+fjall = "3"
 hex = "0.4"
 postcard = { version = "1", features = ["alloc"] }
 ruzstd = "0.9"

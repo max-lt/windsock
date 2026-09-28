@@ -36,6 +36,21 @@ const MAX_ATTEMPTS: u32 = 8;
 /// Frontier of every chain a journal has read.
 pub type Frontiers = BTreeMap<NodeId, Frontier>;
 
+/// Last entry of every chain in `frontiers`, except the chain of `own`.
+pub fn seen_from(frontiers: &Frontiers, own: NodeId) -> Seen {
+    frontiers
+        .iter()
+        .filter(|(node, frontier)| **node != own && frontier.next_seq > 0)
+        .map(|(node, frontier)| {
+            let link = Link {
+                seq: frontier.next_seq - 1,
+                hash: frontier.last_hash,
+            };
+            (*node, link)
+        })
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     #[error(transparent)]
@@ -89,26 +104,18 @@ impl<R: Remote> Journal<R> {
             .unwrap_or(Frontier::GENESIS)
     }
 
-    /// Last entry of every other chain this journal has read.
-    fn seen(&self) -> Seen {
-        self.frontiers
-            .iter()
-            .filter(|(node, frontier)| **node != self.node && frontier.next_seq > 0)
-            .map(|(node, frontier)| {
-                let link = Link {
-                    seq: frontier.next_seq - 1,
-                    hash: frontier.last_hash,
-                };
-                (*node, link)
-            })
-            .collect()
-    }
-
-    /// Appends an action to the own chain. Returns once the entry is in the remote.
+    /// Appends actions to the own chain as one entry. Returns once the entry is in the remote.
+    ///
+    /// `seen` is what the writer has applied from the other chains: build it with
+    /// [`seen_from`] on the applied frontiers, not on the read ones.
     ///
     /// When another process with the same identity took the seq, this reads
     /// what it wrote and retries after it.
-    pub async fn append(&mut self, action: Action) -> Result<Entry, JournalError> {
+    pub async fn append(
+        &mut self,
+        actions: Vec<Action>,
+        seen: Seen,
+    ) -> Result<Entry, JournalError> {
         for _ in 0..MAX_ATTEMPTS {
             let frontier = self.frontier(self.node);
             let entry = Entry::sign(
@@ -116,8 +123,8 @@ impl<R: Remote> Journal<R> {
                 frontier.next_seq,
                 frontier.last_hash,
                 self.clock.tick(),
-                self.seen(),
-                action.clone(),
+                seen.clone(),
+                actions.clone(),
             );
             let bytes = postcard::to_allocvec(&entry).expect("an entry always serializes");
 
@@ -250,7 +257,7 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
 
-        let entry = a.append(put("k")).await.unwrap();
+        let entry = a.append(vec![put("k")], Seen::new()).await.unwrap();
 
         let stored = remote.get(&entry.remote_key()).await.unwrap().unwrap();
         let decoded: Entry = postcard::from_bytes(&stored).unwrap();
@@ -268,7 +275,7 @@ mod tests {
         let mut a = journal(&remote, 1);
         let mut b = journal(&remote, 2);
         for k in ["x", "y", "z"] {
-            a.append(put(k)).await.unwrap();
+            a.append(vec![put(k)], Seen::new()).await.unwrap();
         }
 
         let entries = b.sync_all().await.unwrap();
@@ -285,12 +292,14 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
         let mut b = journal(&remote, 2);
-        a.append(put("x")).await.unwrap();
-        let last_of_a = a.append(put("y")).await.unwrap();
+        a.append(vec![put("x")], Seen::new()).await.unwrap();
+        let last_of_a = a.append(vec![put("y")], Seen::new()).await.unwrap();
 
         b.sync_all().await.unwrap();
-        let from_b = b.append(put("z")).await.unwrap();
-        let from_a = a.append(put("w")).await.unwrap();
+        let seen_by_b = seen_from(b.frontiers(), b.node());
+        let from_b = b.append(vec![put("z")], seen_by_b).await.unwrap();
+        let seen_by_a = seen_from(a.frontiers(), a.node());
+        let from_a = a.append(vec![put("w")], seen_by_a).await.unwrap();
 
         let expected = Link {
             seq: 1,
@@ -306,9 +315,18 @@ mod tests {
         let mut first = journal(&remote, 1);
         let mut zombie = journal(&remote, 1);
 
-        let e0 = first.append(put("from first")).await.unwrap();
-        let e1 = zombie.append(put("from zombie")).await.unwrap();
-        let e2 = first.append(put("from first again")).await.unwrap();
+        let e0 = first
+            .append(vec![put("from first")], Seen::new())
+            .await
+            .unwrap();
+        let e1 = zombie
+            .append(vec![put("from zombie")], Seen::new())
+            .await
+            .unwrap();
+        let e2 = first
+            .append(vec![put("from first again")], Seen::new())
+            .await
+            .unwrap();
 
         assert_eq!((e0.seq, e1.seq, e2.seq), (0, 1, 2));
         assert_eq!(e1.prev, e0.hash());
@@ -323,12 +341,12 @@ mod tests {
     async fn test_restart_with_lost_state_continues_the_chain() {
         let remote = Arc::new(MemoryRemote::default());
         let mut before = journal(&remote, 1);
-        before.append(put("x")).await.unwrap();
-        before.append(put("y")).await.unwrap();
+        before.append(vec![put("x")], Seen::new()).await.unwrap();
+        before.append(vec![put("y")], Seen::new()).await.unwrap();
         drop(before);
 
         let mut after = journal(&remote, 1);
-        let entry = after.append(put("z")).await.unwrap();
+        let entry = after.append(vec![put("z")], Seen::new()).await.unwrap();
 
         assert_eq!(entry.seq, 2);
         let mut reader = journal(&remote, 2);
@@ -340,12 +358,12 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
         let mut b = journal(&remote, 2);
-        a.append(put("x")).await.unwrap();
+        a.append(vec![put("x")], Seen::new()).await.unwrap();
         b.sync_all().await.unwrap();
         let saved = b.frontiers().clone();
         drop(b);
 
-        a.append(put("y")).await.unwrap();
+        a.append(vec![put("y")], Seen::new()).await.unwrap();
         let mut b = Journal::new(remote.clone(), key(2), saved);
         let entries = b.sync_all().await.unwrap();
 
@@ -357,9 +375,9 @@ mod tests {
     async fn test_tampered_entry_stops_the_reader() {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
-        a.append(put("x")).await.unwrap();
-        let mut forged = a.append(put("y")).await.unwrap();
-        forged.action = Some(put("forged"));
+        a.append(vec![put("x")], Seen::new()).await.unwrap();
+        let mut forged = a.append(vec![put("y")], Seen::new()).await.unwrap();
+        forged.actions = Some(vec![put("forged")]);
         overwrite(&remote, &forged).await;
 
         let mut b = journal(&remote, 2);
@@ -368,7 +386,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(JournalError::Chain {
-                source: ChainError::ActionMismatch { seq: 1 },
+                source: ChainError::ActionsMismatch { seq: 1 },
                 ..
             })
         ));
@@ -379,17 +397,17 @@ mod tests {
     async fn test_redacted_entry_keeps_the_chain_readable() {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
-        a.append(put("x")).await.unwrap();
-        let secret = a.append(put("secret")).await.unwrap();
+        a.append(vec![put("x")], Seen::new()).await.unwrap();
+        let secret = a.append(vec![put("secret")], Seen::new()).await.unwrap();
         overwrite(&remote, &secret.redacted()).await;
-        a.append(put("z")).await.unwrap();
+        a.append(vec![put("z")], Seen::new()).await.unwrap();
 
         let mut b = journal(&remote, 2);
         let entries = b.sync_node(a.node()).await.unwrap();
 
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[1].action, None);
-        assert_eq!(entries[2].action, Some(put("z")));
+        assert_eq!(entries[1].actions, None);
+        assert_eq!(entries[2].actions, Some(vec![put("z")]));
     }
 
     #[tokio::test]
@@ -417,7 +435,7 @@ mod tests {
     async fn test_reader_stops_at_a_gap() {
         let remote = Arc::new(MemoryRemote::default());
         let a = journal(&remote, 1);
-        let orphan = Entry::sign(&key(1), 1, [0u8; 32], 5, Seen::new(), put("x"));
+        let orphan = Entry::sign(&key(1), 1, [0u8; 32], 5, Seen::new(), vec![put("x")]);
         overwrite(&remote, &orphan).await;
 
         let mut b = journal(&remote, 2);
@@ -432,10 +450,10 @@ mod tests {
         let mut a = journal(&remote, 1);
         let mut b = journal(&remote, 2);
         a.clock.witness(u64::MAX / 2);
-        let from_a = a.append(put("x")).await.unwrap();
+        let from_a = a.append(vec![put("x")], Seen::new()).await.unwrap();
 
         b.sync_all().await.unwrap();
-        let from_b = b.append(put("y")).await.unwrap();
+        let from_b = b.append(vec![put("y")], Seen::new()).await.unwrap();
 
         assert!(from_b.hlc > from_a.hlc);
     }

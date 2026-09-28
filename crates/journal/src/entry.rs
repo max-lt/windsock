@@ -48,8 +48,8 @@ pub type Seen = BTreeMap<NodeId, Link>;
 
 /// One entry of a node chain, signed by the node.
 ///
-/// The signature covers `blake3(action)` and not the action itself, so a purge
-/// can drop the action and keep the chain valid.
+/// The signature covers `blake3(actions)` and not the actions themselves, so a
+/// purge can drop them and keep the chain valid.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub node: NodeId,
@@ -59,9 +59,9 @@ pub struct Entry {
     pub hlc: u64,
     /// `prev` and `seen` together form a causal DAG across chains.
     pub seen: Seen,
-    pub action_hash: [u8; 32],
-    /// `None` once a purge removed the action.
-    pub action: Option<Action>,
+    pub actions_hash: [u8; 32],
+    /// The mutations of this entry, in order. `None` once a purge removed them.
+    pub actions: Option<Vec<Action>>,
     /// ed25519 signature over the content hash, in two halves: serde has no `[u8; 64]`.
     signature: ([u8; 32], [u8; 32]),
 }
@@ -74,11 +74,11 @@ struct Content<'a> {
     prev: &'a EntryHash,
     hlc: u64,
     seen: &'a Seen,
-    action_hash: &'a [u8; 32],
+    actions_hash: &'a [u8; 32],
 }
 
-fn action_hash(action: &Action) -> [u8; 32] {
-    let bytes = postcard::to_allocvec(action).expect("an action always serializes");
+fn actions_hash(actions: &[Action]) -> [u8; 32] {
+    let bytes = postcard::to_allocvec(actions).expect("actions always serialize");
     *blake3::hash(&bytes).as_bytes()
 }
 
@@ -88,7 +88,7 @@ fn content_hash(
     prev: &EntryHash,
     hlc: u64,
     seen: &Seen,
-    action_hash: &[u8; 32],
+    actions_hash: &[u8; 32],
 ) -> EntryHash {
     let content = Content {
         node,
@@ -96,7 +96,7 @@ fn content_hash(
         prev,
         hlc,
         seen,
-        action_hash,
+        actions_hash,
     };
     let bytes = postcard::to_allocvec(&content).expect("an entry always serializes");
     *blake3::hash(&bytes).as_bytes()
@@ -110,11 +110,11 @@ impl Entry {
         prev: EntryHash,
         hlc: u64,
         seen: Seen,
-        action: Action,
+        actions: Vec<Action>,
     ) -> Self {
         let node = NodeId::from_bytes(key.verifying_key().to_bytes());
-        let action_hash = action_hash(&action);
-        let hash = content_hash(node, seq, &prev, hlc, &seen, &action_hash);
+        let actions_hash = actions_hash(&actions);
+        let hash = content_hash(node, seq, &prev, hlc, &seen, &actions_hash);
         let signature = key.sign(&hash).to_bytes();
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
@@ -127,8 +127,8 @@ impl Entry {
             prev,
             hlc,
             seen,
-            action_hash,
-            action: Some(action),
+            actions_hash,
+            actions: Some(actions),
             signature: (r, s),
         }
     }
@@ -141,7 +141,7 @@ impl Entry {
             &self.prev,
             self.hlc,
             &self.seen,
-            &self.action_hash,
+            &self.actions_hash,
         )
     }
 
@@ -160,17 +160,17 @@ impl Entry {
             .is_ok()
     }
 
-    /// Checks that the action, when present, is the one that was signed.
-    pub fn action_is_intact(&self) -> bool {
-        self.action
+    /// Checks that the actions, when present, are the ones that were signed.
+    pub fn actions_are_intact(&self) -> bool {
+        self.actions
             .as_ref()
-            .is_none_or(|action| action_hash(action) == self.action_hash)
+            .is_none_or(|actions| actions_hash(actions) == self.actions_hash)
     }
 
-    /// The same entry without its action. Its hash and signature do not change.
+    /// The same entry without its actions. Its hash and signature do not change.
     pub fn redacted(&self) -> Self {
         Self {
-            action: None,
+            actions: None,
             ..self.clone()
         }
     }
@@ -219,16 +219,16 @@ mod tests {
 
     #[test]
     fn test_signed_entry_verifies() {
-        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), put());
+        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
 
         assert!(entry.signature_is_valid());
-        assert!(entry.action_is_intact());
+        assert!(entry.actions_are_intact());
         assert_eq!(entry.node.as_bytes(), &key().verifying_key().to_bytes());
     }
 
     #[test]
     fn test_changed_content_fails_verification() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), put());
+        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
         entry.hlc += 1;
 
         assert!(!entry.signature_is_valid());
@@ -236,38 +236,38 @@ mod tests {
 
     #[test]
     fn test_changed_seen_fails_verification() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), put());
+        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
         entry.seen.clear();
 
         assert!(!entry.signature_is_valid());
     }
 
     #[test]
-    fn test_changed_action_is_not_intact() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), put());
-        entry.action = Some(Action::Delete {
+    fn test_changed_actions_are_not_intact() {
+        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        entry.actions = Some(vec![Action::Delete {
             bucket: "b".into(),
             key: "k".into(),
-        });
+        }]);
 
         assert!(entry.signature_is_valid());
-        assert!(!entry.action_is_intact());
+        assert!(!entry.actions_are_intact());
     }
 
     #[test]
     fn test_redacted_entry_keeps_hash_and_signature() {
-        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), put());
+        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
         let redacted = entry.redacted();
 
-        assert_eq!(redacted.action, None);
+        assert_eq!(redacted.actions, None);
         assert_eq!(redacted.hash(), entry.hash());
         assert!(redacted.signature_is_valid());
-        assert!(redacted.action_is_intact());
+        assert!(redacted.actions_are_intact());
     }
 
     #[test]
     fn test_entry_roundtrips_through_postcard() {
-        let entry = Entry::sign(&key(), 3, [9u8; 32], 42, seen(), put());
+        let entry = Entry::sign(&key(), 3, [9u8; 32], 42, seen(), vec![put()]);
         let bytes = postcard::to_allocvec(&entry).unwrap();
         let decoded: Entry = postcard::from_bytes(&bytes).unwrap();
 

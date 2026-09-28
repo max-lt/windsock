@@ -28,6 +28,8 @@ The daemon crate is `windsockd`.
 - `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
+- `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
+  (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers.
 - `protocol-check`: Stateright model of the journal write and sync protocol. Its two slow tests are
   `#[ignore]`: run them in release on a build machine, never on the laptop.
 
@@ -38,8 +40,10 @@ The daemon crate is `windsockd`.
 - Windsock never deletes a remote object.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
 - An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
-- An entry lists in `seen` the last entry of every other chain its writer had read. The index
-  applies an entry only after everything in its `seen`.
+- An entry lists in `seen` the last entry of every other chain its writer had applied (not read).
+  The index applies an entry only after everything in its `seen`.
+- Index state is a function of the set of applied entries, never of their order. A conflict is
+  computed (the head did not know another version), not stored.
 - Write order: pack and manifest, then log entry. Each step is durable before the next step.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.
@@ -78,6 +82,7 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Errors | `thiserror` |
 | Signatures | `ed25519-dalek` v2 |
 | Logging | `tracing` |
+| Local index | `fjall` v3 |
 | Tests | `tempfile` |
 | Model checking | `stateright` |
 

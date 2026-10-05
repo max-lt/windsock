@@ -82,6 +82,8 @@ pub enum EngineError {
     Contended(u32),
     #[error("the flush plan is older than half the GC horizon: plan again")]
     StalePlan,
+    #[error("broken chains: {0:?}")]
+    BrokenChains(Vec<NodeId>),
     #[error("corrupt data: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -124,6 +126,14 @@ pub struct Object {
     pub info: ObjectInfo,
     /// The requested range of the data.
     pub data: Bytes,
+}
+
+/// What one sync did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    pub applied: usize,
+    /// Chains that could not be read past their frontier. The other chains synced.
+    pub broken: Vec<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -608,12 +618,12 @@ impl<R: Remote + 'static> Engine<R> {
     // ------------------------------------------------------------------
 
     /// Reads the new entries of every chain and applies them. Returns the number applied.
-    pub async fn sync(&self) -> Result<usize> {
+    pub async fn sync(&self) -> Result<SyncReport> {
         let mut journal = self.journal.lock().await;
         self.sync_locked(&mut journal).await
     }
 
-    async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<usize> {
+    async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
         let started = Instant::now();
         *self
             .last_sync
@@ -632,35 +642,49 @@ impl<R: Remote + 'static> Engine<R> {
             entries = journal.sync_all().await?;
         }
 
-        let mut applied = 0;
+        let mut report = SyncReport {
+            broken: journal.broken().keys().copied().collect(),
+            ..SyncReport::default()
+        };
 
         if !entries.is_empty() {
             self.ingest(&entries).await?;
-            applied = self.index().apply(entries)?;
-            debug!(applied, "synced");
+            report.applied = self.index().apply(entries)?;
+            debug!(applied = report.applied, "synced");
         }
 
-        *self
-            .fresh_sync
-            .lock()
-            .expect("no panic while the lock is held") = Some(started);
-        Ok(applied)
+        // GC rule 1 needs every chain: a broken one can hide a condemn.
+        if report.broken.is_empty() {
+            *self
+                .fresh_sync
+                .lock()
+                .expect("no panic while the lock is held") = Some(started);
+        }
+
+        Ok(report)
     }
 
-    /// GC rule 1: dedup only against what a sync younger than H/2 found.
-    async fn ensure_fresh_sync(&self) -> Result<()> {
+    /// GC rule 1: dedup only against what a complete sync younger than H/2 found.
+    /// Returns `false` when no such sync exists: the flush then writes every chunk.
+    async fn ensure_fresh_sync(&self) -> Result<bool> {
         let mut journal = self.journal.lock().await;
-        let fresh = self
-            .fresh_sync
-            .lock()
-            .expect("no panic while the lock is held")
-            .is_some_and(|started| started.elapsed() < self.config.gc_horizon / 2);
+        let fresh = || {
+            self.fresh_sync
+                .lock()
+                .expect("no panic while the lock is held")
+                .is_some_and(|started| started.elapsed() < self.config.gc_horizon / 2)
+        };
 
-        if !fresh {
-            self.sync_locked(&mut journal).await?;
+        if fresh() {
+            return Ok(true);
         }
 
-        Ok(())
+        let report = self.sync_locked(&mut journal).await?;
+        if !report.broken.is_empty() {
+            warn!(broken = ?report.broken, "flush without dedup: a chain is broken");
+        }
+
+        Ok(fresh())
     }
 
     fn plan_is_stale(&self, planned_at: u64) -> bool {
@@ -820,7 +844,7 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     async fn flush_segments(&self, segments: &[u64]) -> Result<()> {
-        self.ensure_fresh_sync().await?;
+        let dedup = self.ensure_fresh_sync().await?;
         let planned_at = buffer::unix_nanos();
         let seed = blake3::Hasher::new()
             .update(self.node.as_bytes())
@@ -850,6 +874,9 @@ impl<R: Remote + 'static> Engine<R> {
                         let policy = self.config.policy(&bucket, &key);
                         let closed =
                             planner.add(&record.data, content_hash, metadata, policy, |id| {
+                                if !dedup {
+                                    return Ok(None);
+                                }
                                 self.stored_chunk(id)
                             })?;
                         self.upload_packs(closed).await?;

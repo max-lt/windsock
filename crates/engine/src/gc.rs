@@ -41,7 +41,12 @@ impl<R: Sweep + 'static> Engine<R> {
     /// Runs the GC once. Run it on one proxy only: two runners are safe, but cost twice.
     pub async fn gc(&self) -> Result<GcReport> {
         let started = buffer::unix_nanos();
-        self.sync().await?;
+        // A broken chain can hold puts of packs that look dead, and it pins the stable HLC.
+        let sync = self.sync().await?;
+        if !sync.broken.is_empty() {
+            warn!(broken = ?sync.broken, "gc refused: a chain is broken");
+            return Err(EngineError::BrokenChains(sync.broken));
+        }
 
         let horizon = self.config.gc_horizon.as_nanos() as u64;
         let retention = self.config.retention.as_nanos() as u64;

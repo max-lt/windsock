@@ -119,6 +119,11 @@ async fn get(engine: &Engine<TestRemote>, key: &str) -> Result<Vec<u8>, EngineEr
     Ok(engine.get(BUCKET, key, None).await?.data.to_vec())
 }
 
+async fn keys(engine: &Engine<TestRemote>) -> Vec<String> {
+    let listed = engine.list(BUCKET, "").await.unwrap();
+    listed.into_iter().map(|info| info.key).collect()
+}
+
 async fn count(remote: &TestRemote, prefix: &str) -> usize {
     remote.list(prefix).await.unwrap().len()
 }
@@ -339,6 +344,63 @@ async fn test_old_intent_that_was_written_is_not_written_again() {
     assert_eq!(count(&remote, "log/").await, 1);
     assert_eq!(count(&remote, "packs/").await, 1);
     assert_eq!(get(&a.engine, "k").await.unwrap(), b"data");
+}
+
+/// One broken chain among three: the two others sync, the GC refuses to run,
+/// and a flush does not dedup. Once the chain reads back whole, all goes on.
+#[tokio::test]
+async fn test_broken_chain_fails_alone_and_recovers() {
+    let remote = Arc::new(TestRemote::default());
+    let writers = [
+        proxy(&remote, 1).await,
+        proxy(&remote, 2).await,
+        proxy(&remote, 3).await,
+    ];
+    writers[0].engine.create_bucket(BUCKET, None).await.unwrap();
+    writers[0].engine.flush().await.unwrap();
+    for (i, writer) in writers.iter().enumerate() {
+        put(
+            &writer.engine,
+            &format!("k{i}"),
+            &random_bytes(i as u8, 1000),
+        )
+        .await;
+        writer.engine.flush().await.unwrap();
+    }
+    let broken = writers[2].engine.node();
+    let key = journal::entry_key(broken, 0);
+    let good = remote.get(&key).await.unwrap().unwrap();
+    let mut tampered: journal::Entry = postcard::from_bytes(&good).unwrap();
+    tampered.actions = Some(vec![]);
+    remote
+        .put(&key, Bytes::from(postcard::to_allocvec(&tampered).unwrap()))
+        .await
+        .unwrap();
+
+    let reader = proxy(&remote, 4).await;
+    let report = reader.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, [broken]);
+    assert_eq!(keys(&reader.engine).await, ["k0", "k1"]);
+    assert!(matches!(
+        reader.engine.gc().await,
+        Err(EngineError::BrokenChains(nodes)) if nodes == [broken]
+    ));
+    let packs = count(&remote, "packs/").await;
+    put(&reader.engine, "copy", &random_bytes(0, 1000)).await;
+    reader.engine.flush().await.unwrap();
+    assert_eq!(
+        count(&remote, "packs/").await,
+        packs + 1,
+        "no dedup with a broken chain"
+    );
+
+    remote.put(&key, good).await.unwrap();
+    let report = reader.engine.sync().await.unwrap();
+
+    assert!(report.broken.is_empty());
+    assert_eq!(keys(&reader.engine).await, ["copy", "k0", "k1", "k2"]);
+    reader.engine.gc().await.unwrap();
 }
 
 /// A chain whose HLC runs far ahead of the GC clock raises the stable HLC past real

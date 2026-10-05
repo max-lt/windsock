@@ -77,7 +77,7 @@ impl Frontier {
 }
 
 /// An entry does not extend the chain it was read from.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ChainError {
     #[error("entry {seq} is not a valid entry")]
     Malformed { seq: u64 },

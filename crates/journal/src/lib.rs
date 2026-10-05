@@ -78,6 +78,8 @@ pub struct Journal<R> {
     frontiers: Frontiers,
     /// Own-chain entries read while a commit resolved a taken seq, not yet returned.
     stashed: Vec<Entry>,
+    /// Chains that the last sync found broken. The other chains go on.
+    broken: BTreeMap<NodeId, ChainError>,
     registered: bool,
 }
 
@@ -96,6 +98,7 @@ impl<R: Remote> Journal<R> {
             clock: HybridClock::default(),
             frontiers,
             stashed: Vec::new(),
+            broken: BTreeMap::new(),
             registered: false,
         }
     }
@@ -246,6 +249,11 @@ impl<R: Remote> Journal<R> {
         Ok(entries)
     }
 
+    /// Chains that the last `sync_all` could not read past their frontier, and why.
+    pub fn broken(&self) -> &BTreeMap<NodeId, ChainError> {
+        &self.broken
+    }
+
     /// Reads again from `frontiers`, as after a snapshot load.
     pub fn reset(&mut self, frontiers: Frontiers) {
         self.frontiers = frontiers;
@@ -258,7 +266,8 @@ impl<R: Remote> Journal<R> {
     }
 
     /// Syncs every known node and every node with a marker. Returns the new
-    /// entries, stashed ones first.
+    /// entries, stashed ones first. A broken chain is skipped and listed in
+    /// [`Journal::broken`]; a remote error stops the sync.
     pub async fn sync_all(&mut self) -> Result<Vec<Entry>, JournalError> {
         let mut nodes: BTreeSet<NodeId> = self.frontiers.keys().copied().collect();
 
@@ -271,7 +280,18 @@ impl<R: Remote> Journal<R> {
         let mut entries = self.take_stashed();
 
         for node in nodes {
-            entries.extend(self.sync_node(node).await?);
+            match self.sync_node(node).await {
+                Ok(read) => {
+                    self.broken.remove(&node);
+                    entries.extend(read);
+                }
+                // One bad chain must not stop the sync of every chain.
+                Err(JournalError::Chain { node, source }) => {
+                    warn!(%node, %source, "chain is broken: the other chains go on");
+                    self.broken.insert(node, source);
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(entries)
@@ -583,6 +603,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_broken_chain_does_not_stop_the_other_chains() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let mut b = journal(&remote, 2);
+        let mut c = journal(&remote, 3);
+        a.append(vec![put("a")], Seen::new()).await.unwrap();
+        c.append(vec![put("c0")], Seen::new()).await.unwrap();
+        let mut tampered = c.append(vec![put("c1")], Seen::new()).await.unwrap();
+        b.append(vec![put("b")], Seen::new()).await.unwrap();
+        tampered.actions = Some(vec![put("forged")]);
+        overwrite(&remote, &tampered).await;
+
+        let mut reader = journal(&remote, 9);
+        let entries = reader.sync_all().await.unwrap();
+
+        let nodes: BTreeSet<_> = entries.iter().map(|e| e.node).collect();
+        assert_eq!(nodes, BTreeSet::from([a.node(), b.node()]));
+        assert_eq!(
+            reader.broken().keys().copied().collect::<Vec<_>>(),
+            [c.node()]
+        );
+        assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
+    }
+
+    #[tokio::test]
+    async fn test_fixed_chain_syncs_again() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut c = journal(&remote, 3);
+        let good = c.append(vec![put("c0")], Seen::new()).await.unwrap();
+        let mut tampered = good.clone();
+        tampered.actions = Some(vec![put("forged")]);
+        overwrite(&remote, &tampered).await;
+        let mut reader = journal(&remote, 9);
+        assert!(reader.sync_all().await.unwrap().is_empty());
+        assert!(reader.broken().contains_key(&c.node()));
+
+        overwrite(&remote, &good).await;
+        let entries = reader.sync_all().await.unwrap();
+
+        assert_eq!(entries, vec![good]);
+        assert!(reader.broken().is_empty());
     }
 
     #[tokio::test]

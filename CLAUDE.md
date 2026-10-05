@@ -54,6 +54,9 @@ The daemon crate is `windsockd`.
 - A fresh upload gets a new remote key (a nonce in packs and manifests). A deleted key is never
   written again.
 - A proxy that applied a condemn of a pack never learns that pack again.
+- A broken chain fails alone: a sync reads the other chains and names the broken one. The GC
+  refuses to run while a chain is broken. GC rule 1 counts only a sync with no broken chain: without
+  one, a flush writes every chunk and dedups nothing.
 - An index never applies a redacted entry. A proxy with no state, or one that meets a redacted
   entry, loads the latest snapshot and reads the chains from its frontiers.
 - Clock assumption: no proxy clock is more than R (version retention, 24 h) away from the others.

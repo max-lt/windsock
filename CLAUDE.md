@@ -30,6 +30,8 @@ The daemon crate is `windsockd`.
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers.
+- `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
+  policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss.
 - `protocol-check`: Stateright model of the journal write and sync protocol. Its two slow tests are
   `#[ignore]`: run them in release on a build machine, never on the laptop.
 
@@ -45,6 +47,9 @@ The daemon crate is `windsockd`.
 - Index state is a function of the set of applied entries, never of their order. A conflict is
   computed (the head did not know another version), not stored.
 - Write order: pack and manifest, then log entry. Each step is durable before the next step.
+- A write is acknowledged once fsynced in the local buffer. The buffer drops it only after its
+  log entry is in the remote and applied to the index.
+- A signed entry goes to the intent file before its create. A restart retries that entry before it signs a new one.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.
 

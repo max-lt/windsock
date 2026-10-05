@@ -174,6 +174,7 @@ mod tests {
             bucket: "b".into(),
             key: "k".into(),
             manifest_id: manifest(seed),
+            inline_manifest: None,
         };
         Entry::sign(&key(seed), seq, [0u8; 32], hlc, seen, vec![action])
     }

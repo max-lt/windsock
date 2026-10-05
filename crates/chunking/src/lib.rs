@@ -58,6 +58,15 @@ pub fn chunks(data: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
     })
 }
 
+/// Splits `data` into chunks of [`MAX_SIZE`] bytes, the last one shorter. Empty input gives no chunks.
+pub fn fixed_chunks(data: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
+    data.chunks(MAX_SIZE).enumerate().map(|(i, bytes)| Chunk {
+        id: chunk_id(bytes),
+        offset: i * MAX_SIZE,
+        data: bytes,
+    })
+}
+
 /// Returns the ID of a raw chunk.
 pub fn chunk_id(raw: &[u8]) -> ChunkId {
     ChunkId::from_bytes(*blake3::hash(raw).as_bytes())
@@ -144,6 +153,20 @@ mod tests {
         }
 
         assert_eq!(rebuilt, data);
+    }
+
+    #[test]
+    fn test_fixed_chunks_cover_input() {
+        let data = random_bytes(7, 2 * MAX_SIZE + 10);
+        let all: Vec<_> = fixed_chunks(&data).collect();
+
+        assert_eq!(
+            all.iter().map(|c| c.data.len()).collect::<Vec<_>>(),
+            [MAX_SIZE, MAX_SIZE, 10]
+        );
+        assert_eq!(all[2].offset, 2 * MAX_SIZE);
+        assert_eq!(all[1].id, chunk_id(&data[MAX_SIZE..2 * MAX_SIZE]));
+        assert_eq!(fixed_chunks(b"").count(), 0);
     }
 
     #[test]

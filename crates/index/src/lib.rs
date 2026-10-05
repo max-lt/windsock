@@ -52,6 +52,7 @@ pub struct Index {
     objects: Keyspace,
     buckets: Keyspace,
     chunks: Keyspace,
+    manifests: Keyspace,
     pending: Vec<Entry>,
     _temp: Option<tempfile::TempDir>,
 }
@@ -96,6 +97,7 @@ impl Index {
             objects: db.keyspace("objects", KeyspaceCreateOptions::default)?,
             buckets: db.keyspace("buckets", KeyspaceCreateOptions::default)?,
             chunks: db.keyspace("chunks", KeyspaceCreateOptions::default)?,
+            manifests: db.keyspace("manifests", KeyspaceCreateOptions::default)?,
             db,
             pending: Vec::new(),
             _temp: temp,
@@ -226,6 +228,7 @@ impl Index {
                     bucket,
                     key,
                     manifest_id,
+                    ..
                 } => self.record_version(&mut batch, entry, bucket, key, Some(*manifest_id))?,
                 Action::Delete { bucket, key } => {
                     self.record_version(&mut batch, entry, bucket, key, None)?
@@ -356,6 +359,23 @@ impl Index {
             None => None,
         })
     }
+
+    // ------------------------------------------------------------------
+    // Manifests
+    // ------------------------------------------------------------------
+
+    /// Stores the bytes of a manifest. The caller checks them against `id`.
+    pub fn put_manifest(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
+        self.manifests.insert(id.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    pub fn manifest(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .manifests
+            .get(id.as_bytes())?
+            .map(|value| value.to_vec()))
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +405,7 @@ mod tests {
             bucket: "b".into(),
             key: key.into(),
             manifest_id: manifest(n),
+            inline_manifest: None,
         }]
     }
 
@@ -613,21 +634,25 @@ mod tests {
                     bucket: "b".into(),
                     key: "a/1".into(),
                     manifest_id: manifest(1),
+                    inline_manifest: None,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "a/2".into(),
                     manifest_id: manifest(2),
+                    inline_manifest: None,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "c".into(),
                     manifest_id: manifest(3),
+                    inline_manifest: None,
                 },
                 Action::Put {
                     bucket: "ba".into(),
                     key: "a/3".into(),
                     manifest_id: manifest(4),
+                    inline_manifest: None,
                 },
             ],
         );
@@ -644,6 +669,52 @@ mod tests {
         assert_eq!(keys, ["a/1", "a/2"]);
         assert_eq!(index.list("b", "").unwrap().len(), 3);
         assert_eq!(index.list("ba", "").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_last_action_on_a_name_in_one_entry_wins() {
+        let mut index = Index::open_temporary().unwrap();
+        let entry = Entry::sign(
+            &key(1),
+            0,
+            [0u8; 32],
+            1,
+            Seen::new(),
+            vec![
+                Action::CreateBucket {
+                    bucket: "b".into(),
+                    owner: None,
+                },
+                Action::Put {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    manifest_id: manifest(1),
+                    inline_manifest: None,
+                },
+                Action::Put {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    manifest_id: manifest(2),
+                    inline_manifest: None,
+                },
+                Action::DeleteBucket { bucket: "b".into() },
+            ],
+        );
+
+        index.apply(vec![entry]).unwrap();
+
+        assert_eq!(index.resolve("b", "k").unwrap(), Some(manifest(2)));
+        assert!(!index.bucket("b").unwrap().unwrap().exists);
+    }
+
+    #[test]
+    fn test_manifest_roundtrip() {
+        let index = Index::open_temporary().unwrap();
+
+        index.put_manifest(manifest(1), b"bytes").unwrap();
+
+        assert_eq!(index.manifest(manifest(1)).unwrap().unwrap(), b"bytes");
+        assert_eq!(index.manifest(manifest(2)).unwrap(), None);
     }
 
     #[test]

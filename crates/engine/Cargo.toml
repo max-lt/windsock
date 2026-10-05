@@ -1,0 +1,26 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+model.workspace = true
+chunking.workspace = true
+pack.workspace = true
+remote.workspace = true
+journal.workspace = true
+index.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+ed25519-dalek.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

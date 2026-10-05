@@ -51,6 +51,14 @@ pub fn seen_from(frontiers: &Frontiers, own: NodeId) -> Seen {
         .collect()
 }
 
+/// Outcome of [`Journal::commit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit {
+    Written,
+    /// Another entry holds the seq. Prepare the actions again and retry.
+    SeqTaken,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     #[error(transparent)]
@@ -68,6 +76,8 @@ pub struct Journal<R> {
     node: NodeId,
     clock: HybridClock,
     frontiers: Frontiers,
+    /// Own-chain entries read while a commit resolved a taken seq, not yet returned.
+    stashed: Vec<Entry>,
     registered: bool,
 }
 
@@ -85,6 +95,7 @@ impl<R: Remote> Journal<R> {
             node,
             clock: HybridClock::default(),
             frontiers,
+            stashed: Vec::new(),
             registered: false,
         }
     }
@@ -117,43 +128,86 @@ impl<R: Remote> Journal<R> {
         seen: Seen,
     ) -> Result<Entry, JournalError> {
         for _ in 0..MAX_ATTEMPTS {
-            let frontier = self.frontier(self.node);
-            let entry = Entry::sign(
-                &self.signing_key,
-                frontier.next_seq,
-                frontier.last_hash,
-                self.clock.tick(),
-                seen.clone(),
-                actions.clone(),
-            );
-            let bytes = postcard::to_allocvec(&entry).expect("an entry always serializes");
+            let entry = self.prepare(actions.clone(), seen.clone());
 
-            match self
-                .remote
-                .create(&entry.remote_key(), Bytes::from(bytes))
-                .await
-            {
-                Ok(()) => {
-                    let next = frontier
-                        .extend(self.node, &entry)
-                        .expect("a fresh entry extends the frontier it was built from");
-                    self.frontiers.insert(self.node, next);
-                    self.register().await;
-                    debug!(seq = entry.seq, "appended entry");
-                    return Ok(entry);
-                }
-                Err(RemoteError::AlreadyExists(_)) => {
-                    warn!(
-                        seq = entry.seq,
-                        "seq taken by another process with this identity"
-                    );
-                    self.sync_node(self.node).await?;
-                }
-                Err(e) => return Err(e.into()),
+            match self.commit(&entry).await? {
+                Commit::Written => return Ok(entry),
+                Commit::SeqTaken => continue,
             }
         }
 
         Err(JournalError::Contended(MAX_ATTEMPTS))
+    }
+
+    /// Signs actions as the next entry of the own chain, without writing it.
+    pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Entry {
+        let frontier = self.frontier(self.node);
+
+        Entry::sign(
+            &self.signing_key,
+            frontier.next_seq,
+            frontier.last_hash,
+            self.clock.tick(),
+            seen,
+            actions,
+        )
+    }
+
+    /// Writes a prepared entry. Safe to call again with the same entry after a
+    /// crash or an ambiguous error: an entry already in the remote counts as written.
+    pub async fn commit(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
+        let bytes = postcard::to_allocvec(entry).expect("an entry always serializes");
+
+        match self
+            .remote
+            .create(&entry.remote_key(), Bytes::from(bytes))
+            .await
+        {
+            Ok(()) => {
+                self.advance_own(entry).await?;
+                self.register().await;
+                debug!(seq = entry.seq, "appended entry");
+                Ok(Commit::Written)
+            }
+            Err(RemoteError::AlreadyExists(_)) => self.resolve_taken_seq(entry).await,
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn advance_own(&mut self, entry: &Entry) -> Result<(), JournalError> {
+        match self.frontier(self.node).extend(self.node, entry) {
+            Ok(next) => {
+                self.frontiers.insert(self.node, next);
+            }
+            // The own frontier is behind the entry: a restart lost it.
+            Err(_) => {
+                let read = self.sync_node(self.node).await?;
+                self.stashed.extend(read);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_taken_seq(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
+        let read = self.sync_node(self.node).await?;
+        self.stashed.extend(read);
+
+        let stored = self.remote.get(&entry.remote_key()).await?;
+        let ours = stored
+            .and_then(|bytes| postcard::from_bytes::<Entry>(&bytes).ok())
+            .is_some_and(|stored| stored.hash() == entry.hash());
+
+        if ours {
+            self.register().await;
+            return Ok(Commit::Written);
+        }
+
+        warn!(
+            seq = entry.seq,
+            "seq taken by another process with this identity"
+        );
+        Ok(Commit::SeqTaken)
     }
 
     /// Reads the chain of `node` from its frontier up to the first missing seq.
@@ -189,7 +243,13 @@ impl<R: Remote> Journal<R> {
         Ok(entries)
     }
 
-    /// Syncs every known node and every node with a marker. Returns the new entries.
+    /// Own-chain entries that a commit read and that no sync returned yet.
+    pub fn take_stashed(&mut self) -> Vec<Entry> {
+        std::mem::take(&mut self.stashed)
+    }
+
+    /// Syncs every known node and every node with a marker. Returns the new
+    /// entries, stashed ones first.
     pub async fn sync_all(&mut self) -> Result<Vec<Entry>, JournalError> {
         let mut nodes: BTreeSet<NodeId> = self.frontiers.keys().copied().collect();
 
@@ -199,7 +259,7 @@ impl<R: Remote> Journal<R> {
             }
         }
 
-        let mut entries = Vec::new();
+        let mut entries = self.take_stashed();
 
         for node in nodes {
             entries.extend(self.sync_node(node).await?);
@@ -241,6 +301,7 @@ mod tests {
             bucket: "b".into(),
             key: key.into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
+            inline_manifest: None,
         }
     }
 
@@ -335,6 +396,72 @@ mod tests {
         let mut reader = journal(&remote, 3);
         let entries = reader.sync_node(first.node()).await.unwrap();
         assert_eq!(entries, vec![e0, e1, e2]);
+    }
+
+    #[tokio::test]
+    async fn test_commit_of_a_written_entry_is_idempotent() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let entry = a.prepare(vec![put("k")], Seen::new());
+
+        assert_eq!(a.commit(&entry).await.unwrap(), Commit::Written);
+        assert_eq!(a.commit(&entry).await.unwrap(), Commit::Written);
+
+        let mut reader = journal(&remote, 2);
+        assert_eq!(reader.sync_node(a.node()).await.unwrap(), vec![entry]);
+        assert_eq!(a.frontier(a.node()).next_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_after_restart_finds_the_written_entry() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut before = journal(&remote, 1);
+        let entry = before.prepare(vec![put("k")], Seen::new());
+        before.commit(&entry).await.unwrap();
+        drop(before);
+
+        let mut after = journal(&remote, 1);
+
+        assert_eq!(after.commit(&entry).await.unwrap(), Commit::Written);
+        assert_eq!(after.frontier(after.node()).next_seq, 1);
+        assert_eq!(after.frontier(after.node()).last_hash, entry.hash());
+    }
+
+    #[tokio::test]
+    async fn test_prepared_entry_loses_its_seq_to_another_process() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut first = journal(&remote, 1);
+        let mut zombie = journal(&remote, 1);
+        let prepared = first.prepare(vec![put("from first")], Seen::new());
+        zombie
+            .append(vec![put("from zombie")], Seen::new())
+            .await
+            .unwrap();
+
+        assert_eq!(first.commit(&prepared).await.unwrap(), Commit::SeqTaken);
+        assert_eq!(first.frontier(first.node()).next_seq, 1);
+
+        let retried = first.prepare(vec![put("from first")], Seen::new());
+        assert_eq!(retried.seq, 1);
+        assert_eq!(first.commit(&retried).await.unwrap(), Commit::Written);
+    }
+
+    #[tokio::test]
+    async fn test_entries_read_by_a_commit_come_back_from_the_next_sync() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut first = journal(&remote, 1);
+        let mut zombie = journal(&remote, 1);
+        let prepared = first.prepare(vec![put("from first")], Seen::new());
+        let from_zombie = zombie
+            .append(vec![put("from zombie")], Seen::new())
+            .await
+            .unwrap();
+        first.commit(&prepared).await.unwrap();
+
+        let entries = first.sync_all().await.unwrap();
+
+        assert_eq!(entries, vec![from_zombie]);
+        assert!(first.sync_all().await.unwrap().is_empty());
     }
 
     #[tokio::test]

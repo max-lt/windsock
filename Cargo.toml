@@ -14,6 +14,7 @@ pack = { path = "crates/pack" }
 remote = { path = "crates/remote" }
 journal = { path = "crates/journal" }
 index = { path = "crates/index" }
+engine = { path = "crates/engine" }
 
 async-trait = "0.1"
 blake3 = { version = "1", features = ["pure"] }

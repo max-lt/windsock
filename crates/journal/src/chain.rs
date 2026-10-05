@@ -118,6 +118,7 @@ mod tests {
             bucket: "b".into(),
             key: "k".into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
+            inline_manifest: None,
         }
     }
 

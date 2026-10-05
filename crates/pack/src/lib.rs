@@ -11,6 +11,7 @@
 //!
 //! The PackId is the blake3 hash of the whole pack.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -85,13 +86,18 @@ impl Default for PackBuilder {
 }
 
 impl PackBuilder {
-    /// Compresses and appends a chunk. Returns its entry.
-    pub fn add(&mut self, chunk: Chunk<'_>) -> PackEntry {
+    /// Appends a chunk. Returns its entry.
+    ///
+    /// With `Compression::Zstd`, the chunk is stored compressed when zstd makes it smaller.
+    pub fn add(&mut self, chunk: Chunk<'_>, mode: Compression) -> PackEntry {
         if let Some(&position) = self.positions.get(&chunk.id) {
             return self.entries[position];
         }
 
-        let (compression, stored) = chunking::compress(chunk.data);
+        let (compression, stored) = match mode {
+            Compression::Zstd => chunking::compress(chunk.data),
+            Compression::None => (Compression::None, Cow::Borrowed(chunk.data)),
+        };
         let entry = PackEntry {
             chunk_id: chunk.id,
             offset: self.bytes.len() as u64,
@@ -229,7 +235,7 @@ mod tests {
     fn build(data: &[u8]) -> Pack {
         let mut builder = PackBuilder::default();
         for chunk in chunking::chunks(data) {
-            builder.add(chunk);
+            builder.add(chunk, Compression::Zstd);
         }
         builder.finish()
     }
@@ -262,13 +268,30 @@ mod tests {
         let chunk = chunking::chunks(&data).next().unwrap();
         let mut builder = PackBuilder::default();
 
-        let first = builder.add(chunk);
+        let first = builder.add(chunk, Compression::Zstd);
         let size = builder.size();
-        let second = builder.add(chunk);
+        let second = builder.add(chunk, Compression::Zstd);
 
         assert_eq!(first, second);
         assert_eq!(builder.size(), size);
         assert_eq!(builder.finish().entries.len(), 1);
+    }
+
+    #[test]
+    fn test_uncompressed_mode_stores_raw_chunks() {
+        let data = b"windsock ".repeat(4096);
+        let chunk = chunking::chunks(&data).next().unwrap();
+        let mut builder = PackBuilder::default();
+
+        let entry = builder.add(chunk, Compression::None);
+        let pack = builder.finish();
+
+        assert_eq!(entry.compression, Compression::None);
+        assert_eq!(entry.stored_len, entry.raw_len);
+        assert_eq!(
+            read_chunk(&entry, slice(&pack.bytes, entry.range())).unwrap(),
+            chunk.data
+        );
     }
 
     #[test]

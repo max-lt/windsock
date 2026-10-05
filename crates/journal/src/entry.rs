@@ -22,6 +22,8 @@ pub enum Action {
         bucket: String,
         key: String,
         manifest_id: ObjectId,
+        /// The manifest itself, when it is small enough to skip `manifests/<id>`.
+        inline_manifest: Option<Vec<u8>>,
     },
     Delete {
         bucket: String,
@@ -204,6 +206,7 @@ mod tests {
             bucket: "b".into(),
             key: "k".into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
+            inline_manifest: None,
         }
     }
 

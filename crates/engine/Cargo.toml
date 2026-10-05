@@ -11,6 +11,7 @@ pack.workspace = true
 remote.workspace = true
 journal.workspace = true
 index.workspace = true
+cache.workspace = true
 blake3.workspace = true
 hex.workspace = true
 bytes.workspace = true

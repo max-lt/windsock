@@ -7,6 +7,8 @@ use chunking::Chunk;
 use model::{ChunkId, PackId};
 use pack::{Nonce, Pack, PackBuilder, PackEntry};
 
+#[cfg(test)]
+use crate::config::CacheMode;
 use crate::config::{Chunking, Policy};
 use crate::manifest::{ChunkRef, Manifest};
 
@@ -56,6 +58,14 @@ struct PlannedObject {
     slots: Vec<Slot>,
 }
 
+/// The result of [`Planner::add`].
+pub(crate) struct Added {
+    /// Packs that closed: upload them now.
+    pub closed: Vec<Pack>,
+    /// Every chunk of the object and its bytes in the object, in object order.
+    pub chunks: Vec<(ChunkId, Range<usize>)>,
+}
+
 /// Puts the new chunks of a batch of objects into packs.
 ///
 /// Small objects share packs that close at `pack_target`. An object of at least
@@ -85,7 +95,7 @@ impl Planner {
         }
     }
 
-    /// Adds the next object of the batch. Returns the packs that closed: upload them now.
+    /// Adds the next object of the batch.
     ///
     /// `stored` gives the location of a chunk that is already in the remote.
     pub fn add<E>(
@@ -95,11 +105,15 @@ impl Planner {
         metadata: BTreeMap<String, String>,
         policy: Policy,
         mut stored: impl FnMut(ChunkId) -> Result<Option<ChunkRef>, E>,
-    ) -> Result<Vec<Pack>, E> {
+    ) -> Result<Added, E> {
         let chunks: Vec<Chunk<'_>> = match policy.chunking {
             Chunking::ContentDefined => chunking::chunks(data).collect(),
             Chunking::Fixed => chunking::fixed_chunks(data).collect(),
         };
+        let spans = chunks
+            .iter()
+            .map(|c| (c.id, c.offset..c.offset + c.data.len()))
+            .collect();
         let own = data.len() >= self.own_pack_threshold;
         let mut own_pack = None;
         let mut closed = Vec::new();
@@ -144,7 +158,10 @@ impl Planner {
             metadata,
             slots,
         });
-        Ok(closed)
+        Ok(Added {
+            closed,
+            chunks: spans,
+        })
     }
 
     /// Closes the last shared pack. Returns it, and the manifests in the order of `add`.
@@ -255,6 +272,7 @@ mod tests {
             chunking: Chunking::Fixed,
             compression: Compression::None,
             create_only: false,
+            cache: CacheMode::Off,
         }
     }
 
@@ -266,6 +284,7 @@ mod tests {
         planner
             .add(data, [0u8; 32], BTreeMap::new(), fixed(), nothing_stored)
             .unwrap()
+            .closed
     }
 
     fn packs_of(manifest: &Manifest) -> Vec<PackId> {

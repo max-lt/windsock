@@ -106,6 +106,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d74937895e761d5984206f82ca8ff7725d0fd8021921011921894b41ab1b9f7"
 
 [[package]]
+name = "cache"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "hex",
+ "model",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -335,6 +349,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "cache",
  "chunking",
  "ed25519-dalek",
  "hex",

@@ -13,6 +13,16 @@ pub enum Chunking {
     Fixed,
 }
 
+/// Which chunks of a prefix the local cache keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Chunks that are read and chunks that are written: recent writes stay local.
+    ReadWrite,
+    /// Only chunks that are read: writes go around the cache.
+    Read,
+    Off,
+}
+
 /// How the engine stores the objects of one prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -21,6 +31,7 @@ pub struct Policy {
     pub compression: Compression,
     /// Every put acts as `If-None-Match: *`.
     pub create_only: bool,
+    pub cache: CacheMode,
 }
 
 impl Default for Policy {
@@ -29,6 +40,7 @@ impl Default for Policy {
             chunking: Chunking::ContentDefined,
             compression: Compression::Zstd,
             create_only: false,
+            cache: CacheMode::ReadWrite,
         }
     }
 }
@@ -51,6 +63,8 @@ pub struct Config {
     pub flush_delay: Duration,
     /// Puts fail once the local buffer holds this many bytes.
     pub buffer_limit: u64,
+    /// Bound of the local chunk cache. Zero turns the cache off.
+    pub cache_bytes: u64,
     /// H of the GC rules: the GC deletes an object H after its condemn. A flush syncs
     /// when its last sync is older than H/2, and never commits a plan older than H/2.
     pub gc_horizon: Duration,
@@ -70,6 +84,7 @@ impl Default for Config {
             own_pack_threshold: 8 * 1024 * 1024,
             flush_delay: Duration::from_secs(1),
             buffer_limit: 8 * 1024 * 1024 * 1024,
+            cache_bytes: 16 * 1024 * 1024 * 1024,
             gc_horizon: Duration::from_secs(24 * 3600),
             retention: Duration::from_secs(24 * 3600),
             snapshot_interval: Duration::from_secs(24 * 3600),

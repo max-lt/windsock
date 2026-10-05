@@ -579,7 +579,7 @@ async fn test_uncompressed_policy_stores_raw_chunks() {
         default_policy: Policy {
             chunking: Chunking::Fixed,
             compression: Compression::None,
-            create_only: false,
+            ..Policy::default()
         },
         ..Config::default()
     };

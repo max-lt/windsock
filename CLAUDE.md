@@ -33,9 +33,12 @@ The daemon crate is `windsockd`.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
   condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
+- `cache`: disk cache of raw chunks by ChunkId: LRU by size, blake3 check on every read, one fetch
+  per missing chunk (singleflight).
 - `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
   policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss,
-  GC (`gc.rs`: condemn, delete after H, version prune), snapshots and journal prune (`snapshot.rs`).
+  GC (`gc.rs`: condemn, delete after H, version prune), snapshots and journal prune (`snapshot.rs`),
+  chunk cache use per prefix (`ReadWrite`, `Read`, `Off`).
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.
@@ -57,6 +60,8 @@ The daemon crate is `windsockd`.
 - A broken chain fails alone: a sync reads the other chains and names the broken one. The GC
   refuses to run while a chain is broken. GC rule 1 counts only a sync with no broken chain: without
   one, a flush writes every chunk and dedups nothing.
+- The chunk cache is local and keyed by ChunkId. A chunk never changes for its ChunkId, so the cache
+  never goes stale and the GC never touches it. A cache read that fails its hash check is a miss.
 - An index never applies a redacted entry. A proxy with no state, or one that meets a redacted
   entry, loads the latest snapshot and reads the chains from its frontiers.
 - Clock assumption: no proxy clock is more than R (version retention, 24 h) away from the others.

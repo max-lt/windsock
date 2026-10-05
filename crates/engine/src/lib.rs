@@ -20,20 +20,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use cache::{CacheError, ChunkCache};
 use ed25519_dalek::SigningKey;
 use index::{ChunkLocation, Index, IndexError};
 use journal::{Action, Commit, Entry, Journal, JournalError};
 use model::{ChunkId, NodeId, ObjectId, PackId};
-use pack::{Pack, PackError};
+use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use buffer::{Buffer, BufferedObject, BufferedPut, Head, Intent, Op, SegmentReader};
-use plan::{Nonces, Planner};
+use plan::{Fetch, Nonces, Planner};
 
-pub use config::{Chunking, Config, Policy, PrefixPolicy};
+pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::ObjectState;
 pub use manifest::{ChunkRef, INLINE_MAX, MANIFESTS_PREFIX, Manifest, manifest_id, manifest_key};
@@ -53,6 +54,7 @@ const MAX_COMMIT_ATTEMPTS: u32 = 8;
 
 const INDEX_DIR: &str = "index";
 const BUFFER_DIR: &str = "buffer";
+const CACHE_DIR: &str = "cache";
 
 pub fn pack_key(id: PackId) -> String {
     format!("{PACKS_PREFIX}{id}")
@@ -94,6 +96,8 @@ pub enum EngineError {
     Index(#[from] IndexError),
     #[error(transparent)]
     Pack(#[from] PackError),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -178,6 +182,7 @@ pub struct Engine<R> {
     journal: tokio::sync::Mutex<Journal<R>>,
     index: Mutex<Index>,
     buffer: tokio::sync::Mutex<Buffer>,
+    cache: Option<ChunkCache>,
     /// One flush at a time.
     flushing: tokio::sync::Mutex<()>,
     last_sync: Mutex<Option<Instant>>,
@@ -200,6 +205,10 @@ impl<R: Remote + 'static> Engine<R> {
         let journal = Journal::new(remote.clone(), signing_key, index.frontiers()?);
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
+        let cache = match config.cache_bytes {
+            0 => None,
+            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes).await?),
+        };
 
         if !buffer.is_empty() {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
@@ -213,6 +222,7 @@ impl<R: Remote + 'static> Engine<R> {
             journal: tokio::sync::Mutex::new(journal),
             index: Mutex::new(index),
             buffer: tokio::sync::Mutex::new(buffer),
+            cache,
             flushing: tokio::sync::Mutex::new(()),
             last_sync: Mutex::new(None),
             fresh_sync: Mutex::new(None),
@@ -502,7 +512,8 @@ impl<R: Remote + 'static> Engine<R> {
                 } => {
                     let manifest = self.manifest(manifest_id).await?;
                     let range = check_range(range, manifest.size)?;
-                    let data = self.read_range(&manifest, range).await?;
+                    let mode = self.config.policy(bucket, key).cache;
+                    let data = self.read_range(&manifest, range, mode).await?;
                     return Ok(Object {
                         info: stored_info(key, manifest, hlc, conflicted),
                         data: Bytes::from(data),
@@ -588,29 +599,117 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(manifest)
     }
 
-    async fn read_range(&self, manifest: &Manifest, range: Range<u64>) -> Result<Vec<u8>> {
+    async fn read_range(
+        &self,
+        manifest: &Manifest,
+        range: Range<u64>,
+        mode: CacheMode,
+    ) -> Result<Vec<u8>> {
         let len = (range.end - range.start) as usize;
         let (fetches, skip) = plan::plan_read(&manifest.chunks, range);
         let mut raw = Vec::new();
 
-        for fetch in fetches {
-            let key = pack_key(fetch.pack);
-            let Some(bytes) = self.remote.get_range(&key, fetch.range.clone()).await? else {
-                return Err(EngineError::Corrupt(format!(
-                    "pack {} is missing",
-                    fetch.pack
-                )));
-            };
-
-            for entry in &fetch.entries {
-                let start = (entry.offset - fetch.range.start) as usize;
-                let stored = &bytes[start..start + entry.stored_len as usize];
-                raw.extend(pack::read_chunk(entry, stored)?);
+        for fetch in &fetches {
+            for chunk in self.read_fetch(fetch, mode).await? {
+                raw.extend(chunk);
             }
         }
 
         let skip = skip as usize;
         Ok(raw[skip..skip + len].to_vec())
+    }
+
+    /// The raw chunks of one fetch, in order: from the cache when it holds
+    /// them, else from one range read of the chunks it lacks.
+    async fn read_fetch(&self, fetch: &Fetch, mode: CacheMode) -> Result<Vec<Vec<u8>>> {
+        let Some(cache) = self.cache.as_ref().filter(|_| mode != CacheMode::Off) else {
+            return self.fetch_chunks(fetch.pack, &fetch.entries).await;
+        };
+
+        let mut chunks = Vec::with_capacity(fetch.entries.len());
+        for entry in &fetch.entries {
+            chunks.push(cached(cache, entry.chunk_id).await);
+        }
+
+        if chunks.iter().all(Option::is_some) {
+            return Ok(chunks.into_iter().flatten().collect());
+        }
+
+        // Concurrent readers of a missing chunk wait here, then find it cached.
+        let mut ids: Vec<ChunkId> = fetch
+            .entries
+            .iter()
+            .zip(&chunks)
+            .filter(|(_, chunk)| chunk.is_none())
+            .map(|(entry, _)| entry.chunk_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut flights = Vec::with_capacity(ids.len());
+        for id in ids {
+            flights.push(cache.lock(id).await);
+        }
+
+        for (entry, chunk) in fetch.entries.iter().zip(chunks.iter_mut()) {
+            if chunk.is_none() {
+                *chunk = cached(cache, entry.chunk_id).await;
+            }
+        }
+
+        let missing: Vec<PackEntry> = fetch
+            .entries
+            .iter()
+            .zip(&chunks)
+            .filter(|(_, chunk)| chunk.is_none())
+            .map(|(entry, _)| *entry)
+            .collect();
+
+        if !missing.is_empty() {
+            let fetched = self.fetch_chunks(fetch.pack, &missing).await?;
+            let mut fetched = missing.iter().zip(fetched);
+
+            for chunk in chunks.iter_mut().filter(|chunk| chunk.is_none()) {
+                let (entry, raw) = fetched.next().expect("one fetched chunk per missing chunk");
+                keep(cache, entry.chunk_id, &raw).await;
+                *chunk = Some(raw);
+            }
+        }
+
+        drop(flights);
+        Ok(chunks.into_iter().flatten().collect())
+    }
+
+    /// Reads `entries` of `pack` with one range read. The entries lie in pack order.
+    async fn fetch_chunks(&self, pack: PackId, entries: &[PackEntry]) -> Result<Vec<Vec<u8>>> {
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(Vec::new());
+        };
+
+        let start = first.offset;
+        let range = start..last.range().end;
+        let Some(bytes) = self.remote.get_range(&pack_key(pack), range).await? else {
+            return Err(EngineError::Corrupt(format!("pack {pack} is missing")));
+        };
+
+        entries
+            .iter()
+            .map(|entry| {
+                let offset = (entry.offset - start) as usize;
+                let stored = &bytes[offset..offset + entry.stored_len as usize];
+                Ok(pack::read_chunk(entry, stored)?)
+            })
+            .collect()
+    }
+
+    /// Keeps the chunks of a flushed object, for a prefix whose policy keeps writes.
+    async fn cache_written(&self, data: &[u8], chunks: &[(ChunkId, Range<usize>)]) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+
+        for (id, range) in chunks {
+            keep(cache, *id, &data[range.clone()]).await;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -872,14 +971,17 @@ impl<R: Remote + 'static> Engine<R> {
                         content_hash,
                     } => {
                         let policy = self.config.policy(&bucket, &key);
-                        let closed =
+                        let added =
                             planner.add(&record.data, content_hash, metadata, policy, |id| {
                                 if !dedup {
                                     return Ok(None);
                                 }
                                 self.stored_chunk(id)
                             })?;
-                        self.upload_packs(closed).await?;
+                        self.upload_packs(added.closed).await?;
+                        if policy.cache == CacheMode::ReadWrite {
+                            self.cache_written(&record.data, &added.chunks).await;
+                        }
                         objects += 1;
                         Planned::Put {
                             bucket,
@@ -1039,6 +1141,23 @@ fn stored(state: &ObjectState) -> Current {
             conflicted: state.is_conflicted(),
         },
         _ => Current::Absent,
+    }
+}
+
+/// A cache read. A failing cache is a miss: the remote has the data.
+async fn cached(cache: &ChunkCache, id: ChunkId) -> Option<Vec<u8>> {
+    match cache.get(id).await {
+        Ok(chunk) => chunk.map(|bytes| bytes.to_vec()),
+        Err(e) => {
+            warn!(chunk = %id, %e, "cache read failed");
+            None
+        }
+    }
+}
+
+async fn keep(cache: &ChunkCache, id: ChunkId, raw: &[u8]) {
+    if let Err(e) = cache.insert(id, raw).await {
+        warn!(chunk = %id, %e, "cache write failed");
     }
 }
 

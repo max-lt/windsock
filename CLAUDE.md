@@ -3,19 +3,22 @@
 S3-compatible proxy and cache. The remote object store (Backblaze B2 or any
 S3-compatible store) holds the only durable copy of the data.
 
-Design, decisions and milestones: `../windsock-todo.md`.
+Design, decisions and milestones: `../windsock-todo.md`. State: milestones 0 to 14 are done. The
+section "Hand-over" of that file lists the open decisions and the known limits: read it first.
 
 ## Build and test
 
 ```bash
-cargo build                    # build everything
-cargo test                     # all tests
-cargo test -p model            # one crate
-cargo clippy -- -D warnings    # lint, zero warnings
-cargo fmt --check              # format check
+cargo build                                  # build everything
+cargo test                                   # all tests (about 280; windsockd cluster tests ~85 s)
+cargo test -p model                          # one crate
+cargo clippy --all-targets -- -D warnings    # lint, zero warnings, tests included
+cargo fmt --check                            # format check
+scripts/bench.sh                             # bench, release build, a few minutes
 ```
 
-A milestone is complete only when `cargo clippy -- -D warnings` and `cargo fmt --check` pass.
+A milestone is complete only when `cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` pass. `README.md` shows how to run the daemon locally.
 
 ## Layout
 
@@ -39,13 +42,18 @@ The daemon crate is `windsockd`.
   condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
 - `cache`: disk cache of raw chunks by ChunkId: LRU by size, blake3 check on every read, one fetch
   per missing chunk (singleflight).
-- `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
-  policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss,
-  GC (`gc.rs`: condemn, delete after H, version prune), snapshots and journal prune (`snapshot.rs`),
-  chunk cache use per prefix (`ReadWrite`, `Read`, `Off`).
-- `s3api`: S3 over HTTP (axum) on the engine. SigV4 in the header (payload hash checked, aws-chunked
-  decoded, 15 min clock skew), keys from configuration, ListObjects v1 and v2 with paging, conditional
-  GET/HEAD, multipart uploads with parts on local disk. ETag = blake3 hex of the data.
+- `engine`: object operations. `lib.rs`: types, errors, `open`. One module per kind of operation:
+  `buckets.rs`, `write.rs` (puts fsynced in the buffer), `read.rs` (buffer, then index, cache and
+  remote), `sync.rs` (other chains, manifests, chunk locations, sync on miss), `flush.rs` (plan,
+  upload, intent, commit, group commit). Also `buffer.rs` (NVMe write-back log: segments, replay,
+  intent file), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix
+  policy: chunking, compression, create-only, cache), `gc.rs` (condemn, delete after H, version
+  prune) and `snapshot.rs` (snapshots, bootstrap, journal prune).
+- `s3api`: S3 over HTTP (axum) on the engine. `auth.rs`: SigV4 in the header (payload hash checked,
+  aws-chunked decoded, 15 min clock skew), keys from configuration. `handlers/`: `bucket.rs`,
+  `object.rs`, `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects
+  v1 and v2 paging (no I/O). `multipart.rs`: parts on local disk. `xml.rs`. ETag = blake3 hex of
+  the data.
 - `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
   `README.md` has the steps to run it locally.
@@ -104,7 +112,11 @@ The daemon crate is `windsockd`.
 - `tokio` runtime.
 - Small functions. Early returns instead of deep nesting.
 - Comments: one line, the reason only. No history, no ticket text, ASCII only.
+- No comment separators between sections: one module per concern.
+- A parameter whose meaning a bare `true` or `false` does not show at the call is a two-value enum.
 - Public types get a one-line doc comment. Skip it when the name says everything.
+- Commit subjects: imperative, capitalized (`Add ...`, `Fix ...`, `Split ...`), 72 characters at
+  most. The body says why, in ASD-STE100. Commits stay local until Maxime says otherwise.
 
 ## Dependencies
 
@@ -160,6 +172,9 @@ Add a crate to this table when a milestone adds it.
 - Name tests by behavior: `test_hex_roundtrip`, `test_parse_rejects_non_hex`.
 - Test public behavior. Do not copy the implementation logic into the test.
 - A golden test pins each storage format. It must not depend on the zstd encoder output.
+- Every backend runs `remote::contract::check` (feature `contract`).
+- `windsockd/tests` run the binary as a process through `tests/common`; a failing test prints the
+  daemon log. The cluster tests run one at a time.
 
 ## Bug fixes
 
@@ -170,5 +185,6 @@ Add a crate to this table when a milestone adds it.
 ## Do not
 
 - No `unwrap()` in library code. Use `expect("reason")` only for an invariant that cannot fail.
+  `remote::contract` is test support code: it panics on purpose.
 - No `unsafe`.
 - No erasure coding, no replication between proxies, no consensus, no refcount.

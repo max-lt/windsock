@@ -2,9 +2,10 @@
 //!
 //! Writers put objects. A put either dedups against a pack its index knows, or
 //! uploads a fresh pack: a fresh upload always gets a new pack id. The GC
-//! appends a condemn for a pack that no current object uses, and deletes the
-//! pack later. A writer that applies a condemn forgets the pack, and a later
-//! put that names the pack revives it.
+//! appends one condemn for a pack that no current object uses, and deletes the
+//! pack later. A writer that applies a condemn never learns the pack again. A
+//! put from a writer that did not know the condemn can still name the pack: the
+//! GC then finds the pack live and does not delete it.
 //!
 //! The journal is one log in creation order: the journal model checks the
 //! chains, and a sync reads every entry written before it. Each rule compares
@@ -83,22 +84,21 @@ fn is_live(view: &[Entry], keys: u8, pack: u8) -> bool {
     (0..keys).any(|key| head(view, key) == Some(Entry::Put { key, pack }))
 }
 
-/// The time of the condemn of `pack` that no later put revived.
-fn standing_condemn(view: &[Entry], pack: u8) -> Option<u8> {
-    view.iter().rev().find_map(|entry| match *entry {
-        Entry::Put { pack: p, .. } if p == pack => Some(None),
-        Entry::Condemn { pack: p, at } if p == pack => Some(Some(at)),
+/// The time of the condemn of `pack`.
+fn condemned_at(view: &[Entry], pack: u8) -> Option<u8> {
+    view.iter().find_map(|entry| match *entry {
+        Entry::Condemn { pack: p, at } if p == pack => Some(at),
         _ => None,
-    })?
+    })
 }
 
 fn names(entry: &Entry, pack: u8) -> bool {
     matches!(*entry, Entry::Put { pack: p, .. } if p == pack)
 }
 
-/// A pack that a writer index holds: a put named it, and no condemn came after.
+/// A pack that a writer index holds: a put named it, and no condemn of it is applied.
 fn is_known(view: &[Entry], pack: u8) -> bool {
-    view.iter().any(|e| names(e, pack)) && standing_condemn(view, pack).is_none()
+    view.iter().any(|e| names(e, pack)) && condemned_at(view, pack).is_none()
 }
 
 /// Writers are interchangeable: no entry records which writer wrote it.
@@ -226,7 +226,7 @@ impl GcModel {
 
         if !in_remote
             || is_live(view, self.keys, pack)
-            || standing_condemn(view, pack).is_some()
+            || condemned_at(view, pack).is_some()
             || s.log.len() >= self.max_entries
         {
             return false;
@@ -238,7 +238,7 @@ impl GcModel {
 
     fn sweep(&self, s: &mut State, pack: u8) -> bool {
         let view = s.view(s.gc);
-        let Some(condemned_at) = standing_condemn(view, pack) else {
+        let Some(condemned_at) = condemned_at(view, pack) else {
             return false;
         };
 
@@ -376,7 +376,7 @@ impl Model for GcModel {
                     _ => false,
                 })
             }),
-            Property::sometimes("a put revives a condemned pack", |_: &Self, s: &State| {
+            Property::sometimes("a put names a condemned pack", |_: &Self, s: &State| {
                 s.log.iter().enumerate().any(|(i, e)| match *e {
                     Entry::Put { pack, .. } => s.log[..i]
                         .iter()

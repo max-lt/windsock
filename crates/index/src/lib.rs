@@ -7,6 +7,7 @@
 
 mod state;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
@@ -16,7 +17,7 @@ use pack::PackEntry;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-pub use state::{BucketState, EntryRef, ObjectState, Version, knew};
+pub use state::{BucketState, EntryRef, ObjectState, Pruned, Version, knew};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
@@ -29,6 +30,10 @@ pub enum IndexError {
 }
 
 type Result<T> = std::result::Result<T, IndexError>;
+
+fn corrupt() -> IndexError {
+    IndexError::Corrupt(postcard::Error::DeserializeBadEncoding)
+}
 
 /// Where a chunk lives in the remote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +57,11 @@ pub struct Index {
     objects: Keyspace,
     buckets: Keyspace,
     chunks: Keyspace,
+    /// `pack | chunk`: the chunks to forget when a pack is condemned.
+    pack_chunks: Keyspace,
     manifests: Keyspace,
+    /// `tag | id` to the lowest HLC of a condemn: the same for every apply order.
+    condemned: Keyspace,
     pending: Vec<Entry>,
     _temp: Option<tempfile::TempDir>,
 }
@@ -65,6 +74,23 @@ fn entry_key(node: NodeId, seq: u64) -> [u8; 40] {
     let mut key = [0u8; 40];
     key[..32].copy_from_slice(node.as_bytes());
     key[32..].copy_from_slice(&seq.to_be_bytes());
+    key
+}
+
+const PACK_TAG: u8 = b'p';
+const MANIFEST_TAG: u8 = b'm';
+
+fn condemn_key(tag: u8, id: &[u8; 32]) -> [u8; 33] {
+    let mut key = [0u8; 33];
+    key[0] = tag;
+    key[1..].copy_from_slice(id);
+    key
+}
+
+fn pack_chunk_key(pack: PackId, chunk: ChunkId) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(pack.as_bytes());
+    key[32..].copy_from_slice(chunk.as_bytes());
     key
 }
 
@@ -97,7 +123,9 @@ impl Index {
             objects: db.keyspace("objects", KeyspaceCreateOptions::default)?,
             buckets: db.keyspace("buckets", KeyspaceCreateOptions::default)?,
             chunks: db.keyspace("chunks", KeyspaceCreateOptions::default)?,
+            pack_chunks: db.keyspace("pack_chunks", KeyspaceCreateOptions::default)?,
             manifests: db.keyspace("manifests", KeyspaceCreateOptions::default)?,
+            condemned: db.keyspace("condemned", KeyspaceCreateOptions::default)?,
             db,
             pending: Vec::new(),
             _temp: temp,
@@ -239,6 +267,15 @@ impl Index {
                 Action::DeleteBucket { bucket } => {
                     self.record_bucket(&mut batch, entry, bucket, None)?
                 }
+                Action::Condemn { packs, manifests } => {
+                    for pack in packs {
+                        self.record_condemn(&mut batch, entry, PACK_TAG, pack.as_bytes())?;
+                        self.forget_pack(&mut batch, *pack)?;
+                    }
+                    for manifest in manifests {
+                        self.record_condemn(&mut batch, entry, MANIFEST_TAG, manifest.as_bytes())?;
+                    }
+                }
             }
         }
 
@@ -272,6 +309,52 @@ impl Index {
         }
 
         Ok(())
+    }
+
+    fn record_condemn(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        entry: &Entry,
+        tag: u8,
+        id: &[u8; 32],
+    ) -> Result<()> {
+        let key = condemn_key(tag, id);
+
+        if let Some(hlc) = self.condemned_at(key)?
+            && hlc <= entry.hlc
+        {
+            return Ok(());
+        }
+
+        batch.insert(&self.condemned, key, entry.hlc.to_be_bytes());
+        Ok(())
+    }
+
+    /// Removes the chunk locations in `pack`: a writer must not dedup against it again.
+    fn forget_pack(&self, batch: &mut fjall::OwnedWriteBatch, pack: PackId) -> Result<()> {
+        for guard in self.pack_chunks.prefix(pack.as_bytes()) {
+            let (key, _) = guard.into_inner()?;
+            let chunk = ChunkId::from_bytes(key[32..].try_into().map_err(|_| corrupt())?);
+
+            if self
+                .chunk(chunk)?
+                .is_some_and(|location| location.pack == pack)
+            {
+                batch.remove(&self.chunks, chunk.as_bytes());
+            }
+            batch.remove(&self.pack_chunks, key);
+        }
+
+        Ok(())
+    }
+
+    fn condemned_at(&self, key: [u8; 33]) -> Result<Option<u64>> {
+        let Some(value) = self.condemned.get(key)? else {
+            return Ok(None);
+        };
+
+        let bytes: [u8; 8] = value[..].try_into().map_err(|_| corrupt())?;
+        Ok(Some(u64::from_be_bytes(bytes)))
     }
 
     fn record_bucket(
@@ -348,8 +431,16 @@ impl Index {
     // Chunk locations
     // ------------------------------------------------------------------
 
+    /// Records where a chunk lives. A location in a condemned pack is ignored.
     pub fn put_chunk(&self, id: ChunkId, location: &ChunkLocation) -> Result<()> {
-        self.chunks.insert(id.as_bytes(), encode(location))?;
+        if self.condemned_pack(location.pack)?.is_some() {
+            return Ok(());
+        }
+
+        let mut batch = self.db.batch();
+        batch.insert(&self.chunks, id.as_bytes(), encode(location));
+        batch.insert(&self.pack_chunks, pack_chunk_key(location.pack, id), []);
+        batch.commit()?;
         Ok(())
     }
 
@@ -375,6 +466,71 @@ impl Index {
             .manifests
             .get(id.as_bytes())?
             .map(|value| value.to_vec()))
+    }
+
+    // ------------------------------------------------------------------
+    // GC
+    // ------------------------------------------------------------------
+
+    /// HLC of the first condemn of a pack.
+    pub fn condemned_pack(&self, id: PackId) -> Result<Option<u64>> {
+        self.condemned_at(condemn_key(PACK_TAG, id.as_bytes()))
+    }
+
+    /// HLC of the first condemn of a manifest.
+    pub fn condemned_manifest(&self, id: ObjectId) -> Result<Option<u64>> {
+        self.condemned_at(condemn_key(MANIFEST_TAG, id.as_bytes()))
+    }
+
+    /// Manifests that must stay in the remote: see [`ObjectState::live_manifests`].
+    /// Pending entries count too: they apply later.
+    pub fn live_manifests(&self, recent: u64) -> Result<BTreeSet<ObjectId>> {
+        let mut live = BTreeSet::new();
+
+        for guard in self.objects.iter() {
+            let (_, value) = guard.into_inner()?;
+            let state: ObjectState = postcard::from_bytes(&value)?;
+            live.extend(state.live_manifests(recent));
+        }
+
+        for action in self.pending.iter().flat_map(|e| e.actions.iter().flatten()) {
+            if let Action::Put { manifest_id, .. } = action {
+                live.insert(*manifest_id);
+            }
+        }
+
+        Ok(live)
+    }
+
+    /// No entry still to apply has a lower HLC: the lowest last HLC over the
+    /// applied chains, and the lowest HLC of a pending entry.
+    pub fn stable_hlc(&self) -> Result<u64> {
+        let frontiers = self.frontiers()?;
+        let applied = frontiers.values().map(|f| f.last_hlc);
+        let pending = self.pending.iter().map(|e| e.hlc);
+
+        Ok(applied.chain(pending).min().unwrap_or(0))
+    }
+
+    /// Prunes every key with [`ObjectState::prune`]. Returns the number of keys changed or removed.
+    pub fn prune_versions(&self, below: u64) -> Result<usize> {
+        let mut batch = self.db.batch();
+        let mut changed = 0;
+
+        for guard in self.objects.iter() {
+            let (key, value) = guard.into_inner()?;
+            let mut state: ObjectState = postcard::from_bytes(&value)?;
+
+            match state.prune(below) {
+                Pruned::Unchanged => continue,
+                Pruned::Changed => batch.insert(&self.objects, key, encode(&state)),
+                Pruned::Gone => batch.remove(&self.objects, key),
+            }
+            changed += 1;
+        }
+
+        batch.commit()?;
+        Ok(changed)
     }
 }
 
@@ -715,6 +871,138 @@ mod tests {
 
         assert_eq!(index.manifest(manifest(1)).unwrap().unwrap(), b"bytes");
         assert_eq!(index.manifest(manifest(2)).unwrap(), None);
+    }
+
+    fn location(pack: u8, chunk: ChunkId) -> ChunkLocation {
+        ChunkLocation {
+            pack: PackId::from_bytes([pack; 32]),
+            entry: PackEntry {
+                chunk_id: chunk,
+                offset: 5,
+                stored_len: 10,
+                raw_len: 10,
+                compression: chunking::Compression::None,
+            },
+            seen_at: 0,
+        }
+    }
+
+    fn condemn(seed: u8, hlc: u64, pack: u8) -> Entry {
+        let action = Action::Condemn {
+            packs: vec![PackId::from_bytes([pack; 32])],
+            manifests: vec![manifest(pack)],
+        };
+        Entry::sign(&key(seed), 0, [0u8; 32], hlc, Seen::new(), vec![action])
+    }
+
+    #[test]
+    fn test_condemn_forgets_the_chunks_of_the_pack_for_good() {
+        let mut index = Index::open_temporary().unwrap();
+        let in_condemned = ChunkId::from_bytes([1u8; 32]);
+        let elsewhere = ChunkId::from_bytes([2u8; 32]);
+        index
+            .put_chunk(in_condemned, &location(7, in_condemned))
+            .unwrap();
+        index.put_chunk(elsewhere, &location(8, elsewhere)).unwrap();
+
+        index.apply(vec![condemn(1, 5, 7)]).unwrap();
+        index
+            .put_chunk(in_condemned, &location(7, in_condemned))
+            .unwrap();
+
+        assert_eq!(index.chunk(in_condemned).unwrap(), None);
+        assert!(index.chunk(elsewhere).unwrap().is_some());
+        assert_eq!(
+            index.condemned_pack(PackId::from_bytes([7u8; 32])).unwrap(),
+            Some(5)
+        );
+        assert_eq!(index.condemned_manifest(manifest(7)).unwrap(), Some(5));
+        assert_eq!(
+            index.condemned_pack(PackId::from_bytes([8u8; 32])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_first_condemn_wins_in_any_order() {
+        for order in [[0, 1], [1, 0]] {
+            let entries = [condemn(1, 5, 7), condemn(2, 9, 7)];
+            let mut index = Index::open_temporary().unwrap();
+
+            for i in order {
+                index.apply(vec![entries[i].clone()]).unwrap();
+            }
+
+            assert_eq!(
+                index.condemned_pack(PackId::from_bytes([7u8; 32])).unwrap(),
+                Some(5)
+            );
+        }
+    }
+
+    #[test]
+    fn test_live_manifests_include_pending_entries() {
+        let mut index = Index::open_temporary().unwrap();
+        let waits = Seen::from([(
+            NodeId::from_bytes([9u8; 32]),
+            journal::Link {
+                seq: 0,
+                hash: [0u8; 32],
+            },
+        )]);
+        let pending = Entry::sign(&key(1), 0, [0u8; 32], 7, waits, put("k", 3));
+        let applied = Entry::sign(&key(2), 0, [0u8; 32], 20, Seen::new(), put("j", 4));
+
+        index.apply(vec![pending, applied]).unwrap();
+
+        assert_eq!(index.pending(), 1);
+        assert_eq!(
+            index.live_manifests(0).unwrap(),
+            BTreeSet::from([manifest(3), manifest(4)])
+        );
+        assert_eq!(
+            index.stable_hlc().unwrap(),
+            7,
+            "a pending entry lowers the stable HLC"
+        );
+    }
+
+    #[test]
+    fn test_stable_hlc_is_the_slowest_chain() {
+        let mut index = Index::open_temporary().unwrap();
+        let slow = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), put("a", 1));
+        let fast = Entry::sign(&key(2), 0, [0u8; 32], 30, Seen::new(), put("b", 2));
+
+        assert_eq!(index.stable_hlc().unwrap(), 0);
+        index.apply(vec![slow, fast]).unwrap();
+
+        assert_eq!(index.stable_hlc().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_prune_versions_removes_keys_deleted_long_ago() {
+        let mut index = Index::open_temporary().unwrap();
+        let actions = vec![
+            put("gone", 1).remove(0),
+            put("kept", 2).remove(0),
+            Action::Delete {
+                bucket: "b".into(),
+                key: "gone".into(),
+            },
+        ];
+        let first = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), actions);
+        let rewrite = Entry::sign(&key(1), 1, first.hash(), 20, Seen::new(), put("kept", 5));
+        index.apply(vec![first, rewrite]).unwrap();
+
+        assert_eq!(index.prune_versions(15).unwrap(), 2);
+
+        assert_eq!(index.object("b", "gone").unwrap(), None);
+        assert_eq!(
+            index.object("b", "kept").unwrap().unwrap().versions.len(),
+            1
+        );
+        assert_eq!(index.resolve("b", "kept").unwrap(), Some(manifest(5)));
+        assert_eq!(index.prune_versions(15).unwrap(), 0);
     }
 
     #[test]

@@ -26,13 +26,16 @@ The daemon crate is `windsockd`.
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
   one-chunk read.
-- `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
+- `remote`: `Remote` trait (put, create, get, get_range, list, no delete), `Sweep` trait (delete,
+  GC only), memory and local directory backends.
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
-  (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers.
+  (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
+  condemned packs and manifests, live manifests, stable HLC, version prune.
 - `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
-  policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss.
+  policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss,
+  GC (`gc.rs`: condemn, delete after H, version prune).
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.
@@ -46,7 +49,9 @@ The daemon crate is `windsockd`.
   in the journal and a GC sync that starts a horizon H (24 h) later. A writer dedups only after a
   sync younger than H/2, and commits only a plan younger than H/2. `protocol-check/src/gc.rs`
   checks these rules; each one is needed.
-- A fresh upload gets a new remote key. A deleted key is never written again.
+- A fresh upload gets a new remote key (a nonce in packs and manifests). A deleted key is never
+  written again.
+- A proxy that applied a condemn of a pack never learns that pack again.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
 - An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
 - An entry lists in `seen` the last entry of every other chain its writer had applied (not read).

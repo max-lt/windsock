@@ -237,6 +237,8 @@ pub(crate) struct BufferedBucket {
 pub(crate) struct Intent {
     pub entry: Entry,
     pub segments: Vec<u64>,
+    /// Unix nanoseconds when the flush started its plan. An old plan is never committed.
+    pub planned_at: u64,
 }
 
 struct Active {

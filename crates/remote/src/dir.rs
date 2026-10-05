@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::{Remote, RemoteError, check_key, check_prefix, check_range};
+use crate::{Remote, RemoteError, Sweep, check_key, check_prefix, check_range};
 
 /// Makes temporary file names unique inside one process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -166,5 +166,19 @@ impl Remote for DirRemote {
 
         keys.sort();
         Ok(keys)
+    }
+}
+
+#[async_trait::async_trait]
+impl Sweep for DirRemote {
+    async fn delete(&self, key: &str) -> Result<(), RemoteError> {
+        check_key(key)?;
+        let path = self.root.join(key);
+
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => sync_parent(&path).await,
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }

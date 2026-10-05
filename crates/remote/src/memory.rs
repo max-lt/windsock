@@ -4,7 +4,7 @@ use std::sync::RwLock;
 
 use bytes::Bytes;
 
-use crate::{Remote, RemoteError, check_key, check_prefix, check_range};
+use crate::{Remote, RemoteError, Sweep, check_key, check_prefix, check_range};
 
 /// In-memory remote, for tests.
 #[derive(Default)]
@@ -69,5 +69,17 @@ impl Remote for MemoryRemote {
             .take_while(|key| key.starts_with(prefix))
             .cloned()
             .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl Sweep for MemoryRemote {
+    async fn delete(&self, key: &str) -> Result<(), RemoteError> {
+        check_key(key)?;
+        self.objects
+            .write()
+            .expect("no panic while the lock is held")
+            .remove(key);
+        Ok(())
     }
 }

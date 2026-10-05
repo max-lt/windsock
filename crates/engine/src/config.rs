@@ -51,6 +51,11 @@ pub struct Config {
     pub flush_delay: Duration,
     /// Puts fail once the local buffer holds this many bytes.
     pub buffer_limit: u64,
+    /// H of the GC rules: the GC deletes an object H after its condemn. A flush syncs
+    /// when its last sync is older than H/2, and never commits a plan older than H/2.
+    pub gc_horizon: Duration,
+    /// A version stays readable for this long after a newer write or a delete.
+    pub retention: Duration,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -63,6 +68,8 @@ impl Default for Config {
             own_pack_threshold: 8 * 1024 * 1024,
             flush_delay: Duration::from_secs(1),
             buffer_limit: 8 * 1024 * 1024 * 1024,
+            gc_horizon: Duration::from_secs(24 * 3600),
+            retention: Duration::from_secs(24 * 3600),
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

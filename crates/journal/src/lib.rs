@@ -189,16 +189,19 @@ impl<R: Remote> Journal<R> {
         Ok(())
     }
 
-    async fn resolve_taken_seq(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
+    /// Checks that a prepared entry is in the remote, without writing it.
+    pub async fn is_written(&mut self, entry: &Entry) -> Result<bool, JournalError> {
         let read = self.sync_node(self.node).await?;
         self.stashed.extend(read);
 
         let stored = self.remote.get(&entry.remote_key()).await?;
-        let ours = stored
+        Ok(stored
             .and_then(|bytes| postcard::from_bytes::<Entry>(&bytes).ok())
-            .is_some_and(|stored| stored.hash() == entry.hash());
+            .is_some_and(|stored| stored.hash() == entry.hash()))
+    }
 
-        if ours {
+    async fn resolve_taken_seq(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
+        if self.is_written(entry).await? {
             self.register().await;
             return Ok(Commit::Written);
         }
@@ -444,6 +447,24 @@ mod tests {
         let retried = first.prepare(vec![put("from first")], Seen::new());
         assert_eq!(retried.seq, 1);
         assert_eq!(first.commit(&retried).await.unwrap(), Commit::Written);
+    }
+
+    #[tokio::test]
+    async fn test_is_written_finds_only_the_same_entry() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut first = journal(&remote, 1);
+        let mut zombie = journal(&remote, 1);
+        let prepared = first.prepare(vec![put("from first")], Seen::new());
+
+        assert!(!first.is_written(&prepared).await.unwrap());
+        zombie
+            .append(vec![put("from zombie")], Seen::new())
+            .await
+            .unwrap();
+        assert!(!first.is_written(&prepared).await.unwrap());
+
+        let written = first.append(vec![put("ours")], Seen::new()).await.unwrap();
+        assert!(first.is_written(&written).await.unwrap());
     }
 
     #[tokio::test]

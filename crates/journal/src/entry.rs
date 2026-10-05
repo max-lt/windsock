@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use model::{NodeId, ObjectId};
+use model::{NodeId, ObjectId, PackId};
 use serde::{Deserialize, Serialize};
 
 /// blake3 hash of the signed content of an entry.
@@ -35,6 +35,11 @@ pub enum Action {
     },
     DeleteBucket {
         bucket: String,
+    },
+    /// The GC found these objects dead. Readers stop deduping against the packs.
+    Condemn {
+        packs: Vec<PackId>,
+        manifests: Vec<ObjectId>,
     },
 }
 

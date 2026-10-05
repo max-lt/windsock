@@ -7,6 +7,7 @@
 
 mod buffer;
 mod config;
+mod gc;
 mod manifest;
 mod plan;
 
@@ -32,6 +33,7 @@ use buffer::{Buffer, BufferedObject, BufferedPut, Head, Intent, Op, SegmentReade
 use plan::{Nonces, Planner};
 
 pub use config::{Chunking, Config, Policy, PrefixPolicy};
+pub use gc::GcReport;
 pub use index::ObjectState;
 pub use manifest::{ChunkRef, INLINE_MAX, MANIFESTS_PREFIX, Manifest, manifest_id, manifest_key};
 
@@ -76,6 +78,8 @@ pub enum EngineError {
     BufferFull { limit: u64 },
     #[error("{0} commits lost the seq to another process with this identity")]
     Contended(u32),
+    #[error("the flush plan is older than half the GC horizon: plan again")]
+    StalePlan,
     #[error("corrupt data: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -165,6 +169,8 @@ pub struct Engine<R> {
     /// One flush at a time.
     flushing: tokio::sync::Mutex<()>,
     last_sync: Mutex<Option<Instant>>,
+    /// Start of the last sync that succeeded: GC rule 1 for dedup.
+    fresh_sync: Mutex<Option<Instant>>,
     flush_wanted: Notify,
 }
 
@@ -197,6 +203,7 @@ impl<R: Remote + 'static> Engine<R> {
             buffer: tokio::sync::Mutex::new(buffer),
             flushing: tokio::sync::Mutex::new(()),
             last_sync: Mutex::new(None),
+            fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
         })
     }
@@ -594,20 +601,47 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<usize> {
+        let started = Instant::now();
         *self
             .last_sync
             .lock()
-            .expect("no panic while the lock is held") = Some(Instant::now());
+            .expect("no panic while the lock is held") = Some(started);
 
         let entries = journal.sync_all().await?;
-        if entries.is_empty() {
-            return Ok(0);
+        let mut applied = 0;
+
+        if !entries.is_empty() {
+            self.ingest(&entries).await?;
+            applied = self.index().apply(entries)?;
+            debug!(applied, "synced");
         }
 
-        self.ingest(&entries).await?;
-        let applied = self.index().apply(entries)?;
-        debug!(applied, "synced");
+        *self
+            .fresh_sync
+            .lock()
+            .expect("no panic while the lock is held") = Some(started);
         Ok(applied)
+    }
+
+    /// GC rule 1: dedup only against what a sync younger than H/2 found.
+    async fn ensure_fresh_sync(&self) -> Result<()> {
+        let mut journal = self.journal.lock().await;
+        let fresh = self
+            .fresh_sync
+            .lock()
+            .expect("no panic while the lock is held")
+            .is_some_and(|started| started.elapsed() < self.config.gc_horizon / 2);
+
+        if !fresh {
+            self.sync_locked(&mut journal).await?;
+        }
+
+        Ok(())
+    }
+
+    fn plan_is_stale(&self, planned_at: u64) -> bool {
+        let half = (self.config.gc_horizon / 2).as_nanos() as u64;
+        buffer::unix_nanos() >= planned_at.saturating_add(half)
     }
 
     /// Runs `op`. On a missing bucket or key, syncs once and runs it again,
@@ -727,31 +761,36 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     /// Finishes the commit of a flush that a crash or an error interrupted.
+    /// GC rule 2: an old plan is only looked for in the remote, never written.
     async fn recover(&self) -> Result<()> {
         let Some(intent) = buffer::read_intent(&self.buffer_dir).await? else {
             return Ok(());
         };
 
         let mut journal = self.journal.lock().await;
+        let written = if self.plan_is_stale(intent.planned_at) {
+            journal.is_written(&intent.entry).await?
+        } else {
+            journal.commit(&intent.entry).await? == Commit::Written
+        };
 
-        match journal.commit(&intent.entry).await? {
-            Commit::Written => {
-                info!(seq = intent.entry.seq, "recovered an interrupted flush");
-                self.apply_own(&mut journal, intent.entry).await?;
-                self.buffer.lock().await.release(&intent.segments).await?;
-            }
-            Commit::SeqTaken => {
-                warn!(
-                    seq = intent.entry.seq,
-                    "interrupted flush lost its seq: flushing again"
-                );
-            }
+        if written {
+            info!(seq = intent.entry.seq, "recovered an interrupted flush");
+            self.apply_own(&mut journal, intent.entry).await?;
+            self.buffer.lock().await.release(&intent.segments).await?;
+        } else {
+            warn!(
+                seq = intent.entry.seq,
+                "interrupted flush is not in the remote: flushing again"
+            );
         }
 
         buffer::remove_intent(&self.buffer_dir).await
     }
 
     async fn flush_segments(&self, segments: &[u64]) -> Result<()> {
+        self.ensure_fresh_sync().await?;
+        let planned_at = buffer::unix_nanos();
         let seed = blake3::Hasher::new()
             .update(self.node.as_bytes())
             .update(&buffer::unix_nanos().to_le_bytes())
@@ -819,7 +858,9 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         let mut journal = self.journal.lock().await;
-        let entry = self.commit(&mut journal, actions, segments).await?;
+        let entry = self
+            .commit(&mut journal, actions, segments, planned_at)
+            .await?;
         debug!(seq = entry.seq, segments = segments.len(), "flushed");
         self.apply_own(&mut journal, entry).await?;
         drop(journal);
@@ -880,12 +921,19 @@ impl<R: Remote + 'static> Engine<R> {
         journal: &mut Journal<R>,
         actions: Vec<Action>,
         segments: &[u64],
+        planned_at: u64,
     ) -> Result<Entry> {
         for _ in 0..MAX_COMMIT_ATTEMPTS {
+            // GC rule 2: a dedup decision older than H/2 can name a pack that the GC deleted.
+            if self.plan_is_stale(planned_at) {
+                return Err(EngineError::StalePlan);
+            }
+
             let seen = self.index().seen(self.node)?;
             let intent = Intent {
                 entry: journal.prepare(actions.clone(), seen),
                 segments: segments.to_vec(),
+                planned_at,
             };
             buffer::write_intent(&self.buffer_dir, &intent).await?;
 

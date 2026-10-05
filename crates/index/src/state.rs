@@ -118,6 +118,56 @@ impl ObjectState {
     pub fn is_conflicted(&self) -> bool {
         !self.conflicts().is_empty()
     }
+
+    /// Manifests that must stay in the remote: the one a reader gets, the
+    /// conflicting ones, and the ones written at or after `recent`.
+    pub fn live_manifests(&self, recent: u64) -> Vec<ObjectId> {
+        let conflicts = self.conflicts();
+
+        self.versions
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| *i == 0 || v.hlc >= recent || conflicts.contains(&v.entry_ref()))
+            .filter_map(|(_, v)| v.manifest_id)
+            .collect()
+    }
+
+    /// Drops the versions below `below` that the head knew. The whole key goes
+    /// when its head is a delete below `below` and nothing conflicts.
+    ///
+    /// No entry still to apply may rank under `below`, so pass at most the stable HLC.
+    pub fn prune(&mut self, below: u64) -> Pruned {
+        let Some(head) = self.head() else {
+            return Pruned::Gone;
+        };
+
+        let conflicts = self.conflicts();
+
+        if conflicts.is_empty() && head.manifest_id.is_none() && head.hlc < below {
+            return Pruned::Gone;
+        }
+
+        let head = head.entry_ref();
+        let before = self.versions.len();
+        self.versions.retain(|v| {
+            v.entry_ref() == head || v.hlc >= below || conflicts.contains(&v.entry_ref())
+        });
+
+        if self.versions.len() == before {
+            return Pruned::Unchanged;
+        }
+
+        Pruned::Changed
+    }
+}
+
+/// Outcome of [`ObjectState::prune`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pruned {
+    Unchanged,
+    Changed,
+    /// Nothing is left that a reader could need: remove the key.
+    Gone,
 }
 
 /// State of one bucket name: the last create or delete wins.
@@ -298,6 +348,79 @@ mod tests {
         assert!(state.record(&a, Some(manifest(1))));
         assert!(!state.record(&a, Some(manifest(1))));
         assert_eq!(state.versions.len(), 1);
+    }
+
+    fn put_at(seed: u8, seq: u64, hlc: u64, seen: Seen) -> (Entry, Option<ObjectId>) {
+        (
+            entry(seed, seq, hlc, seen),
+            Some(manifest(seq as u8 + 10 * seed)),
+        )
+    }
+
+    fn state_of(writes: &[(Entry, Option<ObjectId>)]) -> ObjectState {
+        let mut state = ObjectState::default();
+        for (entry, manifest_id) in writes {
+            state.record(entry, *manifest_id);
+        }
+        state
+    }
+
+    #[test]
+    fn test_live_manifests_keep_head_conflicts_and_recent_versions() {
+        let old = put_at(1, 0, 10, Seen::new());
+        let recent = put_at(1, 1, 50, Seen::new());
+        let concurrent = put_at(2, 0, 20, Seen::new());
+        let head = put_at(1, 2, 60, Seen::new());
+        let state = state_of(&[
+            old.clone(),
+            recent.clone(),
+            concurrent.clone(),
+            head.clone(),
+        ]);
+
+        let live = state.live_manifests(40);
+
+        assert!(live.contains(&head.1.unwrap()));
+        assert!(live.contains(&recent.1.unwrap()));
+        assert!(
+            live.contains(&concurrent.1.unwrap()),
+            "a conflicting version stays"
+        );
+        assert!(!live.contains(&old.1.unwrap()));
+    }
+
+    #[test]
+    fn test_prune_drops_old_known_versions_only() {
+        let old = put_at(1, 0, 10, Seen::new());
+        let concurrent = put_at(2, 0, 20, Seen::new());
+        let recent = put_at(1, 1, 50, Seen::new());
+        let head = put_at(1, 2, 60, Seen::new());
+        let mut state = state_of(&[old, concurrent.clone(), recent, head]);
+
+        assert_eq!(state.prune(40), Pruned::Changed);
+        assert_eq!(state.versions.len(), 3, "old is gone, the conflict stays");
+        assert_eq!(state.prune(40), Pruned::Unchanged);
+        assert!(state.conflicts().contains(&EntryRef::of(&concurrent.0)));
+    }
+
+    #[test]
+    fn test_prune_removes_a_key_deleted_long_ago() {
+        let put = put_at(1, 0, 10, Seen::new());
+        let mut state = state_of(&[put]);
+        state.record(&entry(1, 1, 20, Seen::new()), None);
+
+        assert_eq!(state.clone().prune(20), Pruned::Changed);
+        assert_eq!(state.prune(21), Pruned::Gone);
+    }
+
+    #[test]
+    fn test_prune_keeps_a_conflicted_delete() {
+        let put = put_at(2, 0, 10, Seen::new());
+        let mut state = state_of(&[put]);
+        state.record(&entry(1, 0, 20, Seen::new()), None);
+
+        assert_eq!(state.prune(100), Pruned::Unchanged);
+        assert!(state.is_conflicted());
     }
 
     #[test]

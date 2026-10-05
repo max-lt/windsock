@@ -1,6 +1,6 @@
 //! Remote object stores. The remote holds the only durable copy of the data.
 //!
-//! A remote has no delete operation: Windsock never deletes a remote object.
+//! [`Remote`] has no delete operation. Only the GC deletes, and only through [`Sweep`].
 
 mod dir;
 mod memory;
@@ -49,6 +49,13 @@ pub trait Remote: Send + Sync {
 
     /// Returns the keys that start with `prefix`, in lexicographic order.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError>;
+}
+
+/// A remote that can delete. Only the GC takes this bound: the write path uses [`Remote`].
+#[async_trait::async_trait]
+pub trait Sweep: Remote {
+    /// Deletes the object at `key`. A missing object is not an error, so a sweep can run again.
+    async fn delete(&self, key: &str) -> Result<(), RemoteError>;
 }
 
 fn check_key(key: &str) -> Result<(), RemoteError> {
@@ -221,6 +228,25 @@ mod tests {
                 }
 
                 #[tokio::test]
+                async fn test_delete_removes_the_object() {
+                    let (_guard, remote) = $make;
+                    remote.put("packs/a", Bytes::from("data")).await.unwrap();
+                    remote.put("packs/b", Bytes::from("data")).await.unwrap();
+
+                    remote.delete("packs/a").await.unwrap();
+
+                    assert!(remote.get("packs/a").await.unwrap().is_none());
+                    assert_eq!(remote.list("packs/").await.unwrap(), ["packs/b"]);
+                }
+
+                #[tokio::test]
+                async fn test_delete_of_a_missing_key_is_ok() {
+                    let (_guard, remote) = $make;
+
+                    remote.delete("packs/a").await.unwrap();
+                }
+
+                #[tokio::test]
                 async fn test_invalid_key_is_rejected() {
                     let (_guard, remote) = $make;
 
@@ -238,6 +264,10 @@ mod tests {
                                 Err(RemoteError::InvalidKey(_))
                             ),
                             "{key:?} was accepted by create"
+                        );
+                        assert!(
+                            matches!(remote.delete(key).await, Err(RemoteError::InvalidKey(_))),
+                            "{key:?} was accepted by delete"
                         );
                     }
 

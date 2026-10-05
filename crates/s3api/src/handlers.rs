@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
 use engine::{ObjectInfo, WriteMode};
 use remote::Remote;
@@ -130,9 +130,13 @@ fn object_headers(
         builder = builder.header("content-type", "binary/octet-stream");
     }
 
+    // Metadata can come from another proxy: skip what is not a valid header.
     for (name, value) in &info.metadata {
-        if let Ok(value) = HeaderValue::from_str(value) {
-            builder = builder.header(name.as_str(), value);
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(name, value);
         }
     }
 

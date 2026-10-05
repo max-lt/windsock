@@ -470,6 +470,38 @@ async fn test_metadata_comes_back() {
     assert_eq!(plain.header("content-type"), Some("binary/octet-stream"));
 }
 
+/// Metadata can come from the manifest of another proxy: a key that is not a
+/// header name must not break the response.
+#[tokio::test]
+async fn test_metadata_that_is_not_a_header_name_is_skipped() {
+    let server = with_bucket().await;
+    let metadata = std::collections::BTreeMap::from([
+        ("bad name\n".to_string(), "x".to_string()),
+        ("x-amz-meta-good".to_string(), "y".to_string()),
+    ]);
+    server
+        .engine
+        .put(
+            "bkt",
+            "k",
+            bytes::Bytes::from("data"),
+            metadata,
+            engine::WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    let read = run(&server, call("GET", "/bkt/k")).await;
+    let head = run(&server, call("HEAD", "/bkt/k")).await;
+
+    assert_eq!(
+        (read.status, read.text().as_str()),
+        (StatusCode::OK, "data")
+    );
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header("x-amz-meta-good"), Some("y"));
+}
+
 async fn put_plain(server: &Server) {
     put(server, "plain", "x").await;
 }

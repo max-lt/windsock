@@ -39,10 +39,6 @@ pub fn error(code: &str, message: &str) -> String {
     })
 }
 
-// ----------------------------------------------------------------------
-// Buckets
-// ----------------------------------------------------------------------
-
 #[derive(Serialize)]
 struct Owner {
     #[serde(rename = "ID")]
@@ -120,10 +116,6 @@ struct Location {
 pub fn location() -> String {
     to_xml(&Location { xmlns: XMLNS })
 }
-
-// ----------------------------------------------------------------------
-// Listing
-// ----------------------------------------------------------------------
 
 /// One entry of a listing page.
 pub struct ListedObject {
@@ -287,10 +279,6 @@ pub fn list_v1(page: &ListPage, marker: String, next_marker: Option<String>) -> 
     })
 }
 
-// ----------------------------------------------------------------------
-// Objects
-// ----------------------------------------------------------------------
-
 #[derive(Serialize)]
 #[serde(rename = "CopyObjectResult")]
 struct CopyResult {
@@ -380,10 +368,6 @@ pub fn parse_delete(body: &[u8]) -> Result<(Vec<String>, bool), S3Error> {
     let keys = request.object.into_iter().map(|o| o.key).collect();
     Ok((keys, request.quiet))
 }
-
-// ----------------------------------------------------------------------
-// Multipart uploads
-// ----------------------------------------------------------------------
 
 #[derive(Serialize)]
 #[serde(rename = "InitiateMultipartUploadResult")]

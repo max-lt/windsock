@@ -145,10 +145,6 @@ impl Index {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // Frontiers
-    // ------------------------------------------------------------------
-
     /// Frontier of applied entries, per node. Feed it to a new journal.
     pub fn frontiers(&self) -> Result<Frontiers> {
         let mut frontiers = Frontiers::new();
@@ -177,10 +173,6 @@ impl Index {
     pub fn seen(&self, own: NodeId) -> Result<Seen> {
         Ok(journal::seen_from(&self.frontiers()?, own))
     }
-
-    // ------------------------------------------------------------------
-    // Apply
-    // ------------------------------------------------------------------
 
     /// Applies every entry whose causal dependencies are applied, and keeps the
     /// others pending. Returns the number of entries applied.
@@ -396,10 +388,6 @@ impl Index {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // Queries
-    // ------------------------------------------------------------------
-
     pub fn object(&self, bucket: &str, key: &str) -> Result<Option<ObjectState>> {
         Ok(match self.objects.get(object_key(bucket, key))? {
             Some(value) => Some(postcard::from_bytes(&value)?),
@@ -450,10 +438,6 @@ impl Index {
         Ok(out)
     }
 
-    // ------------------------------------------------------------------
-    // Chunk locations
-    // ------------------------------------------------------------------
-
     /// Records where a chunk lives. A location in a condemned pack is ignored.
     pub fn put_chunk(&self, id: ChunkId, location: &ChunkLocation) -> Result<()> {
         if self.condemned_pack(location.pack)?.is_some() {
@@ -474,10 +458,6 @@ impl Index {
         })
     }
 
-    // ------------------------------------------------------------------
-    // Manifests
-    // ------------------------------------------------------------------
-
     /// Stores the bytes of a manifest. The caller checks them against `id`.
     pub fn put_manifest(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
         self.manifests.insert(id.as_bytes(), bytes)?;
@@ -490,10 +470,6 @@ impl Index {
             .get(id.as_bytes())?
             .map(|value| value.to_vec()))
     }
-
-    // ------------------------------------------------------------------
-    // Snapshots
-    // ------------------------------------------------------------------
 
     /// First seq of `node` that the journal prune has not checked yet.
     pub fn redacted_below(&self, node: NodeId) -> Result<u64> {
@@ -593,10 +569,6 @@ impl Index {
         self.pending.clear();
         Ok(())
     }
-
-    // ------------------------------------------------------------------
-    // GC
-    // ------------------------------------------------------------------
 
     /// HLC of the first condemn of a pack.
     pub fn condemned_pack(&self, id: PackId) -> Result<Option<u64>> {

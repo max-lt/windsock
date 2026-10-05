@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use buffer::{Buffer, BufferedObject, BufferedPut, Head, Intent, Op, SegmentReader};
-use plan::Planner;
+use plan::{Nonces, Planner};
 
 pub use config::{Chunking, Config, Policy, PrefixPolicy};
 pub use index::ObjectState;
@@ -752,7 +752,16 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     async fn flush_segments(&self, segments: &[u64]) -> Result<()> {
-        let mut planner = Planner::new(self.config.pack_target, self.config.own_pack_threshold);
+        let seed = blake3::Hasher::new()
+            .update(self.node.as_bytes())
+            .update(&buffer::unix_nanos().to_le_bytes())
+            .finalize();
+        let nonces = Nonces::new(*seed.as_bytes());
+        let mut planner = Planner::new(
+            self.config.pack_target,
+            self.config.own_pack_threshold,
+            nonces,
+        );
         let mut planned = Vec::new();
         let mut objects = 0;
 

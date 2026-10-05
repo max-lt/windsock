@@ -3,13 +3,14 @@
 //! Layout, all offsets relative to the start of the pack:
 //!
 //! ```text
-//! header   MAGIC | VERSION
+//! header   MAGIC | VERSION | nonce (16 bytes)
 //! body     stored chunks, back to back
 //! footer   postcard(Vec<PackEntry>)
 //! trailer  footer length (u32 LE) | MAGIC
 //! ```
 //!
-//! The PackId is the blake3 hash of the whole pack.
+//! The PackId is the blake3 hash of the whole pack. The nonce makes it unique per
+//! upload: the GC deletes a pack key, so the same key must never be written again.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -20,8 +21,11 @@ use model::{ChunkId, PackId};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: [u8; 4] = *b"WSPK";
-const VERSION: u8 = 1;
-const HEADER_LEN: usize = MAGIC.len() + 1;
+/// Makes every pack key unique, also for the same chunks.
+pub type Nonce = [u8; 16];
+
+const VERSION: u8 = 2;
+const HEADER_LEN: usize = MAGIC.len() + 1 + 16;
 const TRAILER_LEN: usize = 4 + MAGIC.len();
 
 /// Location and encoding of one chunk inside a pack.
@@ -71,11 +75,12 @@ pub struct PackBuilder {
     positions: HashMap<ChunkId, usize>,
 }
 
-impl Default for PackBuilder {
-    fn default() -> Self {
+impl PackBuilder {
+    pub fn new(nonce: Nonce) -> Self {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
+        bytes.extend_from_slice(&nonce);
 
         Self {
             bytes,
@@ -83,9 +88,7 @@ impl Default for PackBuilder {
             positions: HashMap::new(),
         }
     }
-}
 
-impl PackBuilder {
     /// Appends a chunk. Returns its entry.
     ///
     /// With `Compression::Zstd`, the chunk is stored compressed when zstd makes it smaller.
@@ -233,7 +236,7 @@ mod tests {
     }
 
     fn build(data: &[u8]) -> Pack {
-        let mut builder = PackBuilder::default();
+        let mut builder = PackBuilder::new([0u8; 16]);
         for chunk in chunking::chunks(data) {
             builder.add(chunk, Compression::Zstd);
         }
@@ -266,7 +269,7 @@ mod tests {
     fn test_duplicate_chunk_is_stored_once() {
         let data = random_bytes(3, 64 * 1024);
         let chunk = chunking::chunks(&data).next().unwrap();
-        let mut builder = PackBuilder::default();
+        let mut builder = PackBuilder::new([0u8; 16]);
 
         let first = builder.add(chunk, Compression::Zstd);
         let size = builder.size();
@@ -281,7 +284,7 @@ mod tests {
     fn test_uncompressed_mode_stores_raw_chunks() {
         let data = b"windsock ".repeat(4096);
         let chunk = chunking::chunks(&data).next().unwrap();
-        let mut builder = PackBuilder::default();
+        let mut builder = PackBuilder::new([0u8; 16]);
 
         let entry = builder.add(chunk, Compression::None);
         let pack = builder.finish();
@@ -295,8 +298,27 @@ mod tests {
     }
 
     #[test]
+    fn test_nonce_makes_the_pack_id_unique() {
+        let data = random_bytes(8, 64 * 1024);
+        let pack = |nonce: Nonce| {
+            let mut builder = PackBuilder::new(nonce);
+            for chunk in chunking::chunks(&data) {
+                builder.add(chunk, Compression::None);
+            }
+            builder.finish()
+        };
+
+        let first = pack([1u8; 16]);
+        let second = pack([2u8; 16]);
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.entries, second.entries);
+        assert_eq!(parse(second.id, &second.bytes).unwrap(), second.entries);
+    }
+
+    #[test]
     fn test_empty_pack_is_valid() {
-        let pack = PackBuilder::default().finish();
+        let pack = PackBuilder::new([0u8; 16]).finish();
 
         assert!(parse(pack.id, &pack.bytes).unwrap().is_empty());
     }
@@ -313,7 +335,7 @@ mod tests {
         );
         assert_eq!(
             pack.id.to_string(),
-            "24aae928236cf2b969facf7c3ffb1dae50f9b4ce0e0759653d2c2f983e8a26b2"
+            "0902018b845321b958a0431250fb52452684a18cb221685dc26e1cdc1b8ecd47"
         );
     }
 

@@ -371,6 +371,23 @@ async fn test_large_manifest_goes_to_the_remote() {
 }
 
 #[tokio::test]
+async fn test_rewrite_of_the_same_data_gets_a_new_manifest_key() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let data = random_bytes(1, 8 * 1024 * 1024);
+
+    for _ in 0..2 {
+        put(&a.engine, "big", &data).await;
+        a.engine.flush().await.unwrap();
+    }
+
+    assert_eq!(count(&*remote, "manifests/").await, 2);
+    assert_eq!(count(&*remote, "packs/").await, 1, "the chunks still dedup");
+    assert_eq!(get(&a.engine, "big").await.unwrap(), data);
+}
+
+#[tokio::test]
 async fn test_range_read_spans_chunks() {
     let remote = Arc::new(MemoryRemote::default());
     let a = proxy(&remote, 1).await;

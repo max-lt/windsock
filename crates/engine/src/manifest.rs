@@ -1,6 +1,8 @@
 //! Manifest format: an object as a list of chunks in packs.
 //!
 //! Layout: `VERSION | postcard(Manifest)`. The ObjectId is the blake3 hash of these bytes.
+//! The nonce makes it unique per write: the GC deletes `manifests/<id>`, so the same key
+//! must never be written again.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::EngineError;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Prefix of the manifests that are too large to inline in a journal entry.
 pub const MANIFESTS_PREFIX: &str = "manifests/";
@@ -27,6 +29,7 @@ pub struct ChunkRef {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    pub nonce: [u8; 16],
     pub size: u64,
     /// blake3 of the object data. Known at put time, so it can serve as a stable ETag.
     pub content_hash: [u8; 32],
@@ -99,6 +102,7 @@ mod tests {
         };
 
         Manifest {
+            nonce: [6u8; 16],
             size: 20,
             content_hash: [3u8; 32],
             metadata: BTreeMap::from([("content-type".into(), "text/plain".into())]),
@@ -129,7 +133,7 @@ mod tests {
     fn test_manifest_format_is_stable() {
         assert_eq!(
             manifest_id(&sample().encode()).to_string(),
-            "c8c475fb2a90ccaeb9fe77a2258ce3ff2229fb9f27135fb24d8f25eb737de596"
+            "b3fb0b2eb7894104c5b11c1ba96fb7f90169a5674fb5a3e449c3b02e0caeca18"
         );
     }
 

@@ -5,10 +5,33 @@ use std::ops::Range;
 
 use chunking::Chunk;
 use model::{ChunkId, PackId};
-use pack::{Pack, PackBuilder, PackEntry};
+use pack::{Nonce, Pack, PackBuilder, PackEntry};
 
 use crate::config::{Chunking, Policy};
 use crate::manifest::{ChunkRef, Manifest};
+
+/// Nonces for the packs and manifests of one flush.
+pub(crate) struct Nonces {
+    seed: [u8; 32],
+    next: u64,
+}
+
+impl Nonces {
+    /// `seed` must be different for every flush of every node.
+    pub fn new(seed: [u8; 32]) -> Self {
+        Self { seed, next: 0 }
+    }
+
+    fn next(&mut self) -> Nonce {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.seed).update(&self.next.to_le_bytes());
+        self.next += 1;
+
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        nonce
+    }
+}
 
 /// Where a chunk of a planned object goes.
 #[derive(Clone, Copy)]
@@ -40,6 +63,7 @@ struct PlannedObject {
 pub(crate) struct Planner {
     pack_target: usize,
     own_pack_threshold: usize,
+    nonces: Nonces,
     shared: Option<OpenPack>,
     /// PackId of every pack by number, once it is closed.
     pack_ids: Vec<Option<PackId>>,
@@ -49,10 +73,11 @@ pub(crate) struct Planner {
 }
 
 impl Planner {
-    pub fn new(pack_target: usize, own_pack_threshold: usize) -> Self {
+    pub fn new(pack_target: usize, own_pack_threshold: usize, nonces: Nonces) -> Self {
         Self {
             pack_target,
             own_pack_threshold,
+            nonces,
             shared: None,
             pack_ids: Vec::new(),
             placed: HashMap::new(),
@@ -96,7 +121,7 @@ impl Planner {
                 self.pack_ids.push(None);
                 OpenPack {
                     number: self.pack_ids.len() - 1,
-                    builder: PackBuilder::default(),
+                    builder: PackBuilder::new(self.nonces.next()),
                 }
             });
             let slot = Slot::Building {
@@ -132,6 +157,7 @@ impl Planner {
             .objects
             .into_iter()
             .map(|object| Manifest {
+                nonce: self.nonces.next(),
                 size: object.size,
                 content_hash: object.content_hash,
                 metadata: object.metadata,
@@ -213,6 +239,7 @@ mod tests {
     use chunking::Compression;
 
     use super::*;
+    use crate::manifest;
 
     fn random_bytes(seed: u8, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
@@ -249,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_small_objects_share_one_pack() {
-        let mut planner = Planner::new(1 << 30, 1 << 30);
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
 
         assert!(add(&mut planner, &random_bytes(1, 1000)).is_empty());
         assert!(add(&mut planner, &random_bytes(2, 1000)).is_empty());
@@ -264,7 +291,7 @@ mod tests {
     #[test]
     fn test_shared_pack_closes_at_target_size() {
         let chunk = chunking::MAX_SIZE;
-        let mut planner = Planner::new(2 * chunk, 1 << 30);
+        let mut planner = Planner::new(2 * chunk, 1 << 30, Nonces::new([0u8; 32]));
 
         let closed = add(&mut planner, &random_bytes(1, 3 * chunk));
         let (last, manifests) = planner.finish();
@@ -277,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_large_object_gets_its_own_pack() {
-        let mut planner = Planner::new(1 << 30, 2 * chunking::MAX_SIZE);
+        let mut planner = Planner::new(1 << 30, 2 * chunking::MAX_SIZE, Nonces::new([0u8; 32]));
 
         add(&mut planner, &random_bytes(1, 1000));
         let closed = add(&mut planner, &random_bytes(2, 2 * chunking::MAX_SIZE));
@@ -292,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_chunk_seen_twice_in_a_batch_is_packed_once() {
-        let mut planner = Planner::new(1 << 30, 1 << 30);
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
         let data = random_bytes(1, 1000);
 
         add(&mut planner, &data);
@@ -316,7 +343,7 @@ mod tests {
                 compression: Compression::None,
             },
         };
-        let mut planner = Planner::new(1 << 30, 1 << 30);
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
 
         planner
             .add(&data, [0u8; 32], BTreeMap::new(), fixed(), |_| {
@@ -330,8 +357,28 @@ mod tests {
     }
 
     #[test]
+    fn test_two_flushes_of_the_same_data_get_new_keys() {
+        let data = random_bytes(1, 1000);
+        let flush = |seed: u8| {
+            let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([seed; 32]));
+            add(&mut planner, &data);
+            let (last, manifests) = planner.finish();
+            (
+                last.unwrap().id,
+                manifest::manifest_id(&manifests[0].encode()),
+            )
+        };
+
+        let (first_pack, first_manifest) = flush(1);
+        let (second_pack, second_manifest) = flush(2);
+
+        assert_ne!(first_pack, second_pack);
+        assert_ne!(first_manifest, second_manifest);
+    }
+
+    #[test]
     fn test_empty_object_has_no_chunks() {
-        let mut planner = Planner::new(1 << 30, 1 << 30);
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
 
         add(&mut planner, b"");
         let (last, manifests) = planner.finish();

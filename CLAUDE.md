@@ -24,7 +24,8 @@ The daemon crate is `windsockd`.
 
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
-- `pack`: pack format (header, chunks, postcard footer, trailer), builder, parser, one-chunk read.
+- `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
+  one-chunk read.
 - `remote`: `Remote` trait (put, get, get_range, list, no delete), memory and local directory backends.
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.

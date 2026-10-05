@@ -21,7 +21,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use remote::{Remote, RemoteError, Sweep, check_key, check_prefix};
-use s3proto::sigv4;
+use s3proto::sigv4::{self, Slash};
 use tracing::debug;
 
 pub use retry::Retry;
@@ -123,11 +123,14 @@ impl S3Remote {
     }
 
     fn path(&self, key: Option<&str>) -> String {
-        let bucket = sigv4::uri_encode(self.config.bucket.as_bytes(), true);
+        let bucket = sigv4::uri_encode(self.config.bucket.as_bytes(), Slash::Encode);
         match key {
             Some(key) => {
                 let full = format!("{}{key}", self.config.prefix);
-                format!("/{bucket}/{}", sigv4::uri_encode(full.as_bytes(), false))
+                format!(
+                    "/{bucket}/{}",
+                    sigv4::uri_encode(full.as_bytes(), Slash::Keep)
+                )
             }
             None => format!("/{bucket}"),
         }
@@ -138,7 +141,12 @@ impl S3Remote {
         let query = call
             .query
             .iter()
-            .map(|(name, value)| format!("{name}={}", sigv4::uri_encode(value.as_bytes(), true)))
+            .map(|(name, value)| {
+                format!(
+                    "{name}={}",
+                    sigv4::uri_encode(value.as_bytes(), Slash::Encode)
+                )
+            })
             .collect::<Vec<_>>()
             .join("&");
         let now = SystemTime::now()

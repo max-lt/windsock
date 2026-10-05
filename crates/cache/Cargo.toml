@@ -8,7 +8,6 @@ publish.workspace = true
 model.workspace = true
 blake3.workspace = true
 bytes.workspace = true
-hex.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 tracing.workspace = true

@@ -242,6 +242,15 @@ pub(crate) struct Intent {
     pub planned_at: u64,
 }
 
+/// What a replay does with a record that does not read back whole.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnInvalid {
+    /// Cut the segment there: the record was never acknowledged.
+    CutTail,
+    /// Stop: a sealed segment is complete, so the damage is corruption.
+    Refuse,
+}
+
 struct Active {
     seq: u64,
     file: File,
@@ -276,14 +285,18 @@ impl Buffer {
         };
 
         for (i, &seq) in existing.iter().enumerate() {
-            let is_last = i + 1 == existing.len();
-            buffer.replay(seq, is_last).await?;
+            // Only the last segment can end in a torn record: a crash cut its last write.
+            let on_invalid = match i + 1 == existing.len() {
+                true => OnInvalid::CutTail,
+                false => OnInvalid::Refuse,
+            };
+            buffer.replay(seq, on_invalid).await?;
         }
 
         Ok(buffer)
     }
 
-    async fn replay(&mut self, seq: u64, is_last: bool) -> Result<(), EngineError> {
+    async fn replay(&mut self, seq: u64, on_invalid: OnInvalid) -> Result<(), EngineError> {
         let path = self.segment_path(seq);
         let mut reader = SegmentReader::open(&path).await?;
         let mut records = 0;
@@ -300,7 +313,7 @@ impl Buffer {
                     records += 1;
                 }
                 Read::End => break reader.len,
-                Read::Invalid(at) if is_last => {
+                Read::Invalid(at) if on_invalid == OnInvalid::CutTail => {
                     warn!(
                         segment = seq,
                         offset = at,

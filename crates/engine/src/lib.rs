@@ -505,7 +505,7 @@ impl<R: Remote + 'static> Engine<R> {
                 Current::Buffered(put) => {
                     let range = check_range(range.clone(), put.size)?;
                     let Some(data) = buffer::read_put(&self.buffer_dir, &put, range).await? else {
-                        // A flush released the segment: the write is in the index now.
+                        // A flush released the segment: the index already holds the write.
                         continue;
                     };
                     return Ok(Object {
@@ -1122,7 +1122,7 @@ impl<R: Remote + 'static> Engine<R> {
         // A pruned copy of the entry can come back from the remote: keep the whole one.
         entries.retain(|stashed| (stashed.node, stashed.seq) != (entry.node, entry.seq));
 
-        // Another process with this identity wrote entries that are now pruned.
+        // Another process with this identity wrote entries that a prune redacted.
         if entries.iter().any(|stashed| stashed.actions.is_none()) {
             if !self.bootstrap(journal).await? {
                 return Err(EngineError::Corrupt(

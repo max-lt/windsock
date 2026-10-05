@@ -31,7 +31,7 @@ pub struct GcReport {
     pub redacted_entries: usize,
 }
 
-/// Dead objects of one kind, split by what the GC does with them now.
+/// Dead objects of one kind, split by what this run does with them.
 struct Dead<T> {
     to_condemn: Vec<T>,
     to_delete: Vec<T>,

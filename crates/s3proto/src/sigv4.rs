@@ -67,14 +67,23 @@ impl Authorization {
     }
 }
 
-/// RFC 3986 encoding: everything but `A-Z a-z 0-9 - _ . ~` is `%XX`, and `/` when asked.
-pub fn uri_encode(bytes: &[u8], encode_slash: bool) -> String {
+/// What [`uri_encode`] does with `/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slash {
+    /// For query values and bucket names.
+    Encode,
+    /// For object keys in a path.
+    Keep,
+}
+
+/// RFC 3986 encoding: everything but `A-Z a-z 0-9 - _ . ~` is `%XX`, and `/` unless kept.
+pub fn uri_encode(bytes: &[u8], slash: Slash) -> String {
     let mut out = String::with_capacity(bytes.len());
 
     for &b in bytes {
         let plain = b.is_ascii_alphanumeric()
             || matches!(b, b'-' | b'_' | b'.' | b'~')
-            || (b == b'/' && !encode_slash);
+            || (b == b'/' && slash == Slash::Keep);
 
         if plain {
             out.push(b as char);
@@ -119,8 +128,8 @@ pub fn canonical_query(query: &str) -> String {
         .map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             (
-                uri_encode(&percent_decode(name), true),
-                uri_encode(&percent_decode(value), true),
+                uri_encode(&percent_decode(name), Slash::Encode),
+                uri_encode(&percent_decode(value), Slash::Encode),
             )
         })
         .collect();

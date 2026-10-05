@@ -5,9 +5,10 @@
 //! restart reads only the new entries. Pending entries are not persisted: a
 //! restart reads them again.
 
+mod snapshot;
 mod state;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
@@ -17,6 +18,7 @@ use pack::PackEntry;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+pub use snapshot::Snapshot;
 pub use state::{BucketState, EntryRef, ObjectState, Pruned, Version, knew};
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +29,8 @@ pub enum IndexError {
     Corrupt(#[from] postcard::Error),
     #[error("entry {seq} of node {node} links to an entry with another hash")]
     LinkMismatch { node: NodeId, seq: u64 },
+    #[error("entry {seq} of node {node} is redacted: load a snapshot that covers it")]
+    Redacted { node: NodeId, seq: u64 },
 }
 
 type Result<T> = std::result::Result<T, IndexError>;
@@ -62,6 +66,8 @@ pub struct Index {
     manifests: Keyspace,
     /// `tag | id` to the lowest HLC of a condemn: the same for every apply order.
     condemned: Keyspace,
+    /// Node to the first seq not yet checked by the journal prune. Local progress only.
+    redacted: Keyspace,
     pending: Vec<Entry>,
     _temp: Option<tempfile::TempDir>,
 }
@@ -126,6 +132,7 @@ impl Index {
             pack_chunks: db.keyspace("pack_chunks", KeyspaceCreateOptions::default)?,
             manifests: db.keyspace("manifests", KeyspaceCreateOptions::default)?,
             condemned: db.keyspace("condemned", KeyspaceCreateOptions::default)?,
+            redacted: db.keyspace("redacted", KeyspaceCreateOptions::default)?,
             db,
             pending: Vec::new(),
             _temp: temp,
@@ -231,12 +238,28 @@ impl Index {
             return Ok(Readiness::Wait);
         }
 
+        if entry.actions.is_none() {
+            return Err(IndexError::Redacted {
+                node: entry.node,
+                seq: entry.seq,
+            });
+        }
+
         for (node, link) in &entry.seen {
-            let Some(applied) = self.entries.get(entry_key(*node, link.seq))? else {
+            let applied = self.frontier(*node)?;
+
+            if applied.next_seq <= link.seq {
                 return Ok(Readiness::Wait);
+            }
+
+            let matches = match self.entries.get(entry_key(*node, link.seq))? {
+                Some(hash) => hash[..] == link.hash[..],
+                // Below a loaded snapshot only the last hash of each chain is known.
+                None if link.seq + 1 == applied.next_seq => applied.last_hash == link.hash,
+                None => true,
             };
 
-            if applied[..] != link.hash[..] {
+            if !matches {
                 return Err(IndexError::LinkMismatch {
                     node: entry.node,
                     seq: entry.seq,
@@ -469,6 +492,109 @@ impl Index {
     }
 
     // ------------------------------------------------------------------
+    // Snapshots
+    // ------------------------------------------------------------------
+
+    /// First seq of `node` that the journal prune has not checked yet.
+    pub fn redacted_below(&self, node: NodeId) -> Result<u64> {
+        let Some(value) = self.redacted.get(node.as_bytes())? else {
+            return Ok(0);
+        };
+
+        let bytes: [u8; 8] = value[..].try_into().map_err(|_| corrupt())?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    pub fn set_redacted_below(&self, node: NodeId, seq: u64) -> Result<()> {
+        self.redacted.insert(node.as_bytes(), seq.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// The applied state. Pending entries are left out: a reader reads them again.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let mut objects = Vec::new();
+        let mut manifests = BTreeMap::new();
+
+        for guard in self.objects.iter() {
+            let (key, value) = guard.into_inner()?;
+            let state: ObjectState = postcard::from_bytes(&value)?;
+
+            for id in state.versions.iter().filter_map(|v| v.manifest_id) {
+                if let Some(bytes) = self.manifest(id)? {
+                    manifests.insert(id, bytes);
+                }
+            }
+            objects.push((key.to_vec(), state));
+        }
+
+        let mut buckets = Vec::new();
+        for guard in self.buckets.iter() {
+            let (name, value) = guard.into_inner()?;
+            buckets.push((
+                String::from_utf8_lossy(&name).into_owned(),
+                postcard::from_bytes(&value)?,
+            ));
+        }
+
+        let mut condemned = Vec::new();
+        for guard in self.condemned.iter() {
+            let (key, value) = guard.into_inner()?;
+            let hlc: [u8; 8] = value[..].try_into().map_err(|_| corrupt())?;
+            condemned.push((key.to_vec(), u64::from_be_bytes(hlc)));
+        }
+
+        Ok(Snapshot {
+            frontiers: self.frontiers()?,
+            objects,
+            buckets,
+            condemned,
+            manifests: manifests.into_iter().collect(),
+        })
+    }
+
+    /// Replaces the applied state with `snapshot`. Chunk locations are cleared:
+    /// the caller rebuilds them from the manifests.
+    pub fn load(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let mut clear = self.db.batch();
+        for keyspace in [
+            &self.frontiers,
+            &self.entries,
+            &self.objects,
+            &self.buckets,
+            &self.chunks,
+            &self.pack_chunks,
+            &self.condemned,
+        ] {
+            for guard in keyspace.iter() {
+                let (key, _) = guard.into_inner()?;
+                clear.remove(keyspace, key);
+            }
+        }
+        clear.commit()?;
+
+        let mut fill = self.db.batch();
+        for (node, frontier) in &snapshot.frontiers {
+            fill.insert(&self.frontiers, node.as_bytes(), encode(frontier));
+        }
+        for (key, state) in &snapshot.objects {
+            fill.insert(&self.objects, key.as_slice(), encode(state));
+        }
+        for (name, state) in &snapshot.buckets {
+            fill.insert(&self.buckets, name.as_bytes(), encode(state));
+        }
+        for (key, hlc) in &snapshot.condemned {
+            fill.insert(&self.condemned, key.as_slice(), hlc.to_be_bytes());
+        }
+        for (id, bytes) in &snapshot.manifests {
+            fill.insert(&self.manifests, id.as_bytes(), bytes.as_slice());
+        }
+        fill.commit()?;
+
+        self.pending.clear();
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // GC
     // ------------------------------------------------------------------
 
@@ -573,9 +699,9 @@ mod tests {
     }
 
     /// Everything a reader can observe.
-    type Snapshot = (Vec<(String, ObjectState)>, Vec<(String, BucketState)>);
+    type View = (Vec<(String, ObjectState)>, Vec<(String, BucketState)>);
 
-    fn snapshot(index: &Index) -> Snapshot {
+    fn snapshot_view(index: &Index) -> View {
         (index.list("b", "").unwrap(), index.buckets().unwrap())
     }
 
@@ -645,7 +771,7 @@ mod tests {
         let mut fresh = journal(&remote, 8);
         rebuilt.apply(fresh.sync_all().await.unwrap()).unwrap();
 
-        assert_eq!(snapshot(&rebuilt), snapshot(&incremental));
+        assert_eq!(snapshot_view(&rebuilt), snapshot_view(&incremental));
         assert_eq!(
             rebuilt.frontiers().unwrap(),
             incremental.frontiers().unwrap()
@@ -722,10 +848,10 @@ mod tests {
         let mut reader = journal(&remote, 9);
         let entries = reader.sync_all().await.unwrap();
         index.apply(entries.clone()).unwrap();
-        let before = snapshot(&index);
+        let before = snapshot_view(&index);
 
         assert_eq!(index.apply(entries).unwrap(), 0);
-        assert_eq!(snapshot(&index), before);
+        assert_eq!(snapshot_view(&index), before);
     }
 
     #[tokio::test]
@@ -1003,6 +1129,150 @@ mod tests {
         );
         assert_eq!(index.resolve("b", "kept").unwrap(), Some(manifest(5)));
         assert_eq!(index.prune_versions(15).unwrap(), 0);
+    }
+
+    /// A redacted entry has no actions: applying it as empty would lose them silently.
+    #[tokio::test]
+    async fn test_redacted_entry_is_refused() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let entry = a.append(put("k", 1), Seen::new()).await.unwrap();
+        let mut index = Index::open_temporary().unwrap();
+
+        let result = index.apply(vec![entry.redacted()]);
+
+        assert!(matches!(result, Err(IndexError::Redacted { seq: 0, .. })));
+        assert_eq!(index.frontier(a.node()).unwrap(), Frontier::GENESIS);
+    }
+
+    /// An index with a bucket, two writes, a delete and a condemn from node 1,
+    /// and the entries it applied.
+    async fn busy_index(remote: &Arc<MemoryRemote>) -> (Index, Vec<Entry>) {
+        let mut a = journal(remote, 1);
+        let mut entries = vec![
+            a.append(create_bucket("b"), Seen::new()).await.unwrap(),
+            a.append(put("x", 1), Seen::new()).await.unwrap(),
+            a.append(put("y", 2), Seen::new()).await.unwrap(),
+        ];
+        let delete = vec![Action::Delete {
+            bucket: "b".into(),
+            key: "x".into(),
+        }];
+        entries.push(a.append(delete, Seen::new()).await.unwrap());
+        let condemn = vec![Action::Condemn {
+            packs: vec![PackId::from_bytes([7u8; 32])],
+            manifests: vec![],
+        }];
+        entries.push(a.append(condemn, Seen::new()).await.unwrap());
+
+        let mut index = Index::open_temporary().unwrap();
+        index.put_manifest(manifest(2), b"inline").unwrap();
+        index.apply(entries.clone()).unwrap();
+        (index, entries)
+    }
+
+    #[test]
+    fn test_snapshot_format_is_stable() {
+        let snapshot = Snapshot {
+            frontiers: Frontiers::from([(
+                NodeId::from_bytes([1u8; 32]),
+                Frontier {
+                    next_seq: 3,
+                    last_hash: [2u8; 32],
+                    last_hlc: 4,
+                },
+            )]),
+            objects: vec![(b"key".to_vec(), ObjectState::default())],
+            buckets: vec![],
+            condemned: vec![(vec![b'p'; 33], 5)],
+            manifests: vec![(manifest(6), b"m".to_vec())],
+        };
+
+        assert_eq!(
+            blake3::hash(&snapshot.encode()).to_string(),
+            "9c6fbf9848442f5b3fbf82aec4b65a4452a57651382f53a7ca8836475899a2b1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loaded_snapshot_gives_the_same_state() {
+        let remote = Arc::new(MemoryRemote::default());
+        let (source, _) = busy_index(&remote).await;
+        let snapshot = source.snapshot().unwrap();
+        let bytes = snapshot.encode();
+        let decoded = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes).unwrap();
+
+        let mut target = Index::open_temporary().unwrap();
+        let stray = Entry::sign(&key(5), 3, [0u8; 32], 1, Seen::new(), put("z", 9));
+        target.apply(vec![stray]).unwrap();
+        target.load(&decoded).unwrap();
+
+        assert_eq!(target.snapshot().unwrap(), snapshot);
+        assert_eq!(snapshot_view(&target), snapshot_view(&source));
+        assert_eq!(target.pending(), 0);
+        assert_eq!(target.manifest(manifest(2)).unwrap().unwrap(), b"inline");
+        assert!(
+            target
+                .condemned_pack(PackId::from_bytes([7u8; 32]))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_decode_rejects_a_wrong_hash() {
+        let bytes = Index::open_temporary()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .encode();
+
+        assert!(Snapshot::decode(&[0u8; 32], &bytes).is_err());
+    }
+
+    /// After a load, the index has no hash for the entries under the frontier.
+    /// A link to one of them must not wait forever.
+    #[tokio::test]
+    async fn test_link_below_a_loaded_snapshot_does_not_block() {
+        let remote = Arc::new(MemoryRemote::default());
+        let (source, entries) = busy_index(&remote).await;
+        let mut target = Index::open_temporary().unwrap();
+        target.load(&source.snapshot().unwrap()).unwrap();
+        let links = |seq: usize| {
+            Seen::from([(
+                entries[seq].node,
+                journal::Link {
+                    seq: seq as u64,
+                    hash: entries[seq].hash(),
+                },
+            )])
+        };
+        let old_link = Entry::sign(&key(2), 0, [0u8; 32], 99, links(1), put("k", 3));
+        let last_link = Entry::sign(&key(3), 0, [0u8; 32], 99, links(4), put("j", 4));
+
+        assert_eq!(target.apply(vec![old_link, last_link]).unwrap(), 2);
+        assert_eq!(target.resolve("b", "k").unwrap(), Some(manifest(3)));
+    }
+
+    #[tokio::test]
+    async fn test_link_to_the_last_entry_of_a_loaded_snapshot_is_checked() {
+        let remote = Arc::new(MemoryRemote::default());
+        let (source, entries) = busy_index(&remote).await;
+        let mut target = Index::open_temporary().unwrap();
+        target.load(&source.snapshot().unwrap()).unwrap();
+        let forged = Seen::from([(
+            entries[4].node,
+            journal::Link {
+                seq: 4,
+                hash: [9u8; 32],
+            },
+        )]);
+        let entry = Entry::sign(&key(2), 0, [0u8; 32], 99, forged, put("k", 3));
+
+        assert!(matches!(
+            target.apply(vec![entry]),
+            Err(IndexError::LinkMismatch { .. })
+        ));
     }
 
     #[test]

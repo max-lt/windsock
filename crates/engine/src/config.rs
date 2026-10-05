@@ -56,6 +56,8 @@ pub struct Config {
     pub gc_horizon: Duration,
     /// A version stays readable for this long after a newer write or a delete.
     pub retention: Duration,
+    /// The GC writes a snapshot when the latest one is this old, then prunes the journal under it.
+    pub snapshot_interval: Duration,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -70,6 +72,7 @@ impl Default for Config {
             buffer_limit: 8 * 1024 * 1024 * 1024,
             gc_horizon: Duration::from_secs(24 * 3600),
             retention: Duration::from_secs(24 * 3600),
+            snapshot_interval: Duration::from_secs(24 * 3600),
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

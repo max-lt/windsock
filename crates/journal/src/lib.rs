@@ -246,6 +246,12 @@ impl<R: Remote> Journal<R> {
         Ok(entries)
     }
 
+    /// Reads again from `frontiers`, as after a snapshot load.
+    pub fn reset(&mut self, frontiers: Frontiers) {
+        self.frontiers = frontiers;
+        self.stashed.clear();
+    }
+
     /// Own-chain entries that a commit read and that no sync returned yet.
     pub fn take_stashed(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.stashed)

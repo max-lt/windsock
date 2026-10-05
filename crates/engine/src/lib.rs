@@ -10,6 +10,7 @@ mod config;
 mod gc;
 mod manifest;
 mod plan;
+mod snapshot;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -36,6 +37,7 @@ pub use config::{Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::ObjectState;
 pub use manifest::{ChunkRef, INLINE_MAX, MANIFESTS_PREFIX, Manifest, manifest_id, manifest_key};
+pub use snapshot::SNAPSHOTS_PREFIX;
 
 /// Prefix of all pack keys.
 pub const PACKS_PREFIX: &str = "packs/";
@@ -193,7 +195,7 @@ impl<R: Remote + 'static> Engine<R> {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
         }
 
-        Ok(Self {
+        let engine = Self {
             node: journal.node(),
             remote,
             config,
@@ -205,7 +207,18 @@ impl<R: Remote + 'static> Engine<R> {
             last_sync: Mutex::new(None),
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
-        })
+        };
+
+        // A proxy with no state starts from the latest snapshot, not from every chain.
+        // On failure, the first sync that meets a redacted entry loads it.
+        if engine.index().frontiers()?.is_empty() {
+            let mut journal = engine.journal.lock().await;
+            if let Err(e) = engine.bootstrap(&mut journal).await {
+                warn!(%e, "no snapshot loaded at open");
+            }
+        }
+
+        Ok(engine)
     }
 
     pub fn node(&self) -> NodeId {
@@ -607,7 +620,18 @@ impl<R: Remote + 'static> Engine<R> {
             .lock()
             .expect("no panic while the lock is held") = Some(started);
 
-        let entries = journal.sync_all().await?;
+        let mut entries = journal.sync_all().await?;
+
+        // Entries under the latest snapshot can be redacted: read from the snapshot instead.
+        if entries.iter().any(|entry| entry.actions.is_none()) {
+            if !self.bootstrap(journal).await? {
+                return Err(EngineError::Corrupt(
+                    "redacted entries and no snapshot".to_string(),
+                ));
+            }
+            entries = journal.sync_all().await?;
+        }
+
         let mut applied = 0;
 
         if !entries.is_empty() {
@@ -680,8 +704,6 @@ impl<R: Remote + 'static> Engine<R> {
     /// Stores the manifests that entries carry or name, and the chunk locations they give.
     /// The data is in the remote before the entry, so this can run before the entries apply.
     async fn ingest(&self, entries: &[Entry]) -> Result<()> {
-        let seen_at = buffer::unix_nanos() / 1_000_000_000;
-
         for action in entries.iter().flat_map(|e| e.actions.iter().flatten()) {
             let Action::Put {
                 manifest_id,
@@ -705,18 +727,27 @@ impl<R: Remote + 'static> Engine<R> {
                 Err(e) => return Err(e),
             };
 
-            let index = self.index();
-            for chunk in &manifest.chunks {
-                if index.chunk(chunk.entry.chunk_id)?.is_some() {
-                    continue;
-                }
-                let location = ChunkLocation {
-                    pack: chunk.pack,
-                    entry: chunk.entry,
-                    seen_at,
-                };
-                index.put_chunk(chunk.entry.chunk_id, &location)?;
+            self.record_chunks(&manifest)?;
+        }
+
+        Ok(())
+    }
+
+    /// Records the chunk locations of a manifest, for dedup.
+    fn record_chunks(&self, manifest: &Manifest) -> Result<()> {
+        let seen_at = buffer::unix_nanos() / 1_000_000_000;
+        let index = self.index();
+
+        for chunk in &manifest.chunks {
+            if index.chunk(chunk.entry.chunk_id)?.is_some() {
+                continue;
             }
+            let location = ChunkLocation {
+                pack: chunk.pack,
+                entry: chunk.entry,
+                seen_at,
+            };
+            index.put_chunk(chunk.entry.chunk_id, &location)?;
         }
 
         Ok(())
@@ -950,6 +981,19 @@ impl<R: Remote + 'static> Engine<R> {
     /// persists the index: the buffer may drop the writes after this.
     async fn apply_own(&self, journal: &mut Journal<R>, entry: Entry) -> Result<()> {
         let mut entries = journal.take_stashed();
+        // A pruned copy of the entry can come back from the remote: keep the whole one.
+        entries.retain(|stashed| (stashed.node, stashed.seq) != (entry.node, entry.seq));
+
+        // Another process with this identity wrote entries that are now pruned.
+        if entries.iter().any(|stashed| stashed.actions.is_none()) {
+            if !self.bootstrap(journal).await? {
+                return Err(EngineError::Corrupt(
+                    "redacted entries and no snapshot".to_string(),
+                ));
+            }
+            entries.clear();
+        }
+
         entries.push(entry);
 
         self.ingest(&entries).await?;

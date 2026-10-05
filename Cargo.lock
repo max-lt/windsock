@@ -337,6 +337,7 @@ dependencies = [
  "bytes",
  "chunking",
  "ed25519-dalek",
+ "hex",
  "index",
  "journal",
  "model",
@@ -529,6 +530,7 @@ checksum = "9633fadf6346456cf8531119ba4838bc6d82ac4ce84d9852126dd2aa34d49264"
 name = "index"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chunking",
  "ed25519-dalek",
  "fjall",

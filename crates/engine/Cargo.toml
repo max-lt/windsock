@@ -12,6 +12,7 @@ remote.workspace = true
 journal.workspace = true
 index.workspace = true
 blake3.workspace = true
+hex.workspace = true
 bytes.workspace = true
 ed25519-dalek.workspace = true
 postcard.workspace = true

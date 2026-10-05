@@ -26,6 +26,9 @@ pub struct GcReport {
     pub pruned_keys: usize,
     /// The stable HLC is more than R ahead of the GC clock: the clock assumption does not hold.
     pub prune_refused: bool,
+    pub snapshot_written: bool,
+    /// Journal entries replaced by their redacted form.
+    pub redacted_entries: usize,
 }
 
 /// Dead objects of one kind, split by what the GC does with them now.
@@ -96,6 +99,14 @@ impl<R: Sweep + 'static> Engine<R> {
                 .index()
                 .prune_versions(stable.saturating_sub(retention))?;
         }
+
+        let interval = self.config.snapshot_interval.as_nanos() as u64;
+        let latest = self.latest_snapshot_time().await?;
+        if latest.is_none_or(|time| buffer::unix_nanos() >= time.saturating_add(interval)) {
+            self.snapshot().await?;
+            report.snapshot_written = true;
+        }
+        report.redacted_entries = self.prune_journal().await?;
 
         info!(?report, "gc run");
         Ok(report)

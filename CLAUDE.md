@@ -32,10 +32,10 @@ The daemon crate is `windsockd`.
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
-  condemned packs and manifests, live manifests, stable HLC, version prune.
+  condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
 - `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
   policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss,
-  GC (`gc.rs`: condemn, delete after H, version prune).
+  GC (`gc.rs`: condemn, delete after H, version prune), snapshots and journal prune (`snapshot.rs`).
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.
@@ -43,7 +43,9 @@ The daemon crate is `windsockd`.
 ## Invariants
 
 - The remote is the source of truth. Local state is a cache. A proxy can rebuild it from the remote.
-- Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once.
+- Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once. One
+  exception: the journal prune replaces a log entry once with its redacted form (same hash, same
+  signature), so the key stays taken and the chain stays valid.
 - Only the GC deletes remote objects. The write path never deletes.
 - The GC deletes a pack or a manifest only when no current object uses it, after a condemn entry
   in the journal and a GC sync that starts a horizon H (24 h) later. A writer dedups only after a
@@ -52,6 +54,8 @@ The daemon crate is `windsockd`.
 - A fresh upload gets a new remote key (a nonce in packs and manifests). A deleted key is never
   written again.
 - A proxy that applied a condemn of a pack never learns that pack again.
+- An index never applies a redacted entry. A proxy with no state, or one that meets a redacted
+  entry, loads the latest snapshot and reads the chains from its frontiers.
 - Clock assumption: no proxy clock is more than R (version retention, 24 h) away from the others.
   The version prune drops versions below (stable HLC - R), and refuses to run when the stable HLC
   is more than R ahead of the GC clock.

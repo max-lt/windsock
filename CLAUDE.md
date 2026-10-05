@@ -39,6 +39,9 @@ The daemon crate is `windsockd`.
   policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss,
   GC (`gc.rs`: condemn, delete after H, version prune), snapshots and journal prune (`snapshot.rs`),
   chunk cache use per prefix (`ReadWrite`, `Read`, `Off`).
+- `s3api`: S3 over HTTP (axum) on the engine. SigV4 in the header (payload hash checked, aws-chunked
+  decoded, 15 min clock skew), keys from configuration, ListObjects v1 and v2 with paging, conditional
+  GET/HEAD, multipart uploads with parts on local disk. ETag = blake3 hex of the data.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.
@@ -117,6 +120,11 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Local index | `fjall` v3 |
 | Tests | `tempfile` |
 | Model checking | `stateright` |
+| HTTP server | `axum` 0.8 |
+| XML | `quick-xml` with `serialize` |
+| SigV4 | `hmac`, `sha2`, `subtle` |
+| URL form encoding | `form_urlencoded` |
+| HTTP tests | `tower` (`util`), `http-body-util` |
 
 Add a crate to this table when a milestone adds it.
 

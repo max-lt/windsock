@@ -144,6 +144,8 @@ pub struct SyncReport {
 pub struct BucketInfo {
     pub name: String,
     pub owner: Option<String>,
+    /// Unix nanoseconds of the create: acknowledgement time while buffered, entry HLC once flushed.
+    pub created: u64,
 }
 
 /// The current state of one key, from the buffer first, then the index.
@@ -305,16 +307,16 @@ impl<R: Remote + 'static> Engine<R> {
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         let buffer = self.buffer.lock().await;
-        let mut buckets: BTreeMap<String, Option<String>> = self
+        let mut buckets: BTreeMap<String, (Option<String>, u64)> = self
             .index()
             .buckets()?
             .into_iter()
-            .map(|(name, state)| (name, state.owner))
+            .map(|(name, state)| (name, (state.owner, state.hlc)))
             .collect();
 
         for (name, state) in buffer.buckets() {
             if state.exists {
-                buckets.insert(name.to_string(), state.owner.clone());
+                buckets.insert(name.to_string(), (state.owner.clone(), state.time));
             } else {
                 buckets.remove(name);
             }
@@ -322,7 +324,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         Ok(buckets
             .into_iter()
-            .map(|(name, owner)| BucketInfo { name, owner })
+            .map(|(name, (owner, created))| BucketInfo {
+                name,
+                owner,
+                created,
+            })
             .collect())
     }
 
@@ -331,6 +337,7 @@ impl<R: Remote + 'static> Engine<R> {
             return Ok(state.exists.then(|| BucketInfo {
                 name: name.to_string(),
                 owner: state.owner.clone(),
+                created: state.time,
             }));
         }
 
@@ -341,6 +348,7 @@ impl<R: Remote + 'static> Engine<R> {
             .map(|state| BucketInfo {
                 name: name.to_string(),
                 owner: state.owner,
+                created: state.hlc,
             }))
     }
 

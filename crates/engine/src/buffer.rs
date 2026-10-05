@@ -230,6 +230,7 @@ pub(crate) struct BufferedBucket {
     pub segment: u64,
     pub exists: bool,
     pub owner: Option<String>,
+    pub time: u64,
 }
 
 /// What a flush must commit, and the segments to delete once it is in the remote.
@@ -404,6 +405,7 @@ impl Buffer {
                     segment,
                     exists: true,
                     owner: owner.clone(),
+                    time: head.time,
                 };
                 self.buckets.insert(bucket.clone(), state);
             }
@@ -412,6 +414,7 @@ impl Buffer {
                     segment,
                     exists: false,
                     owner: None,
+                    time: head.time,
                 };
                 self.buckets.insert(bucket.clone(), state);
             }

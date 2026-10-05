@@ -16,8 +16,17 @@ journal = { path = "crates/journal" }
 index = { path = "crates/index" }
 engine = { path = "crates/engine" }
 cache = { path = "crates/cache" }
+s3api = { path = "crates/s3api" }
 
 async-trait = "0.1"
+axum = "0.8"
+form_urlencoded = "1"
+hmac = "0.12"
+http-body-util = "0.1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+sha2 = "0.10"
+subtle = "2"
+tower = { version = "0.5", features = ["util"] }
 blake3 = { version = "1", features = ["pure"] }
 bytes = "1"
 ed25519-dalek = "2"

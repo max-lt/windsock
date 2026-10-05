@@ -19,7 +19,9 @@ cache = { path = "crates/cache" }
 s3api = { path = "crates/s3api" }
 s3proto = { path = "crates/s3proto" }
 s3remote = { path = "crates/s3remote" }
+windsockd = { path = "crates/windsockd" }
 
+anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 form_urlencoded = "1"
@@ -30,6 +32,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
 sha2 = "0.10"
 subtle = "2"
+toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 blake3 = { version = "1", features = ["pure"] }
 bytes = "1"
@@ -45,6 +48,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 strip = true

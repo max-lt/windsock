@@ -46,6 +46,9 @@ The daemon crate is `windsockd`.
 - `s3api`: S3 over HTTP (axum) on the engine. SigV4 in the header (payload hash checked, aws-chunked
   decoded, 15 min clock skew), keys from configuration, ListObjects v1 and v2 with paging, conditional
   GET/HEAD, multipart uploads with parts on local disk. ETag = blake3 hex of the data.
+- `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
+  serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
+  `README.md` has the steps to run it locally.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.
@@ -126,6 +129,9 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Model checking | `stateright` |
 | HTTP server | `axum` 0.8 |
 | HTTP client | `hyper` 1, `hyper-util` (`client-legacy`) |
+| Daemon errors | `anyhow` (only in `windsockd`) |
+| Configuration | `toml` 0.8 |
+| Log output | `tracing-subscriber` with `env-filter` |
 | XML | `quick-xml` with `serialize` |
 | SigV4 | `hmac`, `sha2`, `subtle` |
 | URL form encoding | `form_urlencoded` |

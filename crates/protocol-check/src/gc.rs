@@ -12,21 +12,17 @@
 
 use stateright::{Model, Property};
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum Kind {
+/// A journal entry. Only the time of a condemn matters to the rules, so only a
+/// condemn has one: two puts at different times are one state.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Entry {
     Put { key: u8, pack: u8 },
     Delete { key: u8 },
-    Condemn { pack: u8 },
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct Entry {
-    pub time: u8,
-    pub kind: Kind,
+    Condemn { pack: u8, at: u8 },
 }
 
 /// A put between its plan and its entry. It survives a crash, as the intent file does.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Plan {
     pub key: u8,
     pub pack: u8,
@@ -34,7 +30,7 @@ pub struct Plan {
 }
 
 /// A journal reader: the first `applied` entries of the log, read at `synced_at`.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Reader {
     pub applied: u8,
     pub synced_at: Option<u8>,
@@ -45,7 +41,7 @@ const FRESH: Reader = Reader {
     synced_at: None,
 };
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Writer {
     pub reader: Reader,
     pub plan: Option<Plan>,
@@ -75,33 +71,41 @@ impl State {
 }
 
 /// The last put or delete of `key`.
-fn head(view: &[Entry], key: u8) -> Option<Kind> {
-    view.iter().rev().map(|e| e.kind).find(|kind| match kind {
-        Kind::Put { key: k, .. } | Kind::Delete { key: k } => *k == key,
-        Kind::Condemn { .. } => false,
+fn head(view: &[Entry], key: u8) -> Option<Entry> {
+    view.iter().rev().copied().find(|entry| match entry {
+        Entry::Put { key: k, .. } | Entry::Delete { key: k } => *k == key,
+        Entry::Condemn { .. } => false,
     })
 }
 
 /// A current object uses `pack`.
 fn is_live(view: &[Entry], keys: u8, pack: u8) -> bool {
-    (0..keys).any(|key| head(view, key) == Some(Kind::Put { key, pack }))
+    (0..keys).any(|key| head(view, key) == Some(Entry::Put { key, pack }))
 }
 
-/// The condemn of `pack` that no later put revived.
-fn standing_condemn(view: &[Entry], pack: u8) -> Option<Entry> {
-    view.iter().rev().copied().find_map(|e| match e.kind {
-        Kind::Put { pack: p, .. } if p == pack => Some(None),
-        Kind::Condemn { pack: p } if p == pack => Some(Some(e)),
+/// The time of the condemn of `pack` that no later put revived.
+fn standing_condemn(view: &[Entry], pack: u8) -> Option<u8> {
+    view.iter().rev().find_map(|entry| match *entry {
+        Entry::Put { pack: p, .. } if p == pack => Some(None),
+        Entry::Condemn { pack: p, at } if p == pack => Some(Some(at)),
         _ => None,
     })?
 }
 
+fn names(entry: &Entry, pack: u8) -> bool {
+    matches!(*entry, Entry::Put { pack: p, .. } if p == pack)
+}
+
 /// A pack that a writer index holds: a put named it, and no condemn came after.
 fn is_known(view: &[Entry], pack: u8) -> bool {
-    let named = view
-        .iter()
-        .any(|e| matches!(e.kind, Kind::Put { pack: p, .. } if p == pack));
-    named && standing_condemn(view, pack).is_none()
+    view.iter().any(|e| names(e, pack)) && standing_condemn(view, pack).is_none()
+}
+
+/// Writers are interchangeable: no entry records which writer wrote it.
+pub fn representative(state: &State) -> State {
+    let mut sorted = state.clone();
+    sorted.writers.sort();
+    sorted
 }
 
 /// Rules of the protocol. A check with one rule off shows that the rule is needed.
@@ -196,8 +200,7 @@ impl GcModel {
     }
 
     fn commit(&self, s: &mut State, writer: usize) -> bool {
-        let w = &s.writers[writer];
-        let Some(plan) = w.plan else {
+        let Some(plan) = s.writers[writer].plan else {
             return false;
         };
 
@@ -209,14 +212,10 @@ impl GcModel {
             return false;
         }
 
-        let entry = Entry {
-            time: s.time,
-            kind: Kind::Put {
-                key: plan.key,
-                pack: plan.pack,
-            },
-        };
-        s.log.push(entry);
+        s.log.push(Entry::Put {
+            key: plan.key,
+            pack: plan.pack,
+        });
         s.writers[writer].plan = None;
         true
     }
@@ -233,26 +232,23 @@ impl GcModel {
             return false;
         }
 
-        s.log.push(Entry {
-            time: s.time,
-            kind: Kind::Condemn { pack },
-        });
+        s.log.push(Entry::Condemn { pack, at: s.time });
         true
     }
 
     fn sweep(&self, s: &mut State, pack: u8) -> bool {
         let view = s.view(s.gc);
-        let Some(condemn) = standing_condemn(view, pack) else {
+        let Some(condemned_at) = standing_condemn(view, pack) else {
             return false;
         };
-
-        let waited =
-            s.gc.synced_at
-                .is_some_and(|synced| synced >= condemn.time + self.horizon);
 
         if s.packs & bit(pack) == 0 || is_live(view, self.keys, pack) {
             return false;
         }
+
+        let waited =
+            s.gc.synced_at
+                .is_some_and(|synced| synced >= condemned_at + self.horizon);
 
         if self.rules.sweep_after_horizon && !waited {
             return false;
@@ -344,10 +340,7 @@ impl Model for GcModel {
             Action::Commit { writer } => self.commit(&mut s, writer),
             Action::Abort { writer } => s.writers[writer].plan.take().is_some(),
             Action::Delete { key } => {
-                s.log.push(Entry {
-                    time: s.time,
-                    kind: Kind::Delete { key },
-                });
+                s.log.push(Entry::Delete { key });
                 true
             }
             Action::Crash { writer } => {
@@ -370,7 +363,7 @@ impl Model for GcModel {
         vec![
             Property::always(READABLE, |m: &Self, s: &State| {
                 (0..m.keys).all(|key| match head(&s.log, key) {
-                    Some(Kind::Put { pack, .. }) => s.packs & bit(pack) != 0,
+                    Some(Entry::Put { pack, .. }) => s.packs & bit(pack) != 0,
                     _ => true,
                 })
             }),
@@ -378,18 +371,16 @@ impl Model for GcModel {
                 (0..s.issued).any(|pack| s.packs & bit(pack) == 0)
             }),
             Property::sometimes("a put dedups against another put", |_: &Self, s: &State| {
-                s.log.iter().enumerate().any(|(i, e)| match e.kind {
-                    Kind::Put { pack, .. } => s.log[..i]
-                        .iter()
-                        .any(|f| matches!(f.kind, Kind::Put { pack: p, .. } if p == pack)),
+                s.log.iter().enumerate().any(|(i, e)| match *e {
+                    Entry::Put { pack, .. } => s.log[..i].iter().any(|f| names(f, pack)),
                     _ => false,
                 })
             }),
             Property::sometimes("a put revives a condemned pack", |_: &Self, s: &State| {
-                s.log.iter().enumerate().any(|(i, e)| match e.kind {
-                    Kind::Put { pack, .. } => {
-                        s.log[..i].iter().any(|f| f.kind == Kind::Condemn { pack })
-                    }
+                s.log.iter().enumerate().any(|(i, e)| match *e {
+                    Entry::Put { pack, .. } => s.log[..i]
+                        .iter()
+                        .any(|f| matches!(*f, Entry::Condemn { pack: p, .. } if p == pack)),
                     _ => false,
                 })
             }),
@@ -418,31 +409,31 @@ mod tests {
         }
     }
 
-    fn check(model: GcModel, finish: HasDiscoveries) -> impl Checker<GcModel> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    fn threads() -> usize {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+
+    fn check_safe(model: GcModel) {
         model
             .checker()
-            .threads(threads)
-            .finish_when(finish)
+            .threads(threads())
+            .symmetry_fn(representative)
+            .finish_when(HasDiscoveries::AnyFailures)
             .spawn_dfs()
             .join()
+            .assert_properties();
     }
 
     /// Breadth first: the shortest loss is a few steps deep.
     fn assert_loses_data(rules: Rules) {
         let first_loss = HasDiscoveries::AnyOf(BTreeSet::from([READABLE]));
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         model(rules)
             .checker()
-            .threads(threads)
+            .threads(threads())
             .finish_when(first_loss)
             .spawn_bfs()
             .join()
             .assert_any_discovery(READABLE);
-    }
-
-    fn check_safe(model: GcModel) {
-        check(model, HasDiscoveries::AnyFailures).assert_properties();
     }
 
     #[test]
@@ -462,11 +453,13 @@ mod tests {
         });
     }
 
+    /// The one-writer checks cover a crash with a plan in the intent file.
     #[test]
     #[ignore = "model check: run on a build machine"]
     fn test_sweep_rules_are_safe_with_two_writers() {
         check_safe(GcModel {
             writers: 2,
+            max_crashes: 0,
             ..model(SAFE)
         });
     }

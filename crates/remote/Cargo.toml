@@ -10,6 +10,10 @@ bytes.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 
+[features]
+# The contract checks, for the tests of backends in other crates.
+contract = ["tokio/rt"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

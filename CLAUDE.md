@@ -27,7 +27,11 @@ The daemon crate is `windsockd`.
 - `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
   one-chunk read.
 - `remote`: `Remote` trait (put, create, get, get_range, list, no delete), `Sweep` trait (delete,
-  GC only), memory and local directory backends.
+  GC only), memory and local directory backends, the contract checks (`contract`, feature `contract`)
+  that every backend passes.
+- `s3proto`: SigV4 (header signing, aws-chunked) and S3 date formats, for the server and the client.
+- `s3remote`: `Remote` and `Sweep` in an S3 bucket over plain HTTP: SigV4 with the body hash,
+  create via `If-None-Match: *`, retries with backoff and time limits. No TLS yet (open point).
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
@@ -121,6 +125,7 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | Tests | `tempfile` |
 | Model checking | `stateright` |
 | HTTP server | `axum` 0.8 |
+| HTTP client | `hyper` 1, `hyper-util` (`client-legacy`) |
 | XML | `quick-xml` with `serialize` |
 | SigV4 | `hmac`, `sha2`, `subtle` |
 | URL form encoding | `form_urlencoded` |

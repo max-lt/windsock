@@ -8,8 +8,6 @@ mod error;
 mod handlers;
 mod list;
 mod multipart;
-pub mod sigv4;
-mod time;
 mod xml;
 
 use std::collections::HashMap;
@@ -24,6 +22,7 @@ use engine::Engine;
 use remote::Remote;
 
 pub use error::S3Error;
+pub use s3proto::sigv4;
 
 use multipart::Uploads;
 

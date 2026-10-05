@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::S3Error;
-use crate::time::iso8601;
+use s3proto::time::iso8601;
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 

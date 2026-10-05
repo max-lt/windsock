@@ -7,17 +7,15 @@ publish.workspace = true
 [dependencies]
 engine.workspace = true
 remote.workspace = true
+s3proto.workspace = true
 axum.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 form_urlencoded.workspace = true
 hex.workspace = true
-hmac.workspace = true
 postcard.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
-sha2.workspace = true
-subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net"] }
 tracing.workspace = true

@@ -12,9 +12,9 @@ use remote::Remote;
 use tracing::info;
 
 use crate::list::{After, Item, page};
-use crate::time::{http_date, parse_http_date};
 use crate::xml::{self, ListPage, ListedObject};
 use crate::{AppState, Caller, S3Error};
+use s3proto::time::{http_date, parse_http_date};
 
 type Reply = Result<axum::response::Response, S3Error>;
 type Params = Query<BTreeMap<String, String>>;

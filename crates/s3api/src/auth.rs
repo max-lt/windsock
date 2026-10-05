@@ -13,9 +13,9 @@ use bytes::Bytes;
 use remote::Remote;
 use tracing::debug;
 
-use crate::sigv4::{self, Authorization, ChunkSigner};
-use crate::time::parse_amz_date;
 use crate::{AppState, Caller, S3Error};
+use s3proto::sigv4::{self, Authorization, ChunkSigner};
+use s3proto::time::parse_amz_date;
 
 /// AWS rejects a request whose `x-amz-date` is further than this from its clock.
 const MAX_SKEW_SECS: u64 = 15 * 60;

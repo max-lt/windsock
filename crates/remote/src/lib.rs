@@ -2,6 +2,8 @@
 //!
 //! [`Remote`] has no delete operation. Only the GC deletes, and only through [`Sweep`].
 
+#[cfg(any(test, feature = "contract"))]
+pub mod contract;
 mod dir;
 mod memory;
 
@@ -28,6 +30,13 @@ pub enum RemoteError {
     AlreadyExists(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A remote service answered with an error that a retry does not fix.
+    #[error("remote service error {status} {code}: {message}")]
+    Service {
+        status: u16,
+        code: String,
+        message: String,
+    },
 }
 
 /// A blob store with `/`-separated string keys, such as `packs/<pack_id>`.
@@ -58,7 +67,8 @@ pub trait Sweep: Remote {
     async fn delete(&self, key: &str) -> Result<(), RemoteError>;
 }
 
-fn check_key(key: &str) -> Result<(), RemoteError> {
+/// Checks the key rules of [`Remote`]. Backends call it before any I/O.
+pub fn check_key(key: &str) -> Result<(), RemoteError> {
     let valid = !key.is_empty()
         && key
             .split('/')
@@ -71,7 +81,8 @@ fn check_key(key: &str) -> Result<(), RemoteError> {
     Ok(())
 }
 
-fn check_prefix(prefix: &str) -> Result<(), RemoteError> {
+/// Checks a list prefix: empty, or a key, with or without a trailing `/`.
+pub fn check_prefix(prefix: &str) -> Result<(), RemoteError> {
     if prefix.is_empty() {
         return Ok(());
     }
@@ -97,198 +108,23 @@ fn check_range(key: &str, range: &Range<u64>, len: u64) -> Result<(), RemoteErro
 mod tests {
     use super::*;
 
-    /// One test per remote behavior, run on every backend.
-    macro_rules! contract_tests {
-        ($backend:ident, $make:expr) => {
-            mod $backend {
-                use super::*;
-
-                #[tokio::test]
-                async fn test_put_get_roundtrip() {
-                    let (_guard, remote) = $make;
-                    remote.put("packs/a", Bytes::from("data")).await.unwrap();
-
-                    assert_eq!(remote.get("packs/a").await.unwrap().unwrap(), "data");
-                }
-
-                #[tokio::test]
-                async fn test_missing_object_is_none() {
-                    let (_guard, remote) = $make;
-
-                    assert!(remote.get("packs/a").await.unwrap().is_none());
-                    assert!(remote.get_range("packs/a", 0..1).await.unwrap().is_none());
-                }
-
-                #[tokio::test]
-                async fn test_put_replaces_object() {
-                    let (_guard, remote) = $make;
-                    remote.put("heads/a", Bytes::from("old")).await.unwrap();
-                    remote.put("heads/a", Bytes::from("new")).await.unwrap();
-
-                    assert_eq!(remote.get("heads/a").await.unwrap().unwrap(), "new");
-                }
-
-                #[tokio::test]
-                async fn test_get_range_returns_slice() {
-                    let (_guard, remote) = $make;
-                    remote
-                        .put("packs/a", Bytes::from("0123456789"))
-                        .await
-                        .unwrap();
-
-                    let middle = remote.get_range("packs/a", 2..5).await.unwrap().unwrap();
-                    let empty = remote.get_range("packs/a", 10..10).await.unwrap().unwrap();
-
-                    assert_eq!(middle, "234");
-                    assert!(empty.is_empty());
-                }
-
-                #[tokio::test]
-                async fn test_get_range_outside_object_is_rejected() {
-                    let (_guard, remote) = $make;
-                    remote.put("packs/a", Bytes::from("0123")).await.unwrap();
-
-                    assert!(matches!(
-                        remote.get_range("packs/a", 2..5).await,
-                        Err(RemoteError::InvalidRange { len: 4, .. })
-                    ));
-                    #[allow(clippy::reversed_empty_ranges)]
-                    let reversed = remote.get_range("packs/a", 3..1).await;
-                    assert!(matches!(reversed, Err(RemoteError::InvalidRange { .. })));
-                }
-
-                #[tokio::test]
-                async fn test_list_returns_sorted_keys_under_prefix() {
-                    let (_guard, remote) = $make;
-                    for key in ["heads/b", "heads/a", "packs/x", "headsx", "log/a/b"] {
-                        remote.put(key, Bytes::from(key)).await.unwrap();
-                    }
-
-                    assert_eq!(remote.list("heads/").await.unwrap(), ["heads/a", "heads/b"]);
-                    assert_eq!(
-                        remote.list("heads").await.unwrap(),
-                        ["heads/a", "heads/b", "headsx"]
-                    );
-                    assert_eq!(
-                        remote.list("").await.unwrap(),
-                        ["heads/a", "heads/b", "headsx", "log/a/b", "packs/x"]
-                    );
-                    assert!(remote.list("snapshots/").await.unwrap().is_empty());
-                }
-
-                #[tokio::test]
-                async fn test_create_writes_a_new_key() {
-                    let (_guard, remote) = $make;
-                    remote.create("log/a", Bytes::from("data")).await.unwrap();
-
-                    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "data");
-                }
-
-                #[tokio::test]
-                async fn test_create_keeps_the_existing_object() {
-                    let (_guard, remote) = $make;
-                    remote.put("log/a", Bytes::from("old")).await.unwrap();
-
-                    let result = remote.create("log/a", Bytes::from("new")).await;
-
-                    assert!(matches!(result, Err(RemoteError::AlreadyExists(_))));
-                    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "old");
-                }
-
-                #[tokio::test(flavor = "multi_thread")]
-                async fn test_concurrent_creates_have_one_winner() {
-                    let (_guard, remote) = $make;
-                    let remote = std::sync::Arc::new(remote);
-                    let mut tasks = tokio::task::JoinSet::new();
-
-                    for i in 0..8u8 {
-                        let remote = remote.clone();
-                        tasks.spawn(async move {
-                            remote
-                                .create("log/a", Bytes::from(vec![i]))
-                                .await
-                                .map(|()| i)
-                        });
-                    }
-
-                    let mut winners = Vec::new();
-                    while let Some(result) = tasks.join_next().await {
-                        match result.unwrap() {
-                            Ok(i) => winners.push(i),
-                            Err(RemoteError::AlreadyExists(_)) => {}
-                            Err(e) => panic!("{e}"),
-                        }
-                    }
-
-                    assert_eq!(winners.len(), 1);
-                    assert_eq!(
-                        remote.get("log/a").await.unwrap().unwrap(),
-                        vec![winners[0]]
-                    );
-                }
-
-                #[tokio::test]
-                async fn test_delete_removes_the_object() {
-                    let (_guard, remote) = $make;
-                    remote.put("packs/a", Bytes::from("data")).await.unwrap();
-                    remote.put("packs/b", Bytes::from("data")).await.unwrap();
-
-                    remote.delete("packs/a").await.unwrap();
-
-                    assert!(remote.get("packs/a").await.unwrap().is_none());
-                    assert_eq!(remote.list("packs/").await.unwrap(), ["packs/b"]);
-                }
-
-                #[tokio::test]
-                async fn test_delete_of_a_missing_key_is_ok() {
-                    let (_guard, remote) = $make;
-
-                    remote.delete("packs/a").await.unwrap();
-                }
-
-                #[tokio::test]
-                async fn test_invalid_key_is_rejected() {
-                    let (_guard, remote) = $make;
-
-                    for key in ["", "/abs", "a//b", "a/", "../x", "a/../b", ".tmp", "a/.b"] {
-                        assert!(
-                            matches!(
-                                remote.put(key, Bytes::new()).await,
-                                Err(RemoteError::InvalidKey(_))
-                            ),
-                            "{key:?} was accepted by put"
-                        );
-                        assert!(
-                            matches!(
-                                remote.create(key, Bytes::new()).await,
-                                Err(RemoteError::InvalidKey(_))
-                            ),
-                            "{key:?} was accepted by create"
-                        );
-                        assert!(
-                            matches!(remote.delete(key).await, Err(RemoteError::InvalidKey(_))),
-                            "{key:?} was accepted by delete"
-                        );
-                    }
-
-                    for prefix in ["/", "../", "a//"] {
-                        assert!(
-                            matches!(remote.list(prefix).await, Err(RemoteError::InvalidKey(_))),
-                            "{prefix:?} was accepted"
-                        );
-                    }
-                }
-            }
-        };
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_memory_remote_meets_the_contract() {
+        contract::check(|| async { MemoryRemote::default() }).await;
     }
 
-    contract_tests!(memory, ((), MemoryRemote::default()));
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dir_remote_meets_the_contract() {
+        let dirs = std::sync::Mutex::new(Vec::new());
 
-    contract_tests!(dir, {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = DirRemote::open(dir.path()).unwrap();
-        (dir, remote)
-    });
+        contract::check(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let remote = DirRemote::open(dir.path()).unwrap();
+            dirs.lock().unwrap().push(dir);
+            async move { remote }
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn test_dir_remote_persists_across_open() {

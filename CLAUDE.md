@@ -52,6 +52,9 @@ The daemon crate is `windsockd`.
 - A fresh upload gets a new remote key (a nonce in packs and manifests). A deleted key is never
   written again.
 - A proxy that applied a condemn of a pack never learns that pack again.
+- Clock assumption: no proxy clock is more than R (version retention, 24 h) away from the others.
+  The version prune drops versions below (stable HLC - R), and refuses to run when the stable HLC
+  is more than R ahead of the GC clock.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
 - An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
 - An entry lists in `seen` the last entry of every other chain its writer had applied (not read).

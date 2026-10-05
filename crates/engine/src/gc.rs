@@ -24,6 +24,8 @@ pub struct GcReport {
     pub deleted_manifests: usize,
     /// Keys whose old versions or old delete left the index.
     pub pruned_keys: usize,
+    /// The stable HLC is more than R ahead of the GC clock: the clock assumption does not hold.
+    pub prune_refused: bool,
 }
 
 /// Dead objects of one kind, split by what the GC does with them now.
@@ -80,8 +82,20 @@ impl<R: Sweep + 'static> Engine<R> {
             report.deleted_manifests += 1;
         }
 
-        let below = self.index().stable_hlc()?.saturating_sub(retention);
-        report.pruned_keys = self.index().prune_versions(below)?;
+        // The prune assumes no proxy clock is more than R behind the others.
+        let stable = self.index().stable_hlc()?;
+        let now = buffer::unix_nanos();
+        if stable > now.saturating_add(retention) {
+            warn!(
+                stable,
+                started, "version prune refused: the stable HLC is far ahead of this clock"
+            );
+            report.prune_refused = true;
+        } else {
+            report.pruned_keys = self
+                .index()
+                .prune_versions(stable.saturating_sub(retention))?;
+        }
 
         info!(?report, "gc run");
         Ok(report)

@@ -266,11 +266,7 @@ async fn test_writer_with_an_old_sync_does_not_dedup_against_a_condemned_pack() 
     let report = a.engine.gc().await.unwrap();
 
     assert_eq!(report.deleted_packs, 1, "the condemned pack is gone");
-    assert_eq!(
-        count(&remote, "packs/").await,
-        1,
-        "b uploaded its own pack"
-    );
+    assert_eq!(count(&remote, "packs/").await, 1, "b uploaded its own pack");
     assert_eq!(get(&a.engine, "y").await.unwrap(), data);
 }
 
@@ -343,6 +339,40 @@ async fn test_old_intent_that_was_written_is_not_written_again() {
     assert_eq!(count(&remote, "log/").await, 1);
     assert_eq!(count(&remote, "packs/").await, 1);
     assert_eq!(get(&a.engine, "k").await.unwrap(), b"data");
+}
+
+/// A chain whose HLC runs far ahead of the GC clock raises the stable HLC past real
+/// time: a proxy with a correct clock could then write under the prune bound.
+#[tokio::test]
+async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
+    let remote = Arc::new(TestRemote::default());
+    let ahead = SigningKey::from_bytes(&[9u8; 32]);
+    let node = model::NodeId::from_bytes(ahead.verifying_key().to_bytes());
+    let far_future = u64::MAX / 2;
+    let entry = journal::Entry::sign(
+        &ahead,
+        0,
+        [0u8; 32],
+        far_future,
+        journal::Seen::new(),
+        vec![],
+    );
+    remote
+        .put(
+            &entry.remote_key(),
+            Bytes::from(postcard::to_allocvec(&entry).unwrap()),
+        )
+        .await
+        .unwrap();
+    remote
+        .put(&journal::node_key(node), Bytes::new())
+        .await
+        .unwrap();
+    let a = proxy(&remote, 1).await;
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(report.prune_refused);
 }
 
 #[tokio::test]

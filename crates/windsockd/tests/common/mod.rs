@@ -27,6 +27,8 @@ pub struct Daemon {
     child: Child,
     pub address: String,
     lines: Receiver<String>,
+    /// Every line read so far, to print when a test fails.
+    seen: Vec<String>,
 }
 
 /// Starts `windsockd run` and waits for its listening address in the log.
@@ -53,6 +55,7 @@ pub fn start(config: &Path, log: &str) -> Daemon {
         child,
         address: String::new(),
         lines,
+        seen: Vec::new(),
     };
     let line = daemon
         .wait_for("address=", Duration::from_secs(30))
@@ -74,8 +77,12 @@ impl Daemon {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.lines.recv_timeout(left) {
-                Ok(line) if line.contains(needle) => return Some(line),
-                Ok(_) => {}
+                Ok(line) => {
+                    self.seen.push(line.clone());
+                    if line.contains(needle) {
+                        return Some(line);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
             }
         }
@@ -110,8 +117,16 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
+    /// Kills a daemon that a failed test left running, and prints its whole log.
     fn drop(&mut self) {
         self.child.kill().ok();
+
+        if std::thread::panicking() {
+            self.seen.extend(self.lines.try_iter());
+            for line in &self.seen {
+                eprintln!("[{}] {line}", self.address);
+            }
+        }
     }
 }
 

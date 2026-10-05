@@ -49,6 +49,8 @@ The daemon crate is `windsockd`.
 - `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
   `README.md` has the steps to run it locally.
+- `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with
+  `scripts/bench.sh`; the numbers are in `../windsock-todo.md`, milestone 14.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.

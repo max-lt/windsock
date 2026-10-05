@@ -20,6 +20,7 @@ s3api = { path = "crates/s3api" }
 s3proto = { path = "crates/s3proto" }
 s3remote = { path = "crates/s3remote" }
 windsockd = { path = "crates/windsockd" }
+bench = { path = "crates/bench" }
 
 anyhow = "1"
 async-trait = "0.1"

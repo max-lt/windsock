@@ -79,8 +79,8 @@ pub struct GcConfig {
     pub enabled: bool,
     pub interval_secs: u64,
     /// H of the GC rules. Every proxy of a remote must use the same value: writers use it too.
-    pub horizon_hours: u64,
-    pub retention_hours: u64,
+    pub horizon_secs: u64,
+    pub retention_secs: u64,
 }
 
 impl Default for GcConfig {
@@ -88,8 +88,8 @@ impl Default for GcConfig {
         Self {
             enabled: false,
             interval_secs: 3600,
-            horizon_hours: 24,
-            retention_hours: 24,
+            horizon_secs: 24 * 3600,
+            retention_secs: 24 * 3600,
         }
     }
 }
@@ -142,8 +142,8 @@ impl Config {
             cache_bytes: self.engine.cache_bytes,
             flush_delay: Duration::from_millis(self.engine.flush_delay_ms),
             buffer_limit: self.engine.buffer_limit_bytes,
-            gc_horizon: Duration::from_secs(self.gc.horizon_hours * 3600),
-            retention: Duration::from_secs(self.gc.retention_hours * 3600),
+            gc_horizon: Duration::from_secs(self.gc.horizon_secs),
+            retention: Duration::from_secs(self.gc.retention_secs),
             ..engine::Config::default()
         }
     }
@@ -241,7 +241,7 @@ mod tests {
             matches!(config.remote, RemoteConfig::S3 { ref region, .. } if region == "us-east-1")
         );
         assert!(config.gc.enabled);
-        assert_eq!(config.gc.horizon_hours, 24);
+        assert_eq!(config.gc.horizon_secs, 86_400);
         assert_eq!(config.listen, "127.0.0.1:9000");
         assert_eq!(config.engine().gc_horizon, Duration::from_secs(24 * 3600));
     }

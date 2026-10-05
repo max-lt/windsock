@@ -91,7 +91,17 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&bytes))
 }
 
+/// Below this, a slow flush can take longer than half the horizon and never commit.
+const SHORT_HORIZON_SECS: u64 = 3600;
+
 async fn run(config: &Config) -> Result<()> {
+    if config.gc.horizon_secs < SHORT_HORIZON_SECS {
+        warn!(
+            horizon_secs = config.gc.horizon_secs,
+            "gc.horizon_secs is under one hour: a flush that plans and uploads for longer than \
+             half of it fails with StalePlan and never commits"
+        );
+    }
     std::fs::create_dir_all(&config.data_dir)?;
     let key = node_key(&config.data_dir)?;
 

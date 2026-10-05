@@ -596,6 +596,34 @@ async fn test_uncompressed_policy_stores_raw_chunks() {
     assert_eq!(get(&a.engine, "k").await.unwrap(), data);
 }
 
+/// After a crash, the replayed writes must not wait a whole flush delay for the remote.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_flusher_flushes_a_replayed_buffer_at_once() {
+    let remote = Arc::new(MemoryRemote::default());
+    let slow = Config {
+        flush_delay: Duration::from_secs(60),
+        ..Config::default()
+    };
+    let a = proxy_with(&remote, 1, slow.clone()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "k", b"acknowledged").await;
+    let a = restart(&remote, 1, a, slow).await;
+    let engine = Arc::new(a.engine);
+
+    let flusher = engine.spawn_flusher();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while count(&*remote, "log/").await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no flush within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    flusher.abort();
+    drop(a.dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_flusher_uploads_within_the_delay() {
     let remote = Arc::new(MemoryRemote::default());

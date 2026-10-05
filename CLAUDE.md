@@ -64,6 +64,9 @@ The daemon crate is `windsockd`.
   in the journal and a GC sync that starts a horizon H (24 h) later. A writer dedups only after a
   sync younger than H/2, and commits only a plan younger than H/2. `protocol-check/src/gc.rs`
   checks these rules; each one is needed.
+- A flush batch must plan and upload in less than H/2, or rule 2 refuses its commit (StalePlan)
+  every time and the writes never reach the journal. H stays far above one batch: 24 h by default,
+  and `windsockd` warns under one hour.
 - A fresh upload gets a new remote key (a nonce in packs and manifests). A deleted key is never
   written again.
 - A proxy that applied a condemn of a pack never learns that pack again.

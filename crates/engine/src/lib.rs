@@ -902,21 +902,22 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(())
     }
 
-    /// Flushes every `flush_delay`, or sooner once a pack worth of data is buffered.
+    /// Flushes at once, then every `flush_delay`, or sooner once a pack worth of data is buffered.
     pub fn spawn_flusher(self: &Arc<Self>) -> JoinHandle<()> {
         let engine = Arc::clone(self);
 
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    () = tokio::time::sleep(engine.config.flush_delay) => {}
-                    () = engine.flush_wanted.notified() => {}
-                }
-
+                // The first pass runs at once: writes replayed after a crash do not wait.
                 if let Err(e) = engine.flush().await {
                     warn!(%e, "flush failed");
                     // Without a pause, a full buffer retries on every put while the remote is down.
                     tokio::time::sleep(engine.config.flush_delay).await;
+                }
+
+                tokio::select! {
+                    () = tokio::time::sleep(engine.config.flush_delay) => {}
+                    () = engine.flush_wanted.notified() => {}
                 }
             }
         })

@@ -32,14 +32,20 @@ The daemon crate is `windsockd`.
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers.
 - `engine`: object operations. NVMe write-back buffer (segments, replay, intent file), per-prefix
   policy, pack planning, inline manifests, group commit, reads from buffer then remote, sync on miss.
-- `protocol-check`: Stateright model of the journal write and sync protocol. Its two slow tests are
-  `#[ignore]`: run them in release on a build machine, never on the laptop.
+- `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
+  pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
+  never on the laptop.
 
 ## Invariants
 
 - The remote is the source of truth. Local state is a cache. A proxy can rebuild it from the remote.
 - Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once.
-- Windsock never deletes a remote object.
+- Only the GC deletes remote objects. The write path never deletes.
+- The GC deletes a pack or a manifest only when no current object uses it, after a condemn entry
+  in the journal and a GC sync that starts a horizon H (24 h) later. A writer dedups only after a
+  sync younger than H/2, and commits only a plan younger than H/2. `protocol-check/src/gc.rs`
+  checks these rules; each one is needed.
+- A fresh upload gets a new remote key. A deleted key is never written again.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
 - An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
 - An entry lists in `seen` the last entry of every other chain its writer had applied (not read).
@@ -120,4 +126,4 @@ Add a crate to this table when a milestone adds it.
 
 - No `unwrap()` in library code. Use `expect("reason")` only for an invariant that cannot fail.
 - No `unsafe`.
-- No erasure coding, no replication between proxies, no consensus, no GC, no refcount.
+- No erasure coding, no replication between proxies, no consensus, no refcount.

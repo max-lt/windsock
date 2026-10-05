@@ -12,6 +12,8 @@
 //! An entry id stands for its content hash: two writes never share an id.
 //! Sets of entries are bitmasks over entry ids, to keep states small.
 
+pub mod gc;
+
 use stateright::{Model, Property};
 
 /// A journal entry. `node` is an index into the node identities.

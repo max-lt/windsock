@@ -1,8 +1,12 @@
-//! Windsock bench on a local directory remote, through the S3 API.
+//! Windsock bench through the S3 API, on a local directory remote or on an S3 remote.
 //!
 //! ```text
 //! windsock-bench [--runs 5] [--seconds 15] [--rate 500] [--out bench.md] [--dir /tmp]
+//!                [--remote http://host:port --remote-bucket name]
 //! ```
+//!
+//! With `--remote`, the keys come from `BENCH_REMOTE_ACCESS_KEY` and `BENCH_REMOTE_SECRET_KEY`.
+//! Each run writes under its own key prefix in that bucket.
 //!
 //! Each run uses new directories. The report gives the median, the lowest and
 //! the highest value of each measure over the runs, and the load of the machine.
@@ -22,6 +26,7 @@ use hyper::StatusCode;
 use tokio::sync::Semaphore;
 use tracing::info;
 
+use s3remote::{Retry, S3Config, S3Remote};
 use support::{CountingRemote, S3Client, Server, load_average, percentile, random_bytes, spread};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -32,6 +37,13 @@ const MAX_SIZE: usize = 500 * 1024;
 const COLD_SAMPLE: usize = 200;
 const CAPACITY_WORKERS: usize = 32;
 const REPLAY_BYTES: usize = 512 * 1024 * 1024;
+const RTT_SAMPLES: usize = 50;
+
+/// An S3 bucket that holds the remote objects.
+struct RemoteBucket {
+    endpoint: String,
+    bucket: String,
+}
 
 struct Args {
     runs: usize,
@@ -39,6 +51,7 @@ struct Args {
     rate: u64,
     out: PathBuf,
     dir: PathBuf,
+    remote: Option<RemoteBucket>,
 }
 
 fn args() -> Result<Args, Error> {
@@ -48,8 +61,10 @@ fn args() -> Result<Args, Error> {
         rate: 500,
         out: PathBuf::from("bench.md"),
         dir: std::env::temp_dir(),
+        remote: None,
     };
     let given: Vec<String> = std::env::args().skip(1).collect();
+    let (mut endpoint, mut bucket) = (None, None);
 
     for pair in given.chunks(2) {
         let [name, value] = pair else {
@@ -61,11 +76,56 @@ fn args() -> Result<Args, Error> {
             "--rate" => args.rate = value.parse()?,
             "--out" => args.out = PathBuf::from(value),
             "--dir" => args.dir = PathBuf::from(value),
+            "--remote" => endpoint = Some(value.clone()),
+            "--remote-bucket" => bucket = Some(value.clone()),
             other => return Err(format!("unknown option {other}").into()),
         }
     }
 
+    args.remote = match (endpoint, bucket) {
+        (None, None) => None,
+        (Some(endpoint), Some(bucket)) => Some(RemoteBucket { endpoint, bucket }),
+        _ => return Err("--remote and --remote-bucket go together".into()),
+    };
     Ok(args)
+}
+
+/// The remote of one part of one run: a new directory, or a new key prefix in the S3 bucket.
+fn open_remote(args: &Args, dir: &Path, name: &str) -> Result<CountingRemote, Error> {
+    let Some(remote) = &args.remote else {
+        return Ok(CountingRemote::open(&dir.join(name))?);
+    };
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let config = S3Config {
+        endpoint: remote.endpoint.clone(),
+        bucket: remote.bucket.clone(),
+        prefix: format!("bench-{}/{name}/", now.as_millis()),
+        region: "us-east-1".into(),
+        access_key: std::env::var("BENCH_REMOTE_ACCESS_KEY")?,
+        secret_key: std::env::var("BENCH_REMOTE_SECRET_KEY")?,
+        retry: Retry::default(),
+        ca_pem: None,
+    };
+    Ok(CountingRemote::new(Box::new(S3Remote::new(config)?)))
+}
+
+/// Round trips to the remote: GETs of a key that does not exist.
+async fn round_trip(remote: &CountingRemote, m: &mut Measures) -> Result<(), Error> {
+    use remote::Remote;
+
+    let mut latencies = Vec::with_capacity(RTT_SAMPLES);
+    for _ in 0..RTT_SAMPLES {
+        let sent = Instant::now();
+        remote.get("no-such-key").await?;
+        latencies.push(sent.elapsed());
+    }
+    latencies.sort();
+    m.insert(
+        "remote.round_trip_p50_ms".into(),
+        millis(percentile(&latencies, 50.0)),
+    );
+    Ok(())
 }
 
 /// Brumal-like WAL objects: sealed, so fixed chunks and no compression.
@@ -251,8 +311,8 @@ async fn reads(
 }
 
 /// Opens an engine whose buffer holds `REPLAY_BYTES` of writes that never flushed.
-async fn replay(dir: &Path, m: &mut Measures) -> Result<(), Error> {
-    let remote = Arc::new(CountingRemote::open(&dir.join("replay-remote"))?);
+async fn replay(args: &Args, dir: &Path, m: &mut Measures) -> Result<(), Error> {
+    let remote = Arc::new(open_remote(args, dir, "replay-remote")?);
     let engine_dir = dir.join("replay-engine");
     let key = SigningKey::from_bytes(&[9u8; 32]);
     let engine = Engine::open(&engine_dir, remote.clone(), key.clone(), config()).await?;
@@ -290,10 +350,11 @@ async fn replay(dir: &Path, m: &mut Measures) -> Result<(), Error> {
 async fn run(args: &Args, n: usize) -> Result<(Measures, String), Error> {
     let load_before = load_average();
     let work = tempfile::tempdir_in(&args.dir)?;
-    let remote = Arc::new(CountingRemote::open(&work.path().join("remote"))?);
+    let remote = Arc::new(open_remote(args, work.path(), "remote")?);
+    let mut m = Measures::new();
+    round_trip(&remote, &mut m).await?;
     let writer = Server::start(&work.path().join("a"), remote.clone(), 1, config()).await?;
     let client = S3Client::new(&writer.address);
-    let mut m = Measures::new();
 
     client
         .send("PUT", &format!("/{BUCKET}"), Bytes::new())
@@ -342,7 +403,7 @@ async fn run(args: &Args, n: usize) -> Result<(Measures, String), Error> {
     reader.stop();
 
     info!(run = n, "buffer replay");
-    replay(work.path(), &mut m).await?;
+    replay(args, work.path(), &mut m).await?;
 
     Ok((m, format!("{load_before} / {}", load_average())))
 }
@@ -360,7 +421,7 @@ fn report(args: &Args, runs: &[(Measures, String)]) -> String {
     let mut out = format!(
         "# Windsock bench\n\n\
          - Machine: {}, {} cores, {memory_gb:.0} GB\n\
-         - Build: release. Remote: local directory (DirRemote). One engine per proxy, S3 API over TCP on 127.0.0.1.\n\
+         - Build: release. Remote: {}. One engine per proxy, S3 API over TCP on 127.0.0.1.\n\
          - Objects: {}-{} KB, incompressible, fixed chunks, no compression (WAL policy). Body hash signed.\n\
          - Runs: {}. Sustained rate target: {}/s for {} s. Capacity: {CAPACITY_WORKERS} workers for {} s.\n\
          - Cold reads: {COLD_SAMPLE} GETs on a second proxy with an empty cache, then the same GETs again.\n\
@@ -368,6 +429,10 @@ fn report(args: &Args, runs: &[(Measures, String)]) -> String {
          Load average (1, 5, 15 min) before / after each run:\n\n",
         sysctl("machdep.cpu.brand_string"),
         sysctl("hw.ncpu"),
+        match &args.remote {
+            None => "local directory (DirRemote)".to_string(),
+            Some(remote) => format!("S3 at {}, bucket {}", remote.endpoint, remote.bucket),
+        },
         MIN_SIZE / 1024,
         MAX_SIZE / 1024,
         args.runs,

@@ -142,6 +142,7 @@ dependencies = [
  "remote",
  "s3api",
  "s3proto",
+ "s3remote",
  "tempfile",
  "tokio",
  "tracing",

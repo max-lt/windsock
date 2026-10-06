@@ -42,18 +42,22 @@ impl Counts {
     }
 }
 
-/// A DirRemote that counts every call.
+/// A remote that counts every call.
 pub struct CountingRemote {
-    inner: DirRemote,
+    inner: Box<dyn Sweep>,
     pub counts: Counts,
 }
 
 impl CountingRemote {
     pub fn open(path: &Path) -> Result<Self, RemoteError> {
-        Ok(Self {
-            inner: DirRemote::open(path)?,
+        Ok(Self::new(Box::new(DirRemote::open(path)?)))
+    }
+
+    pub fn new(inner: Box<dyn Sweep>) -> Self {
+        Self {
+            inner,
             counts: Counts::default(),
-        })
+        }
     }
 }
 

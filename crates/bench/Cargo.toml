@@ -13,6 +13,7 @@ engine.workspace = true
 remote.workspace = true
 s3api.workspace = true
 s3proto.workspace = true
+s3remote.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true

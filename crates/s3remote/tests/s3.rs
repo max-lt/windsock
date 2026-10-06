@@ -75,6 +75,7 @@ fn config(endpoint: &str, prefix: &str) -> S3Config {
         access_key: ACCESS.into(),
         secret_key: SECRET.into(),
         retry: quick_retry(),
+        ca_pem: None,
     }
 }
 

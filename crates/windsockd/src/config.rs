@@ -42,6 +42,9 @@ pub enum RemoteConfig {
         region: String,
         access_key: String,
         secret_key: String,
+        /// PEM file of a private CA to trust, for https. Relative to the file.
+        #[serde(default)]
+        ca_file: Option<PathBuf>,
     },
 }
 
@@ -123,8 +126,13 @@ impl Config {
 
         let base = path.parent().unwrap_or(Path::new("."));
         config.data_dir = base.join(&config.data_dir);
-        if let RemoteConfig::Dir { path } = &mut config.remote {
-            *path = base.join(&*path);
+        match &mut config.remote {
+            RemoteConfig::Dir { path } => *path = base.join(&*path),
+            RemoteConfig::S3 {
+                ca_file: Some(path),
+                ..
+            } => *path = base.join(&*path),
+            RemoteConfig::S3 { .. } => {}
         }
 
         Ok(config)
@@ -216,6 +224,23 @@ mod tests {
                 path: dir.path().join("remote")
             }
         );
+    }
+
+    #[test]
+    fn test_ca_file_is_relative_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windsock.toml");
+        let text = "data_dir = \"d\"\n[[keys]]\naccess_key = \"c\"\nsecret_key = \"d\"\n\
+                    [remote]\ntype = \"s3\"\nendpoint = \"https://s3.example.com\"\n\
+                    bucket = \"b\"\naccess_key = \"a\"\nsecret_key = \"s\"\nca_file = \"ca.pem\"\n";
+        std::fs::write(&path, text).unwrap();
+
+        let config = Config::load(&path).unwrap();
+
+        assert!(matches!(
+            config.remote,
+            RemoteConfig::S3 { ca_file: Some(ref ca), .. } if *ca == dir.path().join("ca.pem")
+        ));
     }
 
     #[test]

@@ -12,10 +12,19 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+hyper-rustls = { workspace = true, optional = true }
 quick-xml.workspace = true
+rustls = { workspace = true, optional = true }
 serde.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
+# The TLS server of the tests. hyper-rustls depends on it already: no extra build.
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[features]
+# HTTPS to the remote. ring compiles C: the one exception to the no-C rule, and only in this feature.
+tls = ["dep:hyper-rustls", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 remote = { workspace = true, features = ["contract"] }
@@ -25,3 +34,5 @@ axum.workspace = true
 ed25519-dalek.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread"] }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["server-auto", "service"] }

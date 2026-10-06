@@ -1,7 +1,7 @@
-//! A remote in an S3 bucket, over HTTP with SigV4.
+//! A remote in an S3 bucket, over HTTP or HTTPS, with SigV4.
 //!
-//! Plain HTTP only: TLS needs a crypto provider, and the providers of rustls
-//! compile C. An `https` endpoint is refused until that choice is made.
+//! HTTPS needs the feature `tls`: rustls with the ring provider, which compiles
+//! C. Without the feature, an `https` endpoint is refused.
 //!
 //! Objects are immutable, so reads need no conditions. `create` is
 //! `If-None-Match: *`: after an ambiguous failure, a retry can report
@@ -28,7 +28,7 @@ pub use retry::Retry;
 
 #[derive(Clone, Debug)]
 pub struct S3Config {
-    /// `http://host:port`
+    /// `http://host:port`, or `https://host[:port]` with the feature `tls`.
     pub endpoint: String,
     pub bucket: String,
     /// Prepended to every key, so one bucket can hold several remotes. Empty or ending with `/`.
@@ -37,6 +37,8 @@ pub struct S3Config {
     pub access_key: String,
     pub secret_key: String,
     pub retry: Retry,
+    /// PEM certificates to trust next to the public roots, for a store with a private CA.
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 /// A response with its whole body.
@@ -85,38 +87,104 @@ impl<'a> Call<'a> {
     }
 }
 
+#[cfg(feature = "tls")]
+type Connector = hyper_rustls::HttpsConnector<HttpConnector>;
+#[cfg(not(feature = "tls"))]
+type Connector = HttpConnector;
+
+fn invalid(message: &str) -> RemoteError {
+    RemoteError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.to_string(),
+    ))
+}
+
+/// HTTP and HTTPS, with the public roots and the extra CA certificates.
+#[cfg(feature = "tls")]
+fn connector(ca_pem: Option<&[u8]>) -> Result<Connector, RemoteError> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = ca_pem {
+        let mut added = 0;
+        for cert in CertificateDer::pem_slice_iter(pem) {
+            let cert =
+                cert.map_err(|e| invalid(&format!("the CA certificates do not parse: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| invalid(&format!("a CA certificate is not valid: {e}")))?;
+            added += 1;
+        }
+        // A CA file with no certificate is a configuration error, not a reason to trust less.
+        if added == 0 {
+            return Err(invalid("the CA certificates hold no PEM certificate"));
+        }
+    }
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| invalid(&format!("TLS setup: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .build())
+}
+
+#[cfg(not(feature = "tls"))]
+fn connector(ca_pem: Option<&[u8]>) -> Result<Connector, RemoteError> {
+    if ca_pem.is_some() {
+        return Err(invalid(
+            "CA certificates need Windsock built with the feature tls",
+        ));
+    }
+    Ok(HttpConnector::new())
+}
+
 pub struct S3Remote {
-    client: Client<HttpConnector, Full<Bytes>>,
-    /// `host:port`, for the `host` header.
+    client: Client<Connector, Full<Bytes>>,
+    /// `http` or `https`.
+    scheme: &'static str,
+    /// `host[:port]`, for the `host` header.
     authority: String,
     config: S3Config,
 }
 
 impl S3Remote {
     pub fn new(config: S3Config) -> Result<Self, RemoteError> {
-        let invalid = |message: &str| {
-            RemoteError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                message.to_string(),
-            ))
-        };
-
-        let Some(authority) = config.endpoint.strip_prefix("http://") else {
-            return Err(invalid(
-                "the endpoint must be http://host:port; https needs a TLS provider (open decision)",
-            ));
+        let (scheme, authority) = match config.endpoint.split_once("://") {
+            Some(("http", rest)) => ("http", rest),
+            Some(("https", rest)) if cfg!(feature = "tls") => ("https", rest),
+            Some(("https", _)) => {
+                return Err(invalid("https needs Windsock built with the feature tls"));
+            }
+            _ => {
+                return Err(invalid(
+                    "the endpoint must be http:// or https://, then host[:port]",
+                ));
+            }
         };
         let authority = authority.trim_end_matches('/').to_string();
         if authority.is_empty() || authority.contains('/') {
-            return Err(invalid("the endpoint must be http://host:port"));
+            return Err(invalid(
+                "the endpoint must be scheme://host[:port], with no path",
+            ));
         }
         if !config.prefix.is_empty() && !config.prefix.ends_with('/') {
             return Err(invalid("the key prefix must be empty or end with '/'"));
         }
 
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        let client =
+            Client::builder(TokioExecutor::new()).build(connector(config.ca_pem.as_deref())?);
         Ok(Self {
             client,
+            scheme,
             authority,
             config,
         })
@@ -177,8 +245,8 @@ impl S3Remote {
         );
 
         let uri = match query.is_empty() {
-            true => format!("http://{}{path}", self.authority),
-            false => format!("http://{}{path}?{query}", self.authority),
+            true => format!("{}://{}{path}", self.scheme, self.authority),
+            false => format!("{}://{}{path}?{query}", self.scheme, self.authority),
         };
         let mut request = Request::builder().method(call.method.clone()).uri(uri);
         for (name, value) in &headers {
@@ -415,13 +483,19 @@ mod tests {
             access_key: "AK".into(),
             secret_key: "SK".into(),
             retry: Retry::default(),
+            ca_pem: None,
         }
     }
 
-    #[test]
-    fn test_endpoint_rules() {
+    #[tokio::test]
+    async fn test_endpoint_rules() {
         assert!(S3Remote::new(config("http://127.0.0.1:9000", "")).is_ok());
-        assert!(S3Remote::new(config("https://s3.example.com", "")).is_err());
+        assert_eq!(
+            S3Remote::new(config("https://s3.example.com", "")).is_ok(),
+            cfg!(feature = "tls"),
+            "https works with the feature tls only"
+        );
+        assert!(S3Remote::new(config("ftp://host", "")).is_err());
         assert!(S3Remote::new(config("http://host/path", "")).is_err());
         assert!(S3Remote::new(config("http://host", "no-slash")).is_err());
     }

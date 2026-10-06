@@ -67,7 +67,7 @@ the configuration file.
 |---|---|---|
 | `data_dir` | `data` | Engine state, write buffer, chunk cache, multipart parts, node key |
 | `listen` | `127.0.0.1:9000` | S3 address |
-| `remote.type` | `dir` | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`) |
+| `remote.type` | `dir` | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA) |
 | `[[keys]]` | one new pair | Key pairs that S3 clients sign with. Every key reaches every bucket |
 | `sync_interval_secs` | `10` | How often the proxy reads the writes of other proxies |
 | `engine.cache_bytes` | 16 GiB | Chunk cache size. `0` turns the cache off |
@@ -82,7 +82,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 
 ## Limits
 
-- The S3 remote uses plain HTTP. An `https` endpoint is refused: TLS is not available yet.
+- An `https` S3 remote needs the feature `tls`: `cargo build --release -p windsockd --features tls`.
+  This feature compiles C (the `ring` crypto provider). The default build has no TLS and refuses an
+  `https` endpoint. `ca_file` adds a PEM file of CA certificates to the public roots.
 - Keys come from the configuration file. There are no per-bucket permissions.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.

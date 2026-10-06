@@ -117,8 +117,16 @@ async fn run(config: &Config) -> Result<()> {
             region,
             access_key,
             secret_key,
+            ca_file,
         } => {
             info!(%endpoint, %bucket, "remote is an S3 bucket");
+            let ca_pem = match ca_file {
+                Some(path) => Some(
+                    std::fs::read(path)
+                        .with_context(|| format!("cannot read {}", path.display()))?,
+                ),
+                None => None,
+            };
             let remote = S3Remote::new(S3Config {
                 endpoint: endpoint.clone(),
                 bucket: bucket.clone(),
@@ -127,6 +135,7 @@ async fn run(config: &Config) -> Result<()> {
                 access_key: access_key.clone(),
                 secret_key: secret_key.clone(),
                 retry: Retry::default(),
+                ca_pem,
             })?;
             serve(config, Arc::new(remote), key).await
         }

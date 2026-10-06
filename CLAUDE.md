@@ -33,8 +33,9 @@ The daemon crate is `windsockd`.
   GC only), memory and local directory backends, the contract checks (`contract`, feature `contract`)
   that every backend passes.
 - `s3proto`: SigV4 (header signing, aws-chunked) and S3 date formats, for the server and the client.
-- `s3remote`: `Remote` and `Sweep` in an S3 bucket over plain HTTP: SigV4 with the body hash,
-  create via `If-None-Match: *`, retries with backoff and time limits. No TLS yet (open point).
+- `s3remote`: `Remote` and `Sweep` in an S3 bucket: SigV4 with the body hash, create via
+  `If-None-Match: *`, retries with backoff and time limits. HTTPS only with the feature `tls`
+  (rustls + ring, public roots plus an optional PEM CA file).
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
   chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
@@ -127,7 +128,10 @@ Check after each new dependency. The build must pass with no C compiler:
 cargo clean && CC=/usr/bin/false CXX=/usr/bin/false cargo build
 ```
 
-The TLS provider for B2 is an open point. See `../windsock-todo.md`.
+One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/tls`) compiles
+`ring`, the TLS crypto provider. Only that feature may compile C. Lint it too:
+`cargo clippy --all-targets --features windsockd/tls,s3remote/tls -- -D warnings`, and
+`cargo test -p s3remote -p windsockd --features tls`.
 
 | Purpose | Crate |
 |---|---|
@@ -152,6 +156,7 @@ The TLS provider for B2 is an open point. See `../windsock-todo.md`.
 | XML | `quick-xml` with `serialize` |
 | SigV4 | `hmac`, `sha2`, `subtle` |
 | URL form encoding | `form_urlencoded` |
+| TLS (feature `tls` only) | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
 | HTTP tests | `tower` (`util`), `http-body-util` |
 
 Add a crate to this table when a milestone adds it.

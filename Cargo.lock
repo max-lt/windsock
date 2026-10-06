@@ -2044,6 +2044,7 @@ dependencies = [
  "ed25519-dalek",
  "engine",
  "hex",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

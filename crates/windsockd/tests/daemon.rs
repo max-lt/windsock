@@ -223,6 +223,69 @@ async fn test_a_request_in_progress_outlives_the_idle_timeout() {
     assert!(daemon.stop());
 }
 
+/// A daemon with 1 connection slot and a request timeout of `secs`.
+fn upload_daemon(dir: &std::path::Path, secs: u64) -> common::Daemon {
+    let config = common::cluster_config(dir, &dir.join("remote"), 1000, "enabled = false");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("max_connections = 1\nrequest_timeout_secs = {secs}\n{text}"),
+    )
+    .unwrap();
+    start(&config, "info")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stalled_upload_is_cut_and_its_slot_comes_back() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = upload_daemon(dir.path(), 1);
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+
+    let body = b"0123456789";
+    let mut stalled = common::send_head(&daemon, &keys, "/demo/stalled", body).await;
+    stalled.write_all(&body[..5]).await.unwrap();
+    let cut = tokio::time::timeout(Duration::from_secs(10), common::read_reply(&mut stalled)).await;
+    assert!(cut.is_ok(), "the daemon cuts a stalled upload");
+
+    let put = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(&daemon, &keys, "PUT", "/demo/after", b"after"),
+    )
+    .await
+    .expect("the slot of the stalled upload comes back");
+    assert_eq!(put.status, StatusCode::OK);
+    assert!(daemon.stop());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_slow_upload_that_makes_progress_is_not_cut() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = upload_daemon(dir.path(), 1);
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+
+    let body = b"0123456789";
+    let mut slow = common::send_head(&daemon, &keys, "/demo/slow", body).await;
+    for byte in body {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        slow.write_all(&[*byte]).await.unwrap();
+    }
+    let reply = common::read_reply(&mut slow).await;
+    drop(slow);
+
+    assert!(reply.starts_with("HTTP/1.1 200"), "reply: {reply}");
+    assert_eq!(
+        call(&daemon, &keys, "GET", "/demo/slow", b"").await.text(),
+        "0123456789"
+    );
+    assert!(daemon.stop());
+}
+
 #[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();

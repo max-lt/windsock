@@ -238,15 +238,14 @@ pub fn signed_headers(
     headers
 }
 
-/// A request to a daemon that pauses `pause` in the middle of its body.
-pub async fn call_with_pause(
+/// Opens a connection and sends the signed head of a PUT of `body`, with no body byte.
+pub async fn send_head(
     daemon: &Daemon,
     keys: &(String, String),
     path: &str,
     body: &[u8],
-    pause: Duration,
-) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
 
     let mut head = format!("PUT {path} HTTP/1.1\r\ncontent-length: {}\r\n", body.len());
     for (name, value) in signed_headers(daemon, keys, "PUT", path, body) {
@@ -254,19 +253,40 @@ pub async fn call_with_pause(
     }
     head.push_str("\r\n");
 
-    let (first, rest) = body.split_at(body.len() / 2);
     let mut stream = tokio::net::TcpStream::connect(&daemon.address)
         .await
         .unwrap();
     stream.write_all(head.as_bytes()).await.unwrap();
+    stream
+}
+
+/// The first bytes of the reply, or an empty string when the daemon closed the connection.
+pub async fn read_reply(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut reply = vec![0u8; 1024];
+    let n = stream.read(&mut reply).await.unwrap_or(0);
+    String::from_utf8_lossy(&reply[..n]).into_owned()
+}
+
+/// A PUT that pauses `pause` in the middle of its body.
+pub async fn call_with_pause(
+    daemon: &Daemon,
+    keys: &(String, String),
+    path: &str,
+    body: &[u8],
+    pause: Duration,
+) -> String {
+    use tokio::io::AsyncWriteExt;
+
+    let (first, rest) = body.split_at(body.len() / 2);
+    let mut stream = send_head(daemon, keys, path, body).await;
     stream.write_all(first).await.unwrap();
     tokio::time::sleep(pause).await;
     stream.write_all(rest).await.unwrap();
-
-    let mut reply = vec![0u8; 1024];
-    let n = stream.read(&mut reply).await.unwrap();
-    String::from_utf8_lossy(&reply[..n]).into_owned()
+    read_reply(&mut stream).await
 }
+
 /// A configuration for one proxy of a cluster on the local directory `remote`.
 /// `gc` is the `[gc]` table, as TOML lines.
 pub fn cluster_config(dir: &Path, remote: &Path, flush_delay_ms: u64, gc: &str) -> PathBuf {

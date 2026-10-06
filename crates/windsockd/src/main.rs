@@ -26,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use config::{Config, RemoteConfig};
 use listener::{
-    ConnectionActivity, LimitedListener, connection_limit, soft_fd_limit, track_requests,
+    ConnectionActivity, LimitedListener, Timeouts, connection_limit, soft_fd_limit, track_requests,
 };
 
 const CONFIG_FILE: &str = "windsock.toml";
@@ -220,8 +220,11 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, key: Signing
     }
     info!(address = %listener.local_addr()?, max_connections, "listening");
 
-    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
-    let listener = LimitedListener::new(listener, max_connections, idle_timeout);
+    let timeouts = Timeouts {
+        idle: Duration::from_secs(config.idle_timeout_secs),
+        upload: Duration::from_secs(config.request_timeout_secs),
+    };
+    let listener = LimitedListener::new(listener, max_connections, timeouts);
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<ConnectionActivity>(),

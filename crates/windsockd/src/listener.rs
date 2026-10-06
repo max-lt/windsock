@@ -3,7 +3,7 @@
 //! Above the limit it stops accepting. New clients wait in the kernel backlog. They use no fd of
 //! this process. Thus the engine keeps the fds that it needs for a flush.
 //! A connection with no request in progress closes after an idle timeout. Thus idle clients
-//! cannot keep the slots.
+//! cannot keep the slots. A request whose body upload stops for a request timeout is cut.
 
 use std::io;
 use std::net::SocketAddr;
@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use axum::body::{Body, HttpBody};
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::{IncomingStream, Listener};
+use http_body::{Frame, SizeHint};
 use rustix::process::{Resource, getrlimit};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -42,18 +44,27 @@ pub fn soft_fd_limit() -> Option<u64> {
     getrlimit(Resource::Nofile).current
 }
 
+/// How long a connection can wait for the client.
+#[derive(Clone, Copy, Debug)]
+pub struct Timeouts {
+    /// With no request in progress.
+    pub idle: Duration,
+    /// In a body upload, between two reads that make progress.
+    pub upload: Duration,
+}
+
 pub struct LimitedListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
-    idle_timeout: Duration,
+    timeouts: Timeouts,
 }
 
 impl LimitedListener {
-    pub fn new(inner: TcpListener, max_connections: usize, idle_timeout: Duration) -> Self {
+    pub fn new(inner: TcpListener, max_connections: usize, timeouts: Timeouts) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
-            idle_timeout,
+            timeouts,
         }
     }
 }
@@ -62,6 +73,8 @@ impl LimitedListener {
 #[derive(Debug)]
 pub struct Activity {
     requests: AtomicUsize,
+    /// Requests whose body upload is not complete.
+    uploads: AtomicUsize,
     last: Mutex<Instant>,
 }
 
@@ -76,6 +89,10 @@ impl Activity {
 
     fn idle(&self) -> bool {
         self.requests.load(Ordering::SeqCst) == 0
+    }
+
+    fn uploading(&self) -> bool {
+        self.uploads.load(Ordering::SeqCst) > 0
     }
 }
 
@@ -99,6 +116,46 @@ impl Drop for InProgress {
     }
 }
 
+/// A body upload that is not complete.
+struct Uploading(Arc<Activity>);
+
+impl Drop for Uploading {
+    fn drop(&mut self) {
+        self.0.uploads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A request body that marks its connection as uploading until its last frame.
+struct UploadBody {
+    inner: Body,
+    uploading: Option<Uploading>,
+}
+
+impl HttpBody for UploadBody {
+    type Data = <Body as HttpBody>::Data;
+    type Error = <Body as HttpBody>::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let frame = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(frame, Poll::Ready(None | Some(Err(_)))) || this.inner.is_end_stream() {
+            this.uploading = None;
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Counts a request from its head to the end of its handler. The body upload is part of it.
 pub async fn track_requests(
     ConnectInfo(ConnectionActivity(activity)): ConnectInfo<ConnectionActivity>,
@@ -106,8 +163,18 @@ pub async fn track_requests(
     next: Next,
 ) -> Response {
     activity.requests.fetch_add(1, Ordering::SeqCst);
-    let _in_progress = InProgress(activity);
-    next.run(request).await
+    let in_progress = InProgress(Arc::clone(&activity));
+
+    let request = request.map(|inner| {
+        let uploading = (!inner.is_end_stream()).then(|| {
+            activity.uploads.fetch_add(1, Ordering::SeqCst);
+            Uploading(activity)
+        });
+        Body::new(UploadBody { inner, uploading })
+    });
+    let response = next.run(request).await;
+    drop(in_progress);
+    response
 }
 
 impl Listener for LimitedListener {
@@ -124,13 +191,14 @@ impl Listener for LimitedListener {
         let (stream, address) = Listener::accept(&mut self.inner).await;
         let activity = Arc::new(Activity {
             requests: AtomicUsize::new(0),
+            uploads: AtomicUsize::new(0),
             last: Mutex::new(Instant::now()),
         });
         let connection = Connection {
             stream,
             _permit: permit,
-            idle: Box::pin(tokio::time::sleep(self.idle_timeout)),
-            idle_timeout: self.idle_timeout,
+            timer: Box::pin(tokio::time::sleep(self.timeouts.idle)),
+            timeouts: self.timeouts,
             activity,
         };
         (connection, address)
@@ -145,27 +213,32 @@ impl Listener for LimitedListener {
 pub struct Connection {
     stream: TcpStream,
     _permit: OwnedSemaphorePermit,
-    idle: Pin<Box<Sleep>>,
-    idle_timeout: Duration,
+    timer: Pin<Box<Sleep>>,
+    timeouts: Timeouts,
     activity: Arc<Activity>,
 }
 
 impl Connection {
-    /// True when the idle timeout passed with no request in progress. If not, arms the timer again.
-    fn idle_expired(&mut self, cx: &mut Context<'_>) -> bool {
-        loop {
-            if self.idle.as_mut().poll(cx).is_pending() {
-                return false;
-            }
-            let deadline = self.activity.last() + self.idle_timeout;
-            let next = match self.activity.idle() {
-                true if Instant::now() >= deadline => return true,
-                true => deadline,
-                // A request in progress keeps the connection. Check again one timeout later.
-                false => Instant::now() + self.idle_timeout,
-            };
-            self.idle.as_mut().reset(next);
+    /// True when the connection is idle too long, or when its upload stopped too long.
+    /// If not, arms the timer for the next check.
+    fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        let last = self.activity.last();
+        let deadline = match (self.activity.idle(), self.activity.uploading()) {
+            (true, _) => last + self.timeouts.idle,
+            (false, true) => last + self.timeouts.upload,
+            // A handler runs. The next read after its response checks again.
+            (false, false) => return false,
+        };
+        if Instant::now() >= deadline {
+            return true;
         }
+
+        if self.timer.deadline() != deadline {
+            self.timer.as_mut().reset(deadline);
+        }
+        // This registers the waker. The task polls this read again at the deadline.
+        let _ = self.timer.as_mut().poll(cx);
+        false
     }
 }
 
@@ -183,9 +256,9 @@ impl AsyncRead for Connection {
                 this.activity.touch();
                 Poll::Ready(Ok(()))
             }
-            Poll::Pending if this.idle_expired(cx) => {
+            Poll::Pending if this.expired(cx) => {
                 // An end of stream makes the HTTP server close the connection.
-                debug!("closing an idle connection");
+                debug!("closing a connection that waits for the client");
                 Poll::Ready(Ok(()))
             }
             other => other,
@@ -250,7 +323,11 @@ mod tests {
     async fn test_listener_stops_accepting_at_the_limit() {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
-        let mut listener = LimitedListener::new(tcp, 1, Duration::from_secs(60));
+        let timeouts = Timeouts {
+            idle: Duration::from_secs(60),
+            upload: Duration::from_secs(60),
+        };
+        let mut listener = LimitedListener::new(tcp, 1, timeouts);
         let _a = TcpStream::connect(address).await.unwrap();
         let _b = TcpStream::connect(address).await.unwrap();
 

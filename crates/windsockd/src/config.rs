@@ -27,6 +27,9 @@ pub struct Config {
     /// Seconds before a connection with no request in progress closes.
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Seconds that a body upload can stop before the request is cut.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
     #[serde(default)]
     pub engine: EngineConfig,
     #[serde(default)]
@@ -111,6 +114,10 @@ fn default_idle_timeout() -> u64 {
     60
 }
 
+fn default_request_timeout() -> u64 {
+    300
+}
+
 fn default_sync_interval() -> u64 {
     10
 }
@@ -184,6 +191,7 @@ impl Config {
             sync_interval_secs: default_sync_interval(),
             max_connections: None,
             idle_timeout_secs: default_idle_timeout(),
+            request_timeout_secs: default_request_timeout(),
             engine: EngineConfig::default(),
             gc: GcConfig::default(),
         })

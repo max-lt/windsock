@@ -47,7 +47,7 @@ The daemon crate is `windsockd`.
   `buckets.rs`, `write.rs` (puts fsynced in the buffer), `read.rs` (buffer, then index, cache and
   remote), `sync.rs` (other chains, manifests, chunk locations, sync on miss), `flush.rs` (plan,
   upload, intent, commit, group commit). Also `buffer.rs` (NVMe write-back log: segments, replay,
-  intent file), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix
+  intent file, group fsync), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix
   policy: chunking, compression, create-only, cache), `gc.rs` (condemn, delete after H, version
   prune) and `snapshot.rs` (snapshots, bootstrap, journal prune).
 - `s3api`: S3 over HTTP (axum) on the engine. `auth.rs`: SigV4 in the header (payload hash checked,
@@ -100,6 +100,15 @@ The daemon crate is `windsockd`.
 - Write order: pack and manifest, then log entry. Each step is durable before the next step.
 - A write is acknowledged once fsynced in the local buffer. The buffer drops it only after its
   log entry is in the remote and applied to the index.
+- Group fsync. A write appends its record under the buffer lock. It waits for the fsync outside
+  the lock. One fsync runs at a time. It covers all records that exist when it starts. A group has
+  no minimum size and no timer.
+- A rotation fsyncs the segment that it seals. Thus only the last segment can end with a torn
+  record, and a flush uploads only fsynced records.
+- A read returns only when all buffered writes that it saw are fsynced.
+- If an fsync fails, the buffer cuts the active segment to its last fsynced size. Then it reads
+  the buffer from disk again. Each write that the fsync covered fails with `WriteLost`.
+- If this repair fails, the buffer refuses all writes until a restart (`BufferBroken`).
 - A signed entry goes to the intent file before its create. A restart retries that entry before it signs a new one.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.

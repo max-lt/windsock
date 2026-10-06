@@ -1,6 +1,7 @@
 //! Local write-back buffer: an append-only log on NVMe, cut into segments.
 //!
-//! A write is acknowledged once its record is fsynced. A flush seals the
+//! A write is acknowledged once its record is fsynced. Writes that wait while
+//! one fsync runs share the next one (group fsync). A flush seals the
 //! segments, uploads their records, and deletes the segments once the journal
 //! entry that covers them is in the remote. An intent file holds that entry
 //! between its signature and the deletion, so a restart never writes it twice.
@@ -15,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use journal::Entry;
@@ -255,16 +257,63 @@ struct Active {
     seq: u64,
     file: File,
     len: u64,
+    /// Bytes known to be on disk.
+    durable_len: u64,
+    /// A second open of the segment. Linux reports an fsync error to each open file, not to each fd.
+    sync: Arc<std::fs::File>,
+}
+
+/// The state of a record. Records get numbers from 1 in write order. Replayed records get 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Durability {
+    Durable,
+    Pending,
+    /// A failed fsync dropped the record.
+    Lost,
+}
+
+/// One fsync of the active segment, run outside the buffer lock.
+pub(crate) struct SyncJob {
+    seq: u64,
+    len: u64,
+    /// The last record that this fsync covers.
+    target: u64,
+    file: Arc<std::fs::File>,
+    #[cfg(test)]
+    fail: bool,
+}
+
+impl SyncJob {
+    pub async fn run(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail {
+            return Err(std::io::Error::other("injected fsync failure"));
+        }
+
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || file.sync_data())
+            .await
+            .map_err(std::io::Error::other)?
+    }
 }
 
 pub(crate) struct Buffer {
     dir: PathBuf,
     segment_target: u64,
     active: Active,
-    /// Sealed segments and their sizes.
+    /// Sealed segments and their sizes. A sealed segment is on disk.
     sealed: BTreeMap<u64, u64>,
     objects: BTreeMap<(String, String), BufferedObject>,
     buckets: BTreeMap<String, BufferedBucket>,
+    written: u64,
+    durable: u64,
+    lost: Vec<Range<u64>>,
+    /// A failed fsync that the buffer could not repair. Only a restart reads the disk again.
+    broken: bool,
+    #[cfg(test)]
+    pub syncs: u64,
+    #[cfg(test)]
+    pub fail_next_sync: bool,
 }
 
 impl Buffer {
@@ -282,6 +331,14 @@ impl Buffer {
             sealed: BTreeMap::new(),
             objects: BTreeMap::new(),
             buckets: BTreeMap::new(),
+            written: 0,
+            durable: 0,
+            lost: Vec::new(),
+            broken: false,
+            #[cfg(test)]
+            syncs: 0,
+            #[cfg(test)]
+            fail_next_sync: false,
         };
 
         for (i, &seq) in existing.iter().enumerate() {
@@ -360,8 +417,12 @@ impl Buffer {
         self.bytes() == 0
     }
 
-    /// Appends a record and fsyncs it. Once this returns, the write survives a crash.
-    pub async fn append(&mut self, head: Head, data: &[u8]) -> Result<(), EngineError> {
+    /// Appends a record without an fsync. Returns the number of the record.
+    pub async fn append(&mut self, head: Head, data: &[u8]) -> Result<u64, EngineError> {
+        if self.broken {
+            return Err(EngineError::BufferBroken);
+        }
+
         let record = encode_record(&head, data);
         let data_offset = self.active.len + (record.len() - data.len()) as u64;
 
@@ -372,18 +433,97 @@ impl Buffer {
         }
 
         self.active.len += record.len() as u64;
+        self.written += 1;
         self.track(self.active.seq, &head, data_offset, data.len() as u64);
 
         if self.active.len >= self.segment_target {
             self.rotate().await?;
         }
 
-        Ok(())
+        Ok(self.written)
     }
 
     async fn write_active(&mut self, record: &[u8]) -> Result<(), EngineError> {
         self.active.file.write_all(record).await?;
-        self.active.file.sync_data().await?;
+        // The record must reach the kernel before another task fsyncs the segment.
+        self.active.file.flush().await?;
+        Ok(())
+    }
+
+    pub fn durability(&self, record: u64) -> Durability {
+        if self.lost.iter().any(|lost| lost.contains(&record)) {
+            return Durability::Lost;
+        }
+
+        match record <= self.durable {
+            true => Durability::Durable,
+            false => Durability::Pending,
+        }
+    }
+
+    /// The last record that a reader can see. `None` when all records are on disk.
+    pub fn pending(&self) -> Option<u64> {
+        (self.written > self.durable).then_some(self.written)
+    }
+
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// An fsync of every record written so far.
+    pub fn sync_job(&mut self) -> SyncJob {
+        SyncJob {
+            seq: self.active.seq,
+            len: self.active.len,
+            target: self.written,
+            file: Arc::clone(&self.active.sync),
+            #[cfg(test)]
+            fail: std::mem::take(&mut self.fail_next_sync),
+        }
+    }
+
+    /// Records the result of `job`. A failure drops every record that is not on disk.
+    pub async fn finish_sync(
+        &mut self,
+        job: SyncJob,
+        result: std::io::Result<()>,
+    ) -> Result<(), EngineError> {
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
+
+        match result {
+            Ok(()) => {
+                self.durable = self.durable.max(job.target);
+                if job.seq == self.active.seq {
+                    self.active.durable_len = self.active.durable_len.max(job.len);
+                }
+                Ok(())
+            }
+            // A rotation fsynced these records through the other open file.
+            Err(_) if self.durable >= job.target => Ok(()),
+            Err(e) => {
+                warn!(%e, segment = job.seq, "buffer fsync failed: the writes it covers are dropped");
+                self.drop_unsynced().await
+            }
+        }
+    }
+
+    /// Cuts the active segment to its last fsynced size. Then reads the buffer from disk again.
+    async fn drop_unsynced(&mut self) -> Result<(), EngineError> {
+        self.broken = true;
+        let lost = self.durable + 1..self.written + 1;
+
+        self.active.file.set_len(self.active.durable_len).await?;
+        self.active.file.sync_all().await?;
+
+        let mut fresh = Self::open(self.dir.clone(), self.segment_target).await?;
+        fresh.written = self.written;
+        fresh.durable = self.written;
+        fresh.lost = std::mem::take(&mut self.lost);
+        fresh.lost.push(lost);
+        *self = fresh;
         Ok(())
     }
 
@@ -470,6 +610,17 @@ impl Buffer {
     }
 
     async fn rotate(&mut self) -> Result<(), EngineError> {
+        // Replay refuses a torn record in a segment that is not the last one.
+        if self.active.durable_len < self.active.len {
+            if let Err(e) = self.active.file.sync_data().await {
+                warn!(%e, segment = self.active.seq, "buffer fsync failed: the writes it covers are dropped");
+                self.drop_unsynced().await?;
+                return Err(EngineError::WriteLost);
+            }
+            self.active.durable_len = self.active.len;
+            self.durable = self.written;
+        }
+
         let next = create_segment(&self.dir, self.active.seq + 1).await?;
         let sealed = std::mem::replace(&mut self.active, next);
         self.sealed.insert(sealed.seq, sealed.len);
@@ -568,13 +719,26 @@ async fn list_segments(dir: &Path) -> Result<Vec<u64>, EngineError> {
 }
 
 async fn create_segment(dir: &Path, seq: u64) -> Result<Active, EngineError> {
+    let path = segment_path(dir, seq);
     let file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .append(true)
-        .open(segment_path(dir, seq))
+        .open(&path)
         .await?;
+    let sync = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await?
+        .into_std()
+        .await;
     sync_dir(dir).await?;
-    Ok(Active { seq, file, len: 0 })
+    Ok(Active {
+        seq,
+        file,
+        len: 0,
+        durable_len: 0,
+        sync: Arc::new(sync),
+    })
 }
 
 async fn sync_dir(dir: &Path) -> Result<(), EngineError> {

@@ -11,24 +11,46 @@ impl<R: Remote + 'static> Engine<R> {
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
         self.retry_after_sync(|| async move {
-            let current = {
-                let buffer = self.buffer.lock().await;
-                self.require_bucket(&buffer, bucket)?;
-                self.current(&buffer, bucket, key)?
-            };
+            let current = self
+                .read_settled(|buffer| {
+                    self.require_bucket(buffer, bucket)?;
+                    self.current(buffer, bucket, key)
+                })
+                .await?;
             self.info(bucket, key, current).await
         })
         .await
     }
 
+    /// Runs `read` on the buffer. Returns the result only when all writes that `read` saw are on disk.
+    /// A crash can lose a write that is not on disk, so a reader must not see it.
+    pub(crate) async fn read_settled<T>(&self, read: impl Fn(&Buffer) -> Result<T>) -> Result<T> {
+        loop {
+            let (result, pending) = {
+                let buffer = self.buffer.lock().await;
+                (read(&buffer), buffer.pending())
+            };
+
+            let Some(record) = pending else {
+                return result;
+            };
+            match self.wait_durable(record).await? {
+                Durability::Durable => return result,
+                // A failed fsync dropped writes that `read` saw. Read the repaired buffer.
+                Durability::Pending | Durability::Lost => continue,
+            }
+        }
+    }
+
     /// Every key of `bucket` under `prefix` that exists, in key order.
     pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
         self.retry_after_sync(|| async move {
-            let keys = {
-                let buffer = self.buffer.lock().await;
-                self.require_bucket(&buffer, bucket)?;
-                self.keys_in(&buffer, bucket, prefix)?
-            };
+            let keys = self
+                .read_settled(|buffer| {
+                    self.require_bucket(buffer, bucket)?;
+                    self.keys_in(buffer, bucket, prefix)
+                })
+                .await?;
 
             let mut out = Vec::with_capacity(keys.len());
             for (key, current) in keys {
@@ -53,11 +75,12 @@ impl<R: Remote + 'static> Engine<R> {
         range: Option<Range<u64>>,
     ) -> Result<Object> {
         loop {
-            let current = {
-                let buffer = self.buffer.lock().await;
-                self.require_bucket(&buffer, bucket)?;
-                self.current(&buffer, bucket, key)?
-            };
+            let current = self
+                .read_settled(|buffer| {
+                    self.require_bucket(buffer, bucket)?;
+                    self.current(buffer, bucket, key)
+                })
+                .await?;
 
             match current {
                 Current::Absent => return Err(no_such_key(bucket, key)),

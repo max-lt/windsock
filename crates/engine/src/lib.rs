@@ -36,7 +36,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use buffer::{Buffer, BufferedObject, BufferedPut, Head, Intent, Op, SegmentReader};
+use buffer::{Buffer, BufferedObject, BufferedPut, Durability, Head, Intent, Op, SegmentReader};
 use plan::{Fetch, Nonces, Planner};
 
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
@@ -76,6 +76,10 @@ pub enum EngineError {
     InvalidRange { start: u64, end: u64, size: u64 },
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error("the buffer fsync failed, so the write is not stored")]
+    WriteLost,
+    #[error("the buffer did not recover from a failed fsync. Restart the proxy")]
+    BufferBroken,
     #[error("{0} commits lost the seq to another process with this identity")]
     Contended(u32),
     #[error("the flush plan is older than half the GC horizon: plan again")]
@@ -172,6 +176,8 @@ pub struct Engine<R> {
     cache: Option<ChunkCache>,
     /// One flush at a time.
     flushing: tokio::sync::Mutex<()>,
+    /// One buffer fsync at a time. The writes that arrive during an fsync share the next one.
+    syncing: tokio::sync::Mutex<()>,
     last_sync: Mutex<Option<Instant>>,
     /// Start of the last sync that succeeded: GC rule 1 for dedup.
     fresh_sync: Mutex<Option<Instant>>,
@@ -211,6 +217,7 @@ impl<R: Remote + 'static> Engine<R> {
             buffer: tokio::sync::Mutex::new(buffer),
             cache,
             flushing: tokio::sync::Mutex::new(()),
+            syncing: tokio::sync::Mutex::new(()),
             last_sync: Mutex::new(None),
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),

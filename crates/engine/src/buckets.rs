@@ -5,26 +5,32 @@ use super::*;
 impl<R: Remote + 'static> Engine<R> {
     pub async fn create_bucket(&self, name: &str, owner: Option<String>) -> Result<()> {
         check_bucket_name(name)?;
-        let mut buffer = self.buffer.lock().await;
+        let record = {
+            let mut buffer = self.buffer.lock().await;
 
-        if self.bucket_in(&buffer, name)?.is_some() {
-            return Err(EngineError::BucketAlreadyExists(name.to_string()));
-        }
+            if self.bucket_in(&buffer, name)?.is_some() {
+                return Err(EngineError::BucketAlreadyExists(name.to_string()));
+            }
 
-        let op = Op::CreateBucket {
-            bucket: name.to_string(),
-            owner,
+            let op = Op::CreateBucket {
+                bucket: name.to_string(),
+                owner,
+            };
+            self.append(&mut buffer, op, &[]).await?
         };
-        self.append(&mut buffer, op, &[]).await
+
+        self.acknowledge(record).await
     }
 
     /// Deletes an empty bucket. Emptiness is checked against what this proxy knows.
     pub async fn delete_bucket(&self, name: &str) -> Result<()> {
-        self.retry_after_sync(|| self.delete_bucket_once(name))
-            .await
+        let record = self
+            .retry_after_sync(|| self.delete_bucket_once(name))
+            .await?;
+        self.acknowledge(record).await
     }
 
-    pub(crate) async fn delete_bucket_once(&self, name: &str) -> Result<()> {
+    pub(crate) async fn delete_bucket_once(&self, name: &str) -> Result<u64> {
         let mut buffer = self.buffer.lock().await;
         self.require_bucket(&buffer, name)?;
 
@@ -44,15 +50,15 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     pub async fn bucket(&self, name: &str) -> Result<BucketInfo> {
-        self.retry_after_sync(|| async move {
-            let buffer = self.buffer.lock().await;
-            self.require_bucket(&buffer, name)
-        })
-        .await
+        self.retry_after_sync(|| self.read_settled(|buffer| self.require_bucket(buffer, name)))
+            .await
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
-        let buffer = self.buffer.lock().await;
+        self.read_settled(|buffer| self.buckets_in(buffer)).await
+    }
+
+    fn buckets_in(&self, buffer: &Buffer) -> Result<Vec<BucketInfo>> {
         let mut buckets: BTreeMap<String, (Option<String>, u64)> = self
             .index()
             .buckets()?

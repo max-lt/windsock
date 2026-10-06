@@ -152,6 +152,77 @@ async fn test_flush_succeeds_while_clients_hold_more_connections_than_descriptor
     assert!(daemon.stop());
 }
 
+/// A daemon with 2 connection slots and an idle timeout of 1 s.
+fn small_daemon(dir: &std::path::Path) -> common::Daemon {
+    let config = common::cluster_config(dir, &dir.join("remote"), 1000, "enabled = false");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("max_connections = 2\nidle_timeout_secs = 1\n{text}"),
+    )
+    .unwrap();
+    start(&config, "info")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_idle_connections_close_and_free_their_slots() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = small_daemon(dir.path());
+    let keys = common::test_keys();
+    let mut idle = [
+        tokio::net::TcpStream::connect(&daemon.address)
+            .await
+            .unwrap(),
+        tokio::net::TcpStream::connect(&daemon.address)
+            .await
+            .unwrap(),
+    ];
+
+    let put = tokio::time::timeout(
+        Duration::from_secs(10),
+        call(&daemon, &keys, "PUT", "/demo", b""),
+    )
+    .await
+    .expect("the idle connections give their slots back");
+
+    assert_eq!(put.status, StatusCode::OK);
+    for stream in &mut idle {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "the daemon closes an idle connection"
+        );
+    }
+    assert!(daemon.stop());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_request_in_progress_outlives_the_idle_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = small_daemon(dir.path());
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+
+    let reply = common::call_with_pause(
+        &daemon,
+        &keys,
+        "/demo/slow",
+        b"0123456789",
+        Duration::from_millis(2500),
+    )
+    .await;
+
+    assert!(reply.starts_with("HTTP/1.1 200"), "reply: {reply}");
+    assert_eq!(
+        call(&daemon, &keys, "GET", "/demo/slow", b"").await.text(),
+        "0123456789"
+    );
+    assert!(daemon.stop());
+}
+
 #[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();

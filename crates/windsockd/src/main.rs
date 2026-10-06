@@ -25,7 +25,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::{Config, RemoteConfig};
-use listener::{LimitedListener, connection_limit, soft_fd_limit};
+use listener::{
+    ConnectionActivity, LimitedListener, connection_limit, soft_fd_limit, track_requests,
+};
 
 const CONFIG_FILE: &str = "windsock.toml";
 const NODE_KEY_FILE: &str = "node.key";
@@ -201,7 +203,7 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, key: Signing
     }
 
     let s3 = s3api::S3Config::new(config.keys(), config.data_dir.join("uploads"));
-    let router = s3api::router(engine.clone(), s3);
+    let router = s3api::router(engine.clone(), s3).layer(axum::middleware::from_fn(track_requests));
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen))?;
@@ -218,9 +220,14 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, key: Signing
     }
     info!(address = %listener.local_addr()?, max_connections, "listening");
 
-    axum::serve(LimitedListener::new(listener, max_connections), router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+    let listener = LimitedListener::new(listener, max_connections, idle_timeout);
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<ConnectionActivity>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // A flush cut by the abort is safe: its intent file finishes it at the next flush.
     for task in background {

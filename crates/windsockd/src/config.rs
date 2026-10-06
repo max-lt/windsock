@@ -24,6 +24,9 @@ pub struct Config {
     /// Open S3 connections at most. Default: the soft descriptor limit minus a reserve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
+    /// Seconds before a connection with no request in progress closes.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
     #[serde(default)]
     pub engine: EngineConfig,
     #[serde(default)]
@@ -104,6 +107,10 @@ fn default_listen() -> String {
     "127.0.0.1:9000".to_string()
 }
 
+fn default_idle_timeout() -> u64 {
+    60
+}
+
 fn default_sync_interval() -> u64 {
     10
 }
@@ -176,6 +183,7 @@ impl Config {
             }],
             sync_interval_secs: default_sync_interval(),
             max_connections: None,
+            idle_timeout_secs: default_idle_timeout(),
             engine: EngineConfig::default(),
             gc: GcConfig::default(),
         })

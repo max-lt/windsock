@@ -172,40 +172,13 @@ pub async fn call(
     path: &str,
     body: &[u8],
 ) -> Reply {
-    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let timestamp = sigv4::timestamp(now);
-    let payload_hash = sigv4::sha256_hex(body);
-    let headers = vec![
-        ("host".to_string(), daemon.address.clone()),
-        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-        ("x-amz-date".to_string(), timestamp.clone()),
-    ];
-    let (authorization, _) = sigv4::sign(
-        &sigv4::Request {
-            method,
-            path: path_only,
-            query,
-            headers: &headers,
-            payload_hash: &payload_hash,
-        },
-        &keys.0,
-        &keys.1,
-        &timestamp,
-        "us-east-1",
-    );
-
     let mut request = Request::builder()
         .method(method)
         .uri(format!("http://{}{path}", daemon.address));
-    for (name, value) in &headers {
-        request = request.header(name.as_str(), value.as_str());
+    for (name, value) in signed_headers(daemon, keys, method, path, body) {
+        request = request.header(name, value);
     }
     let request = request
-        .header("authorization", authorization)
         .body(Full::new(Bytes::copy_from_slice(body)))
         .unwrap();
 
@@ -227,6 +200,73 @@ pub async fn call(
     }
 }
 
+/// The headers of a signed request to a daemon, `authorization` included.
+pub fn signed_headers(
+    daemon: &Daemon,
+    keys: &(String, String),
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<(String, String)> {
+    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let timestamp = sigv4::timestamp(now);
+    let payload_hash = sigv4::sha256_hex(body);
+    let mut headers = vec![
+        ("host".to_string(), daemon.address.clone()),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), timestamp.clone()),
+    ];
+    let (authorization, _) = sigv4::sign(
+        &sigv4::Request {
+            method,
+            path: path_only,
+            query,
+            headers: &headers,
+            payload_hash: &payload_hash,
+        },
+        &keys.0,
+        &keys.1,
+        &timestamp,
+        "us-east-1",
+    );
+
+    headers.push(("authorization".to_string(), authorization));
+    headers
+}
+
+/// A request to a daemon that pauses `pause` in the middle of its body.
+pub async fn call_with_pause(
+    daemon: &Daemon,
+    keys: &(String, String),
+    path: &str,
+    body: &[u8],
+    pause: Duration,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut head = format!("PUT {path} HTTP/1.1\r\ncontent-length: {}\r\n", body.len());
+    for (name, value) in signed_headers(daemon, keys, "PUT", path, body) {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+
+    let (first, rest) = body.split_at(body.len() / 2);
+    let mut stream = tokio::net::TcpStream::connect(&daemon.address)
+        .await
+        .unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(first).await.unwrap();
+    tokio::time::sleep(pause).await;
+    stream.write_all(rest).await.unwrap();
+
+    let mut reply = vec![0u8; 1024];
+    let n = stream.read(&mut reply).await.unwrap();
+    String::from_utf8_lossy(&reply[..n]).into_owned()
+}
 /// A configuration for one proxy of a cluster on the local directory `remote`.
 /// `gc` is the `[gc]` table, as TOML lines.
 pub fn cluster_config(dir: &Path, remote: &Path, flush_delay_ms: u64, gc: &str) -> PathBuf {

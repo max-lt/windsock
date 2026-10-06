@@ -68,6 +68,7 @@ the configuration file.
 | `data_dir` | `data` | Engine state, write buffer, chunk cache, multipart parts, node key |
 | `listen` | `127.0.0.1:9000` | S3 address |
 | `max_connections` | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors |
+| `idle_timeout_secs` | `60` | A connection with no request in progress closes after this time. A request in progress is never cut |
 | `remote.type` | `dir` | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA) |
 | `[[keys]]` | one new pair | Key pairs that S3 clients sign with. Every key reaches every bucket |
 | `sync_interval_secs` | `10` | How often the proxy reads the writes of other proxies |

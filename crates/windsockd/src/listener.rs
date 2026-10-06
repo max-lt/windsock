@@ -1,19 +1,29 @@
 //! A TCP listener that keeps at most a fixed number of connections open.
 //!
-//! Above the limit it stops accepting: new clients wait in the kernel backlog and use no
-//! descriptor of this process, so the engine keeps the descriptors it needs to flush.
+//! Above the limit it stops accepting. New clients wait in the kernel backlog. They use no fd of
+//! this process. Thus the engine keeps the fds that it needs for a flush.
+//! A connection with no request in progress closes after an idle timeout. Thus idle clients
+//! cannot keep the slots.
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use axum::serve::Listener;
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request};
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::serve::{IncomingStream, Listener};
 use rustix::process::{Resource, getrlimit};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, Sleep};
+use tracing::debug;
 
 /// Descriptors kept for the engine: buffer segments, index files, cache files, remote calls.
 pub const FD_RESERVE: u64 = 256;
@@ -35,15 +45,69 @@ pub fn soft_fd_limit() -> Option<u64> {
 pub struct LimitedListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
+    idle_timeout: Duration,
 }
 
 impl LimitedListener {
-    pub fn new(inner: TcpListener, max_connections: usize) -> Self {
+    pub fn new(inner: TcpListener, max_connections: usize, idle_timeout: Duration) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
+            idle_timeout,
         }
     }
+}
+
+/// The requests in progress on one connection, and its last activity.
+#[derive(Debug)]
+pub struct Activity {
+    requests: AtomicUsize,
+    last: Mutex<Instant>,
+}
+
+impl Activity {
+    fn touch(&self) {
+        *self.last.lock().expect("no panic while the lock is held") = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.last.lock().expect("no panic while the lock is held")
+    }
+
+    fn idle(&self) -> bool {
+        self.requests.load(Ordering::SeqCst) == 0
+    }
+}
+
+/// The activity of the connection that carries a request.
+#[derive(Clone, Debug)]
+pub struct ConnectionActivity(Arc<Activity>);
+
+impl Connected<IncomingStream<'_, LimitedListener>> for ConnectionActivity {
+    fn connect_info(stream: IncomingStream<'_, LimitedListener>) -> Self {
+        Self(Arc::clone(&stream.io().activity))
+    }
+}
+
+/// A request in progress. The connection is idle again when the last one drops.
+struct InProgress(Arc<Activity>);
+
+impl Drop for InProgress {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Counts a request from its head to the end of its handler. The body upload is part of it.
+pub async fn track_requests(
+    ConnectInfo(ConnectionActivity(activity)): ConnectInfo<ConnectionActivity>,
+    request: Request,
+    next: Next,
+) -> Response {
+    activity.requests.fetch_add(1, Ordering::SeqCst);
+    let _in_progress = InProgress(activity);
+    next.run(request).await
 }
 
 impl Listener for LimitedListener {
@@ -58,13 +122,18 @@ impl Listener for LimitedListener {
             .await
             .expect("the semaphore is never closed");
         let (stream, address) = Listener::accept(&mut self.inner).await;
-        (
-            Connection {
-                stream,
-                _permit: permit,
-            },
-            address,
-        )
+        let activity = Arc::new(Activity {
+            requests: AtomicUsize::new(0),
+            last: Mutex::new(Instant::now()),
+        });
+        let connection = Connection {
+            stream,
+            _permit: permit,
+            idle: Box::pin(tokio::time::sleep(self.idle_timeout)),
+            idle_timeout: self.idle_timeout,
+            activity,
+        };
+        (connection, address)
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -76,6 +145,28 @@ impl Listener for LimitedListener {
 pub struct Connection {
     stream: TcpStream,
     _permit: OwnedSemaphorePermit,
+    idle: Pin<Box<Sleep>>,
+    idle_timeout: Duration,
+    activity: Arc<Activity>,
+}
+
+impl Connection {
+    /// True when the idle timeout passed with no request in progress. If not, arms the timer again.
+    fn idle_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        loop {
+            if self.idle.as_mut().poll(cx).is_pending() {
+                return false;
+            }
+            let deadline = self.activity.last() + self.idle_timeout;
+            let next = match self.activity.idle() {
+                true if Instant::now() >= deadline => return true,
+                true => deadline,
+                // A request in progress keeps the connection. Check again one timeout later.
+                false => Instant::now() + self.idle_timeout,
+            };
+            self.idle.as_mut().reset(next);
+        }
+    }
 }
 
 impl AsyncRead for Connection {
@@ -84,7 +175,21 @@ impl AsyncRead for Connection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        let this = self.get_mut();
+        let before = buf.filled().len();
+
+        match Pin::new(&mut this.stream).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() > before => {
+                this.activity.touch();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending if this.idle_expired(cx) => {
+                // An end of stream makes the HTTP server close the connection.
+                debug!("closing an idle connection");
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
     }
 }
 
@@ -94,7 +199,12 @@ impl AsyncWrite for Connection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write(cx, buf);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            this.activity.touch();
+        }
+        written
     }
 
     fn poll_write_vectored(
@@ -102,7 +212,12 @@ impl AsyncWrite for Connection {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let written = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            this.activity.touch();
+        }
+        written
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -135,7 +250,7 @@ mod tests {
     async fn test_listener_stops_accepting_at_the_limit() {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
-        let mut listener = LimitedListener::new(tcp, 1);
+        let mut listener = LimitedListener::new(tcp, 1, Duration::from_secs(60));
         let _a = TcpStream::connect(address).await.unwrap();
         let _b = TcpStream::connect(address).await.unwrap();
 

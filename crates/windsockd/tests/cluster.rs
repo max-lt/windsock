@@ -322,12 +322,30 @@ async fn test_proxy_killed_in_the_middle_of_a_flush() {
     assert_chains_whole(&cluster.remote());
 }
 
+/// The entries of one chain directory, in seq order, without the temporary files of a create.
+fn entries(chain: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(chain)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .is_ok()
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
 fn chain_sizes(remote: &Path) -> Vec<(PathBuf, usize)> {
     std::fs::read_dir(remote.join("log"))
         .unwrap()
         .map(|node| {
             let path = node.unwrap().path();
-            let size = std::fs::read_dir(&path).unwrap().count();
+            let size = entries(&path).len();
             (path, size)
         })
         .collect()
@@ -347,17 +365,34 @@ async fn newest_entry_of_the_chain_that_grows(
                 .find(|(c, _)| *c == chain)
                 .map_or(0, |(_, s)| *s);
             if size > old {
-                let mut entries: Vec<PathBuf> = std::fs::read_dir(&chain)
-                    .unwrap()
-                    .map(|e| e.unwrap().path())
-                    .collect();
-                entries.sort();
-                return entries.pop().unwrap();
+                return entries(&chain).pop().unwrap();
             }
         }
         assert!(Instant::now() < deadline, "no new entry");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A create writes a temporary file in the chain directory before the entry.
+#[tokio::test]
+async fn test_new_entry_is_not_a_temporary_file() {
+    let remote = tempfile::tempdir().unwrap();
+    let chain = remote.path().join("log").join("n");
+    std::fs::create_dir_all(&chain).unwrap();
+    std::fs::write(chain.join("00000000000000000001"), b"old").unwrap();
+    let before = chain_sizes(remote.path());
+
+    std::fs::write(chain.join(".tmp.1.2"), b"new").unwrap();
+    let late = chain.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::write(late.join("00000000000000000002"), b"new").unwrap();
+    });
+
+    assert_eq!(
+        newest_entry_of_the_chain_that_grows(remote.path(), &before).await,
+        chain.join("00000000000000000002")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

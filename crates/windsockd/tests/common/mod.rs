@@ -261,7 +261,17 @@ pub fn chains(remote: &Path) -> Vec<Vec<u64>> {
         .collect()
 }
 
-/// Files under `remote/<dir>`.
+/// Files under `remote/<dir>`, without the temporary files of a write in progress.
 pub fn count(remote: &Path, dir: &str) -> usize {
-    std::fs::read_dir(remote.join(dir)).map_or(0, |entries| entries.count())
+    std::fs::read_dir(remote.join(dir)).map_or(0, |entries| {
+        entries
+            .filter(|e| {
+                !e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            })
+            .count()
+    })
 }

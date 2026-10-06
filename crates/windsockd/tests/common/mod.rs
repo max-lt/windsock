@@ -33,9 +33,24 @@ pub struct Daemon {
 
 /// Starts `windsockd run` and waits for its listening address in the log.
 pub fn start(config: &Path, log: &str) -> Daemon {
-    let mut child = Command::new(BIN)
-        .arg("run")
-        .arg(config)
+    let mut command = Command::new(BIN);
+    command.arg("run").arg(config);
+    attach(command, log)
+}
+
+/// Starts `windsockd run` with a soft limit of `fds` open descriptors.
+pub fn start_with_fd_limit(config: &Path, log: &str, fds: u64) -> Daemon {
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(format!("ulimit -n {fds} && exec \"$0\" run \"$1\""))
+        .arg(BIN)
+        .arg(config);
+    attach(command, log)
+}
+
+fn attach(mut command: Command, log: &str) -> Daemon {
+    let mut child = command
         .env("RUST_LOG", log)
         .stderr(Stdio::piped())
         .spawn()

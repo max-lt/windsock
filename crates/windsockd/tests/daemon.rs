@@ -4,6 +4,7 @@ mod common;
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use common::{BIN, call, start};
 use hyper::StatusCode;
@@ -100,6 +101,54 @@ async fn test_wrong_key_is_refused() {
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert!(reply.text().contains("InvalidAccessKeyId"));
+    assert!(daemon.stop());
+}
+
+/// Entries in all the chains of a local directory remote.
+fn entries(remote: &std::path::Path) -> usize {
+    common::chains(remote).iter().map(Vec::len).sum()
+}
+
+async fn wait_for_more_entries(remote: &std::path::Path, than: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while entries(remote) <= than {
+        assert!(Instant::now() < deadline, "no flush reached the remote");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_flush_succeeds_while_clients_hold_more_connections_than_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
+    let keys = common::test_keys();
+    let daemon = common::start_with_fd_limit(&config, "info", 128);
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    wait_for_more_entries(&remote, 0).await;
+    let before = entries(&remote);
+
+    assert_eq!(
+        call(&daemon, &keys, "PUT", "/demo/k", b"value")
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let mut held = Vec::new();
+    for _ in 0..150 {
+        held.push(
+            tokio::net::TcpStream::connect(&daemon.address)
+                .await
+                .unwrap(),
+        );
+    }
+    wait_for_more_entries(&remote, before).await;
+    drop(held);
+
+    assert_eq!(
+        call(&daemon, &keys, "GET", "/demo/k", b"").await.text(),
+        "value"
+    );
     assert!(daemon.stop());
 }
 

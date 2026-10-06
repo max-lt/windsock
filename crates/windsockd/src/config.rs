@@ -21,6 +21,9 @@ pub struct Config {
     pub keys: Vec<KeyConfig>,
     #[serde(default = "default_sync_interval")]
     pub sync_interval_secs: u64,
+    /// Open S3 connections at most. Default: the soft descriptor limit minus a reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
     #[serde(default)]
     pub engine: EngineConfig,
     #[serde(default)]
@@ -32,7 +35,7 @@ pub struct Config {
 pub enum RemoteConfig {
     /// A local directory. Relative to the file.
     Dir { path: PathBuf },
-    /// An S3 bucket over plain HTTP.
+    /// An S3 bucket, over HTTP, or HTTPS with the feature `tls`.
     S3 {
         endpoint: String,
         bucket: String,
@@ -172,6 +175,7 @@ impl Config {
                 secret_key: hex::encode(random_bytes::<20>()?),
             }],
             sync_interval_secs: default_sync_interval(),
+            max_connections: None,
             engine: EngineConfig::default(),
             gc: GcConfig::default(),
         })

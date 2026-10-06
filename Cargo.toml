@@ -32,6 +32,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 sha2 = "0.10"
 subtle = "2"

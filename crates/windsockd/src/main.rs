@@ -6,6 +6,7 @@
 //! ```
 
 mod config;
+mod listener;
 
 use std::io::IsTerminal;
 use std::os::unix::fs::OpenOptionsExt;
@@ -24,6 +25,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::{Config, RemoteConfig};
+use listener::{LimitedListener, connection_limit, soft_fd_limit};
 
 const CONFIG_FILE: &str = "windsock.toml";
 const NODE_KEY_FILE: &str = "node.key";
@@ -203,9 +205,20 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, key: Signing
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen))?;
-    info!(address = %listener.local_addr()?, "listening");
+    let soft = soft_fd_limit();
+    let safe = connection_limit(soft);
+    let max_connections = config.max_connections.unwrap_or(safe);
+    if max_connections > safe {
+        warn!(
+            max_connections,
+            soft_fd_limit = soft,
+            safe,
+            "max_connections leaves too few descriptors to the engine: under load, a flush can fail"
+        );
+    }
+    info!(address = %listener.local_addr()?, max_connections, "listening");
 
-    axum::serve(listener, router)
+    axum::serve(LimitedListener::new(listener, max_connections), router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

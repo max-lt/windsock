@@ -2048,6 +2048,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "remote",
+ "rustix",
  "s3api",
  "s3proto",
  "s3remote",

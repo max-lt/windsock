@@ -13,8 +13,9 @@ anyhow.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+rustix.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

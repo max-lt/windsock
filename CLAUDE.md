@@ -70,7 +70,10 @@ The daemon crate is `windsockd`.
 - Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once. One
   exception: the journal prune replaces a log entry once with its redacted form (same hash, same
   signature), so the key stays taken and the chain stays valid.
-- Only the GC deletes remote objects. The write path never deletes.
+- Only the GC deletes remote objects, plus the startup probe, which deletes its own probe key.
+  The write path never deletes.
+- `windsockd` starts only if the remote refuses a second create of one key
+  (`remote::check_create_only`).
 - The GC deletes a pack or a manifest only when no current object uses it, after a condemn entry
   in the journal and a GC sync that starts a horizon H (24 h) later. A writer dedups only after a
   sync younger than H/2, and commits only a plan younger than H/2. `protocol-check/src/gc.rs`

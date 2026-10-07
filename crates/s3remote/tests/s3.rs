@@ -92,6 +92,35 @@ async fn test_s3_remote_meets_the_contract() {
     .await;
 }
 
+/// The contract against another S3 implementation. Set S3REMOTE_TEST_ENDPOINT, _BUCKET,
+/// _ACCESS_KEY and _SECRET_KEY, then run with `--ignored`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_s3_remote_meets_the_contract_on_an_external_store() {
+    let var = |name: &str| std::env::var(format!("S3REMOTE_TEST_{name}")).unwrap();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let next = AtomicU32::new(0);
+
+    remote::contract::check(|| {
+        let config = S3Config {
+            endpoint: var("ENDPOINT"),
+            bucket: var("BUCKET"),
+            prefix: format!("contract-{run}-{}/", next.fetch_add(1, Ordering::SeqCst)),
+            region: std::env::var("S3REMOTE_TEST_REGION").unwrap_or("us-east-1".into()),
+            access_key: var("ACCESS_KEY"),
+            secret_key: var("SECRET_KEY"),
+            retry: Retry::default(),
+            ca_pem: None,
+        };
+        let remote = S3Remote::new(config).unwrap();
+        async move { remote }
+    })
+    .await;
+}
+
 /// An engine whose remote is an S3 bucket served by another engine.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_engine_runs_on_an_s3_remote() {

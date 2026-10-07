@@ -112,7 +112,8 @@ async fn run(config: &Config) -> Result<()> {
     match &config.remote {
         RemoteConfig::Dir { path } => {
             info!(remote = %path.display(), "remote is a local directory");
-            serve(config, Arc::new(DirRemote::open(path)?), key).await
+            let store = format!("directory {}", path.display());
+            serve(config, Arc::new(DirRemote::open(path)?), &store, key).await
         }
         RemoteConfig::S3 {
             endpoint,
@@ -141,7 +142,8 @@ async fn run(config: &Config) -> Result<()> {
                 retry: Retry::default(),
                 ca_pem,
             })?;
-            serve(config, Arc::new(remote), key).await
+            let store = format!("S3 endpoint {endpoint}, bucket {bucket}");
+            serve(config, Arc::new(remote), &store, key).await
         }
     }
 }
@@ -171,7 +173,17 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, key: SigningKey) -> Result<()> {
+async fn serve<R: Sweep + 'static>(
+    config: &Config,
+    remote: Arc<R>,
+    store: &str,
+    key: SigningKey,
+) -> Result<()> {
+    remote::check_create_only(&*remote)
+        .await
+        .with_context(|| format!("the {store} cannot hold a Windsock journal"))?;
+    info!(store, "the remote refuses a second create of one key");
+
     let engine = Engine::open(config.data_dir.join("engine"), remote, key, config.engine()).await?;
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");

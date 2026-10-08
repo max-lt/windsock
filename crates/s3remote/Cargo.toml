@@ -29,6 +29,7 @@ tls = ["dep:hyper-rustls", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 [dev-dependencies]
 remote = { workspace = true, features = ["contract"] }
 engine.workspace = true
+keys.workspace = true
 s3api.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true

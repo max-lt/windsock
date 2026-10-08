@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::io::Read;
 
+use keys::RepoKey;
 use model::ChunkId;
 use ruzstd::decoding::StreamingDecoder;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
@@ -47,11 +48,11 @@ pub enum DecodeError {
 }
 
 /// Splits `data` into content-defined chunks. Empty input gives no chunks.
-pub fn chunks(data: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
+pub fn chunks<'a>(key: &'a RepoKey, data: &'a [u8]) -> impl Iterator<Item = Chunk<'a>> {
     fastcdc::v2020::FastCDC::new(data, MIN_SIZE, AVG_SIZE, MAX_SIZE).map(move |c| {
         let bytes = &data[c.offset..c.offset + c.length];
         Chunk {
-            id: chunk_id(bytes),
+            id: chunk_id(key, bytes),
             offset: c.offset,
             data: bytes,
         }
@@ -59,17 +60,17 @@ pub fn chunks(data: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
 }
 
 /// Splits `data` into chunks of [`MAX_SIZE`] bytes, the last one shorter. Empty input gives no chunks.
-pub fn fixed_chunks(data: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
+pub fn fixed_chunks<'a>(key: &'a RepoKey, data: &'a [u8]) -> impl Iterator<Item = Chunk<'a>> {
     data.chunks(MAX_SIZE).enumerate().map(|(i, bytes)| Chunk {
-        id: chunk_id(bytes),
+        id: chunk_id(key, bytes),
         offset: i * MAX_SIZE,
         data: bytes,
     })
 }
 
-/// Returns the ID of a raw chunk.
-pub fn chunk_id(raw: &[u8]) -> ChunkId {
-    ChunkId::from_bytes(*blake3::hash(raw).as_bytes())
+/// Returns the ID of a raw chunk: keyed, so a reader of the remote cannot test for known data.
+pub fn chunk_id(key: &RepoKey, raw: &[u8]) -> ChunkId {
+    ChunkId::from_bytes(key.hash(raw))
 }
 
 /// Compresses a raw chunk. Keeps the raw bytes when zstd does not make them smaller.
@@ -85,6 +86,7 @@ pub fn compress(raw: &[u8]) -> (Compression, Cow<'_, [u8]>) {
 
 /// Restores a raw chunk from its stored form and checks it against `id`.
 pub fn decode(
+    key: &RepoKey,
     id: ChunkId,
     compression: Compression,
     stored: &[u8],
@@ -95,7 +97,7 @@ pub fn decode(
         Compression::Zstd => decompress(stored)?,
     };
 
-    let actual = chunk_id(&raw);
+    let actual = chunk_id(key, &raw);
 
     if actual != id {
         return Err(DecodeError::HashMismatch {
@@ -126,7 +128,14 @@ fn decompress(stored: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
+
+    fn key() -> &'static RepoKey {
+        static KEY: OnceLock<RepoKey> = OnceLock::new();
+        KEY.get_or_init(|| RepoKey::from_bytes([7u8; 32]))
+    }
 
     fn random_bytes(seed: u8, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
@@ -139,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_empty_input_has_no_chunks() {
-        assert_eq!(chunks(b"").count(), 0);
+        assert_eq!(chunks(key(), b"").count(), 0);
     }
 
     #[test]
@@ -147,7 +156,7 @@ mod tests {
         let data = random_bytes(1, 2 * 1024 * 1024);
         let mut rebuilt = Vec::new();
 
-        for chunk in chunks(&data) {
+        for chunk in chunks(key(), &data) {
             assert_eq!(chunk.offset, rebuilt.len());
             rebuilt.extend_from_slice(chunk.data);
         }
@@ -158,21 +167,21 @@ mod tests {
     #[test]
     fn test_fixed_chunks_cover_input() {
         let data = random_bytes(7, 2 * MAX_SIZE + 10);
-        let all: Vec<_> = fixed_chunks(&data).collect();
+        let all: Vec<_> = fixed_chunks(key(), &data).collect();
 
         assert_eq!(
             all.iter().map(|c| c.data.len()).collect::<Vec<_>>(),
             [MAX_SIZE, MAX_SIZE, 10]
         );
         assert_eq!(all[2].offset, 2 * MAX_SIZE);
-        assert_eq!(all[1].id, chunk_id(&data[MAX_SIZE..2 * MAX_SIZE]));
-        assert_eq!(fixed_chunks(b"").count(), 0);
+        assert_eq!(all[1].id, chunk_id(key(), &data[MAX_SIZE..2 * MAX_SIZE]));
+        assert_eq!(fixed_chunks(key(), b"").count(), 0);
     }
 
     #[test]
     fn test_chunk_sizes_within_bounds() {
         let data = random_bytes(2, 4 * 1024 * 1024);
-        let all: Vec<_> = chunks(&data).collect();
+        let all: Vec<_> = chunks(key(), &data).collect();
         let (last, rest) = all.split_last().unwrap();
 
         assert!(
@@ -183,10 +192,17 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_id_depends_on_the_key() {
+        let other = RepoKey::from_bytes([8u8; 32]);
+
+        assert_ne!(chunk_id(key(), b"windsock"), chunk_id(&other, b"windsock"));
+    }
+
+    #[test]
     fn test_storage_format_is_stable() {
         let data = random_bytes(3, 1024 * 1024);
-        let lengths: Vec<_> = chunks(&data).map(|c| c.data.len()).collect();
-        let first = chunks(&data).next().unwrap().id.to_string();
+        let lengths: Vec<_> = chunks(key(), &data).map(|c| c.data.len()).collect();
+        let first = chunks(key(), &data).next().unwrap().id.to_string();
 
         assert_eq!(
             lengths,
@@ -196,7 +212,7 @@ mod tests {
         );
         assert_eq!(
             first,
-            "35120ec9d1890e3daeeadbb2e90969698bc8a5df64cb82a4b481f8c4d1fa2857"
+            "7f199fa1cbaf42a855fc4c5300eaecc1db4a0c373ddf00413e758eb0cbf14211"
         );
     }
 
@@ -206,8 +222,8 @@ mod tests {
         let mut edited = data.clone();
         edited.splice(1024 * 1024..1024 * 1024, random_bytes(5, 100));
 
-        let before: Vec<_> = chunks(&data).map(|c| c.id).collect();
-        let after: Vec<_> = chunks(&edited).map(|c| c.id).collect();
+        let before: Vec<_> = chunks(key(), &data).map(|c| c.id).collect();
+        let after: Vec<_> = chunks(key(), &edited).map(|c| c.id).collect();
         let changed = after.iter().filter(|id| !before.contains(id)).count();
 
         assert!(changed <= 2, "{changed} of {} chunks changed", after.len());
@@ -220,7 +236,10 @@ mod tests {
 
         assert_eq!(compression, Compression::Zstd);
         assert!(stored.len() < raw.len());
-        assert_eq!(decode(chunk_id(&raw), compression, &stored).unwrap(), raw);
+        assert_eq!(
+            decode(key(), chunk_id(key(), &raw), compression, &stored).unwrap(),
+            raw
+        );
     }
 
     #[test]
@@ -229,17 +248,20 @@ mod tests {
         let (compression, stored) = compress(&raw);
 
         assert_eq!(compression, Compression::None);
-        assert_eq!(decode(chunk_id(&raw), compression, &stored).unwrap(), raw);
+        assert_eq!(
+            decode(key(), chunk_id(key(), &raw), compression, &stored).unwrap(),
+            raw
+        );
     }
 
     #[test]
     fn test_decode_rejects_hash_mismatch() {
         let raw = b"windsock ".repeat(4096);
         let (compression, stored) = compress(&raw);
-        let other = chunk_id(b"other");
+        let other = chunk_id(key(), b"other");
 
         assert!(matches!(
-            decode(other, compression, &stored),
+            decode(key(), other, compression, &stored),
             Err(DecodeError::HashMismatch { .. })
         ));
     }
@@ -250,7 +272,7 @@ mod tests {
         let (compression, stored) = compress(&raw);
 
         assert!(matches!(
-            decode(chunk_id(&raw), compression, &stored),
+            decode(key(), chunk_id(key(), &raw), compression, &stored),
             Err(DecodeError::TooLarge)
         ));
     }
@@ -260,7 +282,7 @@ mod tests {
         let raw = b"not a zstd frame";
 
         assert!(matches!(
-            decode(chunk_id(raw), Compression::Zstd, raw),
+            decode(key(), chunk_id(key(), raw), Compression::Zstd, raw),
             Err(DecodeError::Zstd(_))
         ));
     }

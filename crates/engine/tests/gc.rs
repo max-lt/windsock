@@ -9,8 +9,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine, EngineError, GcReport, WriteMode};
+use keys::RepoKey;
 use remote::{MemoryRemote, Remote, RemoteError, Sweep};
 use tempfile::TempDir;
+
+/// Every proxy of one remote shares the repository key.
+fn repo_key() -> RepoKey {
+    RepoKey::from_bytes([42u8; 32])
+}
 
 const BUCKET: &str = "bkt";
 const HORIZON: Duration = Duration::from_millis(600);
@@ -83,7 +89,7 @@ fn config(retention: Duration) -> Config {
 async fn proxy_with(remote: &Arc<TestRemote>, seed: u8, config: Config) -> Proxy {
     let dir = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, config)
+    let engine = Engine::open(dir.path(), remote.clone(), key, repo_key(), config)
         .await
         .unwrap();
     Proxy { _dir: dir, engine }

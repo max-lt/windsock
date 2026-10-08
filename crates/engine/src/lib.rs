@@ -29,6 +29,7 @@ use cache::{CacheError, ChunkCache};
 use ed25519_dalek::SigningKey;
 use index::{ChunkLocation, Index, IndexError};
 use journal::{Action, Commit, Entry, Journal, JournalError};
+use keys::RepoKey;
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
@@ -167,6 +168,7 @@ impl Current {
 
 pub struct Engine<R> {
     remote: Arc<R>,
+    key: Arc<RepoKey>,
     config: Config,
     node: NodeId,
     buffer_dir: PathBuf,
@@ -186,21 +188,24 @@ pub struct Engine<R> {
 
 impl<R: Remote + 'static> Engine<R> {
     /// Opens the engine state in `dir` and replays the writes a previous process
-    /// buffered. The node identity is the public key of `signing_key`.
+    /// buffered. The node identity is the public key of `signing_key`. Every
+    /// proxy of the remote must use the same `key`.
     pub async fn open(
         dir: impl AsRef<Path>,
         remote: Arc<R>,
         signing_key: SigningKey,
+        key: RepoKey,
         config: Config,
     ) -> Result<Self> {
         let dir = dir.as_ref();
+        let key = Arc::new(key);
         let index = Index::open(dir.join(INDEX_DIR))?;
         let journal = Journal::new(remote.clone(), signing_key, index.frontiers()?);
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
         let cache = match config.cache_bytes {
             0 => None,
-            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes).await?),
+            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, key.clone()).await?),
         };
 
         if !buffer.is_empty() {
@@ -210,6 +215,7 @@ impl<R: Remote + 'static> Engine<R> {
         let engine = Self {
             node: journal.node(),
             remote,
+            key,
             config,
             buffer_dir,
             journal: tokio::sync::Mutex::new(journal),

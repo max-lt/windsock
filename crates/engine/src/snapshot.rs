@@ -78,7 +78,7 @@ impl<R: Remote + 'static> Engine<R> {
         self.index().load(&snapshot)?;
 
         for (id, bytes) in &snapshot.manifests {
-            match Manifest::decode(*id, bytes) {
+            match Manifest::decode(&self.key, *id, bytes) {
                 Ok(manifest) => self.record_chunks(&manifest)?,
                 Err(e) => warn!(manifest_id = %id, %e, "skipped a snapshot manifest"),
             }

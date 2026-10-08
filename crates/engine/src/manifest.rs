@@ -1,18 +1,19 @@
 //! Manifest format: an object as a list of chunks in packs.
 //!
-//! Layout: `VERSION | postcard(Manifest)`. The ObjectId is the blake3 hash of these bytes.
-//! The nonce makes it unique per write: the GC deletes `manifests/<id>`, so the same key
-//! must never be written again.
+//! Layout: `VERSION | sealed postcard(Manifest)`. The ObjectId is the blake3 hash of these
+//! bytes. The seal nonce is the manifest nonce then zero. The nonce makes it unique per write:
+//! the GC deletes `manifests/<id>`, so the same key must never be written again.
 
 use std::collections::BTreeMap;
 
+use keys::RepoKey;
 use model::{ObjectId, PackId};
 use pack::PackEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::EngineError;
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// Prefix of the manifests that are too large to inline in a journal entry.
 pub const MANIFESTS_PREFIX: &str = "manifests/";
@@ -39,14 +40,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, key: &RepoKey) -> Vec<u8> {
+        let plain = postcard::to_allocvec(self).expect("a manifest always serializes");
+        let mut nonce = [0u8; 24];
+        nonce[..16].copy_from_slice(&self.nonce);
         let mut bytes = vec![VERSION];
-        bytes.extend(postcard::to_allocvec(self).expect("a manifest always serializes"));
+        bytes.extend(key.seal(&nonce, &plain));
         bytes
     }
 
     /// Checks `bytes` against `id` and decodes them.
-    pub fn decode(id: ObjectId, bytes: &[u8]) -> Result<Self, EngineError> {
+    pub fn decode(key: &RepoKey, id: ObjectId, bytes: &[u8]) -> Result<Self, EngineError> {
         if manifest_id(bytes) != id {
             return Err(EngineError::Corrupt(format!(
                 "manifest {id}: hash mismatch"
@@ -59,7 +63,10 @@ impl Manifest {
             )));
         };
 
-        let manifest: Self = postcard::from_bytes(body)
+        let plain = key
+            .open(body)
+            .map_err(|e| EngineError::Corrupt(format!("manifest {id}: {e}")))?;
+        let manifest: Self = postcard::from_bytes(&plain)
             .map_err(|e| EngineError::Corrupt(format!("manifest {id}: {e}")))?;
         let chunk_bytes: u64 = manifest
             .chunks
@@ -92,6 +99,10 @@ mod tests {
 
     use super::*;
 
+    fn key() -> RepoKey {
+        RepoKey::from_bytes([7u8; 32])
+    }
+
     fn sample() -> Manifest {
         let entry = |n: u8, offset: u64| PackEntry {
             chunk_id: ChunkId::from_bytes([n; 32]),
@@ -121,10 +132,10 @@ mod tests {
 
     #[test]
     fn test_manifest_roundtrip() {
-        let bytes = sample().encode();
+        let bytes = sample().encode(&key());
 
         assert_eq!(
-            Manifest::decode(manifest_id(&bytes), &bytes).unwrap(),
+            Manifest::decode(&key(), manifest_id(&bytes), &bytes).unwrap(),
             sample()
         );
     }
@@ -132,29 +143,48 @@ mod tests {
     #[test]
     fn test_manifest_format_is_stable() {
         assert_eq!(
-            manifest_id(&sample().encode()).to_string(),
-            "b3fb0b2eb7894104c5b11c1ba96fb7f90169a5674fb5a3e449c3b02e0caeca18"
+            manifest_id(&sample().encode(&key())).to_string(),
+            "02f2fd2104337e8c56f92d9e040824a7fc96e5e10ee14d2659de7e7fea68fb27"
         );
     }
 
     #[test]
+    fn test_manifest_hides_metadata_and_chunk_ids() {
+        let bytes = sample().encode(&key());
+
+        assert!(!bytes.windows(10).any(|w| w == b"text/plain"));
+        assert!(!bytes.windows(32).any(|w| w == [4u8; 32]));
+    }
+
+    #[test]
+    fn test_decode_rejects_another_key() {
+        let bytes = sample().encode(&key());
+        let other = RepoKey::from_bytes([8u8; 32]);
+
+        assert!(matches!(
+            Manifest::decode(&other, manifest_id(&bytes), &bytes),
+            Err(EngineError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn test_decode_rejects_hash_mismatch() {
-        let bytes = sample().encode();
+        let bytes = sample().encode(&key());
         let other = manifest_id(b"other");
 
         assert!(matches!(
-            Manifest::decode(other, &bytes),
+            Manifest::decode(&key(), other, &bytes),
             Err(EngineError::Corrupt(_))
         ));
     }
 
     #[test]
     fn test_decode_rejects_unknown_version() {
-        let mut bytes = sample().encode();
+        let mut bytes = sample().encode(&key());
         bytes[0] = VERSION + 1;
 
         assert!(matches!(
-            Manifest::decode(manifest_id(&bytes), &bytes),
+            Manifest::decode(&key(), manifest_id(&bytes), &bytes),
             Err(EngineError::Corrupt(_))
         ));
     }
@@ -163,10 +193,10 @@ mod tests {
     fn test_decode_rejects_chunks_that_miss_the_size() {
         let mut manifest = sample();
         manifest.size = 21;
-        let bytes = manifest.encode();
+        let bytes = manifest.encode(&key());
 
         assert!(matches!(
-            Manifest::decode(manifest_id(&bytes), &bytes),
+            Manifest::decode(&key(), manifest_id(&bytes), &bytes),
             Err(EngineError::Corrupt(_))
         ));
     }

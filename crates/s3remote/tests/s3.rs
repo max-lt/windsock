@@ -12,6 +12,7 @@ use axum::http::{Response, StatusCode};
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine, WriteMode};
+use keys::RepoKey;
 use remote::{DirRemote, Remote, RemoteError};
 use s3remote::{Retry, S3Config, S3Remote};
 use tempfile::TempDir;
@@ -39,6 +40,7 @@ async fn server() -> Server {
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
+        RepoKey::from_bytes([42u8; 32]),
         Config::default(),
     )
     .await
@@ -155,6 +157,7 @@ async fn test_engine_runs_on_an_s3_remote() {
             dir.path().to_path_buf(),
             remote.clone(),
             SigningKey::from_bytes(&[seed; 32]),
+            RepoKey::from_bytes([42u8; 32]),
             Config::default(),
         )
     };

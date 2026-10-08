@@ -23,6 +23,9 @@ pub fn test_keys() -> (String, String) {
     ("WSTESTKEY".to_string(), "test-secret".to_string())
 }
 
+/// The repository key of the configurations that [`cluster_config`] writes: one per remote.
+pub const TEST_REPO_KEY: [u8; 32] = [42u8; 32];
+
 pub struct Daemon {
     child: Child,
     pub address: String,
@@ -291,8 +294,11 @@ pub async fn call_with_pause(
 /// `gc` is the `[gc]` table, as TOML lines.
 pub fn cluster_config(dir: &Path, remote: &Path, flush_delay_ms: u64, gc: &str) -> PathBuf {
     let (access, secret) = test_keys();
+    let key_file = dir.join("repo.key");
+    std::fs::write(&key_file, hex::encode(TEST_REPO_KEY)).unwrap();
     let text = format!(
         r#"data_dir = "{data}"
+key_file = "{key_file}"
 listen = "127.0.0.1:0"
 sync_interval_secs = 1
 
@@ -311,6 +317,7 @@ flush_delay_ms = {flush_delay_ms}
 {gc}
 "#,
         data = dir.join("data").display(),
+        key_file = key_file.display(),
         remote = remote.display(),
     );
     let path = dir.join("windsock.toml");

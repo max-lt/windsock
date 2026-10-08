@@ -10,8 +10,14 @@ use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine, WriteMode};
 use journal::Entry;
+use keys::RepoKey;
 use remote::{MemoryRemote, Remote, RemoteError, Sweep};
 use tempfile::TempDir;
+
+/// Every proxy of one remote shares the repository key.
+fn repo_key() -> RepoKey {
+    RepoKey::from_bytes([42u8; 32])
+}
 
 const BUCKET: &str = "bkt";
 
@@ -69,9 +75,15 @@ struct Proxy {
 
 async fn open(remote: &Arc<TestRemote>, seed: u8, dir: TempDir) -> Proxy {
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, Config::default())
-        .await
-        .unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        repo_key(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     Proxy { dir, engine }
 }
 
@@ -239,7 +251,7 @@ async fn test_short_interval_writes_a_new_snapshot() {
         ..Config::default()
     };
     let key = SigningKey::from_bytes(&[1u8; 32]);
-    let a = Engine::open(dir.path(), remote.clone(), key, config)
+    let a = Engine::open(dir.path(), remote.clone(), key, repo_key(), config)
         .await
         .unwrap();
     a.create_bucket(BUCKET, None).await.unwrap();

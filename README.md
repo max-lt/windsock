@@ -14,8 +14,9 @@ Most of that time is the first build (under a minute on an M-series Mac).
    cargo build --release -p windsockd
    ```
 
-2. Make a configuration. This writes `./local/windsock.toml` with a new access key and secret.
-   The remote is the directory `./local/remote`. The file is readable by you only.
+2. Make a configuration. This writes `./local/windsock.toml` with a new access key and secret,
+   and `./local/repo.key`, the key that encrypts the remote. The remote is the directory
+   `./local/remote`. The files are readable by you only.
 
    ```bash
    ./target/release/windsockd init ./local
@@ -67,6 +68,7 @@ the configuration file.
 | --------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `data_dir`                  | `data`                                     | Engine state, write buffer, chunk cache, multipart parts, node key                                                                            |
 | `listen`                    | `127.0.0.1:9000`                           | S3 address                                                                                                                                    |
+| `key_file`                  | `repo.key`                                 | Repository key that encrypts the remote. Every proxy of a remote uses a copy of the same file. See `docs/encryption.md`                       |
 | `max_connections`           | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors                         |
 | `idle_timeout_secs`         | `60`                                       | A connection with no request in progress closes after this time                                                                               |
 | `request_timeout_secs`      | `300`                                      | A body upload that receives no byte for this time is cut. Each byte received starts the time again                                            |
@@ -92,6 +94,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - The remote store must keep the storage contract in `docs/storage.md`. Garage does not.
   Backblaze B2 does not document a conditional create. Run `windsockd diagnose <config>` before
   you use a new store.
+- Keep a copy of `repo.key` offline. Without it, the data in the remote is lost. The key does not
+  rotate. The remote shows the sizes and the times of the writes, but not the data, the object
+  keys or the metadata: see `docs/encryption.md`.
 - An `https` S3 remote needs the feature `tls`: `cargo build --release -p windsockd --features tls`.
   This feature compiles C (the `ring` crypto provider). The default build has no TLS and refuses an
   `https` endpoint. `ca_file` adds a PEM file of CA certificates to the public roots.

@@ -22,6 +22,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+keys.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

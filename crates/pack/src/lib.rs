@@ -4,10 +4,13 @@
 //!
 //! ```text
 //! header   MAGIC | VERSION | nonce (16 bytes)
-//! body     stored chunks, back to back
-//! footer   postcard(Vec<PackEntry>)
+//! body     sealed chunks, back to back
+//! footer   sealed postcard(Vec<PackEntry>)
 //! trailer  footer length (u32 LE) | MAGIC
 //! ```
+//!
+//! Each chunk has its own seal, so a range read opens one chunk. The seal nonce
+//! of chunk `i` is the pack nonce then `i`; the footer takes `u64::MAX`.
 //!
 //! The PackId is the blake3 hash of the whole pack. The nonce makes it unique per
 //! upload: the GC deletes a pack key, so the same key must never be written again.
@@ -17,6 +20,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use chunking::{Chunk, Compression};
+use keys::RepoKey;
 use model::{ChunkId, PackId};
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +28,10 @@ const MAGIC: [u8; 4] = *b"WSPK";
 /// Makes every pack key unique, also for the same chunks.
 pub type Nonce = [u8; 16];
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const HEADER_LEN: usize = MAGIC.len() + 1 + 16;
+/// Seal position of the footer: no pack holds that many chunks.
+const FOOTER_POSITION: u64 = u64::MAX;
 const TRAILER_LEN: usize = 4 + MAGIC.len();
 
 /// Location and encoding of one chunk inside a pack.
@@ -65,11 +71,14 @@ pub enum PackError {
     #[error("invalid pack footer: {0}")]
     Footer(#[from] postcard::Error),
     #[error(transparent)]
+    Seal(#[from] keys::SealError),
+    #[error(transparent)]
     Chunk(#[from] chunking::DecodeError),
 }
 
 /// Builds a pack from chunks. A chunk added twice is stored once.
 pub struct PackBuilder {
+    nonce: Nonce,
     bytes: Vec<u8>,
     entries: Vec<PackEntry>,
     positions: HashMap<ChunkId, usize>,
@@ -83,6 +92,7 @@ impl PackBuilder {
         bytes.extend_from_slice(&nonce);
 
         Self {
+            nonce,
             bytes,
             entries: Vec::new(),
             positions: HashMap::new(),
@@ -92,15 +102,17 @@ impl PackBuilder {
     /// Appends a chunk. Returns its entry.
     ///
     /// With `Compression::Zstd`, the chunk is stored compressed when zstd makes it smaller.
-    pub fn add(&mut self, chunk: Chunk<'_>, mode: Compression) -> PackEntry {
+    pub fn add(&mut self, key: &RepoKey, chunk: Chunk<'_>, mode: Compression) -> PackEntry {
         if let Some(&position) = self.positions.get(&chunk.id) {
             return self.entries[position];
         }
 
-        let (compression, stored) = match mode {
+        let (compression, plain) = match mode {
             Compression::Zstd => chunking::compress(chunk.data),
             Compression::None => (Compression::None, Cow::Borrowed(chunk.data)),
         };
+        let position = self.entries.len() as u64;
+        let stored = key.seal(&seal_nonce(&self.nonce, position), &plain);
         let entry = PackEntry {
             chunk_id: chunk.id,
             offset: self.bytes.len() as u64,
@@ -121,8 +133,9 @@ impl PackBuilder {
     }
 
     /// Writes the footer and computes the PackId.
-    pub fn finish(mut self) -> Pack {
-        let footer = postcard::to_allocvec(&self.entries).expect("entries always serialize");
+    pub fn finish(mut self, key: &RepoKey) -> Pack {
+        let entries = postcard::to_allocvec(&self.entries).expect("entries always serialize");
+        let footer = key.seal(&seal_nonce(&self.nonce, FOOTER_POSITION), &entries);
         let footer_len = u32::try_from(footer.len()).expect("footer is smaller than 4 GiB");
 
         self.bytes.extend_from_slice(&footer);
@@ -137,13 +150,21 @@ impl PackBuilder {
     }
 }
 
+/// The seal nonce of the chunk at `position`, or of the footer.
+fn seal_nonce(nonce: &Nonce, position: u64) -> keys::Nonce {
+    let mut seal = [0u8; 24];
+    seal[..16].copy_from_slice(nonce);
+    seal[16..].copy_from_slice(&position.to_le_bytes());
+    seal
+}
+
 /// Returns the ID of a whole pack.
 pub fn pack_id(bytes: &[u8]) -> PackId {
     PackId::from_bytes(*blake3::hash(bytes).as_bytes())
 }
 
 /// Checks a whole pack against `id` and returns its entries.
-pub fn parse(id: PackId, bytes: &[u8]) -> Result<Vec<PackEntry>, PackError> {
+pub fn parse(key: &RepoKey, id: PackId, bytes: &[u8]) -> Result<Vec<PackEntry>, PackError> {
     let actual = pack_id(bytes);
 
     if actual != id {
@@ -180,7 +201,7 @@ pub fn parse(id: PackId, bytes: &[u8]) -> Result<Vec<PackEntry>, PackError> {
     }
 
     let (body, footer) = rest.split_at(rest.len() - footer_len);
-    let entries: Vec<PackEntry> = postcard::from_bytes(footer)?;
+    let entries: Vec<PackEntry> = postcard::from_bytes(&key.open(footer)?)?;
     let mut next = HEADER_LEN as u64;
 
     for entry in &entries {
@@ -198,14 +219,15 @@ pub fn parse(id: PackId, bytes: &[u8]) -> Result<Vec<PackEntry>, PackError> {
 }
 
 /// Restores a raw chunk from the bytes at `entry.range()` in its pack.
-pub fn read_chunk(entry: &PackEntry, stored: &[u8]) -> Result<Vec<u8>, PackError> {
+pub fn read_chunk(key: &RepoKey, entry: &PackEntry, stored: &[u8]) -> Result<Vec<u8>, PackError> {
     if stored.len() != entry.stored_len as usize {
         return Err(PackError::Malformed(
             "stored length does not match the entry",
         ));
     }
 
-    let raw = chunking::decode(entry.chunk_id, entry.compression, stored)?;
+    let plain = key.open(stored)?;
+    let raw = chunking::decode(key, entry.chunk_id, entry.compression, &plain)?;
 
     if raw.len() != entry.raw_len as usize {
         return Err(PackError::Malformed("raw length does not match the entry"));
@@ -216,7 +238,14 @@ pub fn read_chunk(entry: &PackEntry, stored: &[u8]) -> Result<Vec<u8>, PackError
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
+
+    fn key() -> &'static RepoKey {
+        static KEY: OnceLock<RepoKey> = OnceLock::new();
+        KEY.get_or_init(|| RepoKey::from_bytes([7u8; 32]))
+    }
 
     fn random_bytes(seed: u8, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
@@ -237,10 +266,10 @@ mod tests {
 
     fn build(data: &[u8]) -> Pack {
         let mut builder = PackBuilder::new([0u8; 16]);
-        for chunk in chunking::chunks(data) {
-            builder.add(chunk, Compression::Zstd);
+        for chunk in chunking::chunks(key(), data) {
+            builder.add(key(), chunk, Compression::Zstd);
         }
-        builder.finish()
+        builder.finish(key())
     }
 
     fn slice(bytes: &[u8], range: Range<u64>) -> &[u8] {
@@ -251,7 +280,7 @@ mod tests {
     fn test_pack_roundtrip() {
         let data = sample();
         let pack = build(&data);
-        let entries = parse(pack.id, &pack.bytes).unwrap();
+        let entries = parse(key(), pack.id, &pack.bytes).unwrap();
 
         assert_eq!(entries, pack.entries);
         assert!(entries.iter().any(|e| e.compression == Compression::Zstd));
@@ -260,7 +289,7 @@ mod tests {
         let mut rebuilt = Vec::new();
         for entry in &entries {
             let stored = slice(&pack.bytes, entry.range());
-            rebuilt.extend(read_chunk(entry, stored).unwrap());
+            rebuilt.extend(read_chunk(key(), entry, stored).unwrap());
         }
         assert_eq!(rebuilt, data);
     }
@@ -268,31 +297,34 @@ mod tests {
     #[test]
     fn test_duplicate_chunk_is_stored_once() {
         let data = random_bytes(3, 64 * 1024);
-        let chunk = chunking::chunks(&data).next().unwrap();
+        let chunk = chunking::chunks(key(), &data).next().unwrap();
         let mut builder = PackBuilder::new([0u8; 16]);
 
-        let first = builder.add(chunk, Compression::Zstd);
+        let first = builder.add(key(), chunk, Compression::Zstd);
         let size = builder.size();
-        let second = builder.add(chunk, Compression::Zstd);
+        let second = builder.add(key(), chunk, Compression::Zstd);
 
         assert_eq!(first, second);
         assert_eq!(builder.size(), size);
-        assert_eq!(builder.finish().entries.len(), 1);
+        assert_eq!(builder.finish(key()).entries.len(), 1);
     }
 
     #[test]
     fn test_uncompressed_mode_stores_raw_chunks() {
         let data = b"windsock ".repeat(4096);
-        let chunk = chunking::chunks(&data).next().unwrap();
+        let chunk = chunking::chunks(key(), &data).next().unwrap();
         let mut builder = PackBuilder::new([0u8; 16]);
 
-        let entry = builder.add(chunk, Compression::None);
-        let pack = builder.finish();
+        let entry = builder.add(key(), chunk, Compression::None);
+        let pack = builder.finish(key());
 
         assert_eq!(entry.compression, Compression::None);
-        assert_eq!(entry.stored_len, entry.raw_len);
         assert_eq!(
-            read_chunk(&entry, slice(&pack.bytes, entry.range())).unwrap(),
+            entry.stored_len as usize,
+            entry.raw_len as usize + keys::SEAL_OVERHEAD
+        );
+        assert_eq!(
+            read_chunk(key(), &entry, slice(&pack.bytes, entry.range())).unwrap(),
             chunk.data
         );
     }
@@ -302,10 +334,10 @@ mod tests {
         let data = random_bytes(8, 64 * 1024);
         let pack = |nonce: Nonce| {
             let mut builder = PackBuilder::new(nonce);
-            for chunk in chunking::chunks(&data) {
-                builder.add(chunk, Compression::None);
+            for chunk in chunking::chunks(key(), &data) {
+                builder.add(key(), chunk, Compression::None);
             }
-            builder.finish()
+            builder.finish(key())
         };
 
         let first = pack([1u8; 16]);
@@ -313,14 +345,17 @@ mod tests {
 
         assert_ne!(first.id, second.id);
         assert_eq!(first.entries, second.entries);
-        assert_eq!(parse(second.id, &second.bytes).unwrap(), second.entries);
+        assert_eq!(
+            parse(key(), second.id, &second.bytes).unwrap(),
+            second.entries
+        );
     }
 
     #[test]
     fn test_empty_pack_is_valid() {
-        let pack = PackBuilder::new([0u8; 16]).finish();
+        let pack = PackBuilder::new([0u8; 16]).finish(key());
 
-        assert!(parse(pack.id, &pack.bytes).unwrap().is_empty());
+        assert!(parse(key(), pack.id, &pack.bytes).unwrap().is_empty());
     }
 
     #[test]
@@ -335,8 +370,35 @@ mod tests {
         );
         assert_eq!(
             pack.id.to_string(),
-            "0902018b845321b958a0431250fb52452684a18cb221685dc26e1cdc1b8ecd47"
+            "b2c6605a08d0d350ccfeaff22998291ebdcc53171b15c7b966e5549cc94226c6"
         );
+    }
+
+    #[test]
+    fn test_pack_hides_chunks_and_chunk_ids() {
+        let data = b"windsock ".repeat(4096);
+        let pack = build(&data);
+
+        assert!(!pack.bytes.windows(9).any(|w| w == b"windsock "));
+        for entry in &pack.entries {
+            assert!(
+                !pack
+                    .bytes
+                    .windows(32)
+                    .any(|w| w == entry.chunk_id.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_another_key() {
+        let pack = build(&sample());
+        let other = RepoKey::from_bytes([8u8; 32]);
+
+        assert!(matches!(
+            super::parse(&other, pack.id, &pack.bytes),
+            Err(PackError::Seal(_))
+        ));
     }
 
     #[test]
@@ -346,7 +408,7 @@ mod tests {
         bytes[HEADER_LEN + 10] ^= 1;
 
         assert!(matches!(
-            parse(pack.id, &bytes),
+            parse(key(), pack.id, &bytes),
             Err(PackError::HashMismatch { .. })
         ));
     }
@@ -357,7 +419,7 @@ mod tests {
         bytes[MAGIC.len()] = VERSION + 1;
 
         assert!(matches!(
-            parse(pack_id(&bytes), &bytes),
+            parse(key(), pack_id(&bytes), &bytes),
             Err(PackError::UnsupportedVersion(v)) if v == VERSION + 1
         ));
     }
@@ -367,7 +429,7 @@ mod tests {
         let bytes = &build(&sample()).bytes[..HEADER_LEN + 2];
 
         assert!(matches!(
-            parse(pack_id(bytes), bytes),
+            parse(key(), pack_id(bytes), bytes),
             Err(PackError::Malformed(_))
         ));
     }
@@ -380,6 +442,6 @@ mod tests {
         };
         let stored = slice(&pack.bytes, second.range());
 
-        assert!(read_chunk(&first, stored).is_err());
+        assert!(read_chunk(key(), &first, stored).is_err());
     }
 }

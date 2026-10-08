@@ -10,6 +10,7 @@ use axum::http::{Request, Response, StatusCode};
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine};
 use http_body_util::BodyExt;
+use keys::RepoKey;
 use remote::DirRemote;
 use s3api::{S3Config, sigv4};
 use tempfile::TempDir;
@@ -32,6 +33,7 @@ async fn server() -> Server {
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
+        RepoKey::from_bytes([42u8; 32]),
         Config::default(),
     )
     .await

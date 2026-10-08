@@ -26,8 +26,8 @@ The daemon crate is `windsockd`.
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId, KeyId).
 - `keys`: the repository key (`docs/encryption.md`): hash key, seal key and key ID derived with
   `blake3::derive_key`, keyed blake3, sealed objects (XChaCha20-Poly1305), random bytes.
-- `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
-- `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
+- `chunking`: FastCDC chunk boundaries, chunk IDs (keyed blake3), per-chunk zstd compression.
+- `pack`: pack format v3 (header with a nonce, sealed chunks, sealed postcard footer, trailer), builder, parser,
   one-chunk read.
 - `remote`: `Remote` trait (put, create, get, get_range, list, no delete), `Sweep` trait (delete,
   GC only), memory and local directory backends, the contract checks (`contract`, feature `contract`)
@@ -41,7 +41,7 @@ The daemon crate is `windsockd`.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
   condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
-- `cache`: disk cache of raw chunks by ChunkId: LRU by size, blake3 check on every read, one fetch
+- `cache`: disk cache of raw chunks by ChunkId: LRU by size, chunk ID check on every read, one fetch
   per missing chunk (singleflight).
 - `engine`: object operations. `lib.rs`: types, errors, `open`. One module per kind of operation:
   `buckets.rs`, `write.rs` (puts fsynced in the buffer), `read.rs` (buffer, then index, cache and
@@ -55,7 +55,7 @@ The daemon crate is `windsockd`.
   `object.rs`, `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects
   v1 and v2 paging (no I/O). `multipart.rs`: parts on local disk. `xml.rs`. ETag = blake3 hex of
   the data.
-- `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
+- `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair and a repository key (`repo.key`); `run <config>`
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
   `README.md` has the steps to run it locally.
 - `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with

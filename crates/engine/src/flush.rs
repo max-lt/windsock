@@ -86,12 +86,9 @@ impl<R: Remote + 'static> Engine<R> {
     pub(crate) async fn flush_segments(&self, segments: &[u64]) -> Result<()> {
         let dedup = self.ensure_fresh_sync().await?;
         let planned_at = buffer::unix_nanos();
-        let seed = blake3::Hasher::new()
-            .update(self.node.as_bytes())
-            .update(&buffer::unix_nanos().to_le_bytes())
-            .finalize();
-        let nonces = Nonces::new(*seed.as_bytes());
+        let nonces = Nonces::new(keys::random());
         let mut planner = Planner::new(
+            self.key.clone(),
             self.config.pack_target,
             self.config.own_pack_threshold,
             nonces,
@@ -195,7 +192,7 @@ impl<R: Remote + 'static> Engine<R> {
         key: String,
         manifest: &Manifest,
     ) -> Result<Action> {
-        let bytes = manifest.encode();
+        let bytes = manifest.encode(&self.key);
         let manifest_id = manifest_id(&bytes);
 
         let inline_manifest = if bytes.len() <= INLINE_MAX {

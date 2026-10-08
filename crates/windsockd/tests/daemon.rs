@@ -301,6 +301,21 @@ fn test_diagnose_reports_that_a_directory_remote_keeps_the_storage_contract() {
 }
 
 #[test]
+fn test_init_writes_a_repository_key_for_the_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, _, _) = init();
+    let path = dir.path().join("repo.key");
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    assert_eq!(hex::decode(text.trim()).unwrap().len(), 32);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();
 

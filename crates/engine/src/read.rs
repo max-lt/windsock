@@ -172,14 +172,14 @@ impl<R: Remote + 'static> Engine<R> {
     /// The manifest from the index, or from the remote on a miss.
     pub(crate) async fn manifest(&self, id: ObjectId) -> Result<Manifest> {
         if let Some(bytes) = self.index().manifest(id)? {
-            return Manifest::decode(id, &bytes);
+            return Manifest::decode(&self.key, id, &bytes);
         }
 
         let Some(bytes) = self.remote.get(&manifest_key(id)).await? else {
             return Err(EngineError::Corrupt(format!("manifest {id} is missing")));
         };
 
-        let manifest = Manifest::decode(id, &bytes)?;
+        let manifest = Manifest::decode(&self.key, id, &bytes)?;
         self.index().put_manifest(id, &bytes)?;
         Ok(manifest)
     }
@@ -193,7 +193,7 @@ impl<R: Remote + 'static> Engine<R> {
             return self.manifest(id).await;
         };
 
-        let manifest = Manifest::decode(id, bytes)?;
+        let manifest = Manifest::decode(&self.key, id, bytes)?;
         self.index().put_manifest(id, bytes)?;
         Ok(manifest)
     }
@@ -299,7 +299,7 @@ impl<R: Remote + 'static> Engine<R> {
             .map(|entry| {
                 let offset = (entry.offset - start) as usize;
                 let stored = &bytes[offset..offset + entry.stored_len as usize];
-                Ok(pack::read_chunk(entry, stored)?)
+                Ok(pack::read_chunk(&self.key, entry, stored)?)
             })
             .collect()
     }

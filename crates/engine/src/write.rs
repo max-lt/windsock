@@ -152,6 +152,7 @@ mod tests {
             dir,
             Arc::new(MemoryRemote::default()),
             SigningKey::from_bytes(&[3; 32]),
+            RepoKey::from_bytes([42; 32]),
             Config::default(),
         )
         .await

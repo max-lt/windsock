@@ -8,8 +8,14 @@ use bytes::Bytes;
 use chunking::Compression;
 use ed25519_dalek::SigningKey;
 use engine::{Chunking, Config, Engine, EngineError, Policy, PrefixPolicy, WriteMode};
+use keys::RepoKey;
 use remote::{MemoryRemote, Remote, RemoteError};
 use tempfile::TempDir;
+
+/// Every proxy of one remote shares the repository key.
+fn repo_key() -> RepoKey {
+    RepoKey::from_bytes([42u8; 32])
+}
 
 const BUCKET: &str = "bkt";
 
@@ -62,7 +68,7 @@ async fn open<R: Remote + 'static>(
     config: Config,
 ) -> Proxy<R> {
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, config)
+    let engine = Engine::open(dir.path(), remote.clone(), key, repo_key(), config)
         .await
         .unwrap();
     Proxy { dir, engine }

@@ -1,7 +1,7 @@
 //! Disk cache of raw chunks, keyed by ChunkId.
 //!
 //! A chunk never changes for a given ChunkId, so the cache never goes stale and
-//! the GC never needs to touch it. Every read checks the blake3 hash: a torn or
+//! the GC never needs to touch it. Every read checks the chunk ID: a torn or
 //! corrupt file is a miss. Eviction is LRU by size. After a restart, the LRU
 //! order comes from the file modification times.
 
@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use keys::RepoKey;
 use model::ChunkId;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -120,6 +121,7 @@ impl Drop for Flight<'_> {
 pub struct ChunkCache {
     dir: PathBuf,
     max_bytes: u64,
+    key: Arc<RepoKey>,
     lru: Mutex<Lru>,
     flights: Flights,
 }
@@ -127,7 +129,7 @@ pub struct ChunkCache {
 impl ChunkCache {
     /// Opens the cache in `dir`, takes the chunks a previous process left, and
     /// evicts the oldest ones above `max_bytes`.
-    pub async fn open(dir: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
+    pub async fn open(dir: impl Into<PathBuf>, max_bytes: u64, key: Arc<RepoKey>) -> Result<Self> {
         let dir = dir.into();
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -143,6 +145,7 @@ impl ChunkCache {
         let cache = Self {
             dir,
             max_bytes,
+            key,
             lru: Mutex::new(lru),
             flights: Mutex::new(HashMap::new()),
         };
@@ -178,7 +181,7 @@ impl ChunkCache {
             Err(e) => return Err(e.into()),
         };
 
-        if blake3::hash(&data).as_bytes() != id.as_bytes() {
+        if chunking::chunk_id(&self.key, &data) != id {
             warn!(chunk = %id, "cached chunk fails its hash check: removed");
             self.lru().remove(id);
             self.remove_files(&[id]).await;
@@ -289,9 +292,13 @@ mod tests {
 
     use super::*;
 
+    fn key() -> Arc<RepoKey> {
+        Arc::new(RepoKey::from_bytes([7u8; 32]))
+    }
+
     fn chunk(n: u8, len: usize) -> (ChunkId, Vec<u8>) {
         let data = vec![n; len];
-        (ChunkId::from_bytes(*blake3::hash(&data).as_bytes()), data)
+        (chunking::chunk_id(&key(), &data), data)
     }
 
     #[test]
@@ -311,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_then_get() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path(), 1 << 20).await.unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, key()).await.unwrap();
         let (id, data) = chunk(1, 100);
 
         assert!(cache.get(id).await.unwrap().is_none());
@@ -324,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_bound_evicts_the_least_recently_used_file() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path(), 250).await.unwrap();
+        let cache = ChunkCache::open(dir.path(), 250, key()).await.unwrap();
         let chunks: Vec<_> = (0..3).map(|n| chunk(n, 100)).collect();
         cache.insert(chunks[0].0, &chunks[0].1).await.unwrap();
         cache.insert(chunks[1].0, &chunks[1].1).await.unwrap();
@@ -341,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_larger_than_the_bound_is_not_cached() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path(), 50).await.unwrap();
+        let cache = ChunkCache::open(dir.path(), 50, key()).await.unwrap();
         let (id, data) = chunk(1, 100);
 
         cache.insert(id, &data).await.unwrap();
@@ -353,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn test_corrupt_file_is_a_miss_and_is_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path(), 1 << 20).await.unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, key()).await.unwrap();
         let (id, data) = chunk(1, 100);
         cache.insert(id, &data).await.unwrap();
         std::fs::write(path_of(dir.path(), id), b"torn").unwrap();
@@ -368,7 +375,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chunks: Vec<_> = (0..3).map(|n| chunk(n, 100)).collect();
         {
-            let cache = ChunkCache::open(dir.path(), 1 << 20).await.unwrap();
+            let cache = ChunkCache::open(dir.path(), 1 << 20, key()).await.unwrap();
             for (id, data) in &chunks {
                 cache.insert(*id, data).await.unwrap();
                 // Modification times order the chunks at the next open.
@@ -379,7 +386,7 @@ mod tests {
         let tmp = path_of(dir.path(), chunks[0].0).with_file_name(".tmp.1.1");
         std::fs::write(&tmp, b"partial").unwrap();
 
-        let cache = ChunkCache::open(dir.path(), 250).await.unwrap();
+        let cache = ChunkCache::open(dir.path(), 250, key()).await.unwrap();
 
         assert_eq!(cache.bytes(), 200);
         assert!(cache.get(chunks[0].0).await.unwrap().is_none());
@@ -390,7 +397,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_second_fetch_of_a_chunk_waits_for_the_first() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(ChunkCache::open(dir.path(), 1 << 20).await.unwrap());
+        let cache = Arc::new(ChunkCache::open(dir.path(), 1 << 20, key()).await.unwrap());
         let (id, data) = chunk(1, 100);
         let first = cache.lock(id).await;
 

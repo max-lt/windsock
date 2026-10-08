@@ -11,6 +11,7 @@ use ed25519_dalek::SigningKey;
 use engine::{Config, Engine};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::service::TowerToHyperService;
+use keys::RepoKey;
 use remote::{DirRemote, Remote};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -31,6 +32,7 @@ async fn tls_server() -> (TempDir, String) {
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
+        RepoKey::from_bytes([42u8; 32]),
         Config::default(),
     )
     .await

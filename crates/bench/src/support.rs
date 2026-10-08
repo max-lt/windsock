@@ -14,6 +14,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use keys::RepoKey;
 use remote::{DirRemote, Remote, RemoteError, Sweep};
 use s3proto::sigv4;
 
@@ -120,6 +121,7 @@ impl Server {
             engine_dir,
             remote,
             SigningKey::from_bytes(&[seed; 32]),
+            repo_key(),
             config,
         )
         .await?;
@@ -224,6 +226,11 @@ impl S3Client {
 }
 
 /// Incompressible bytes, the same for the same seed.
+/// Every proxy of one remote shares the repository key.
+pub fn repo_key() -> RepoKey {
+    RepoKey::from_bytes([42u8; 32])
+}
+
 pub fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     let mut out = Vec::with_capacity(len + 8);

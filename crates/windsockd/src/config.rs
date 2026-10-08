@@ -8,6 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// File name of the repository key that `windsockd init` writes.
+pub const REPO_KEY_FILE: &str = "repo.key";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -16,6 +19,8 @@ pub struct Config {
     /// The S3 address, `host:port`.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// The repository key, 32 bytes in hex. Every proxy of the remote reads a copy. Relative to the file.
+    pub key_file: PathBuf,
     pub remote: RemoteConfig,
     /// The keys that S3 clients sign with. Every key reaches every bucket.
     pub keys: Vec<KeyConfig>,
@@ -143,6 +148,7 @@ impl Config {
 
         let base = path.parent().unwrap_or(Path::new("."));
         config.data_dir = base.join(&config.data_dir);
+        config.key_file = base.join(&config.key_file);
         match &mut config.remote {
             RemoteConfig::Dir { path } => *path = base.join(&*path),
             RemoteConfig::S3 {
@@ -178,6 +184,7 @@ impl Config {
         Ok(Self {
             data_dir: PathBuf::from("data"),
             listen: default_listen(),
+            key_file: PathBuf::from(REPO_KEY_FILE),
             remote: RemoteConfig::Dir {
                 path: PathBuf::from("remote"),
             },
@@ -238,6 +245,7 @@ mod tests {
         let config = Config::load(&path).unwrap();
 
         assert_eq!(config.data_dir, dir.path().join("data"));
+        assert_eq!(config.key_file, dir.path().join("repo.key"));
         assert_eq!(
             config.remote,
             RemoteConfig::Dir {
@@ -250,7 +258,7 @@ mod tests {
     fn test_ca_file_is_relative_to_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("windsock.toml");
-        let text = "data_dir = \"d\"\n[[keys]]\naccess_key = \"c\"\nsecret_key = \"d\"\n\
+        let text = "data_dir = \"d\"\nkey_file = \"k\"\n[[keys]]\naccess_key = \"c\"\nsecret_key = \"d\"\n\
                     [remote]\ntype = \"s3\"\nendpoint = \"https://s3.example.com\"\n\
                     bucket = \"b\"\naccess_key = \"a\"\nsecret_key = \"s\"\nca_file = \"ca.pem\"\n";
         std::fs::write(&path, text).unwrap();
@@ -267,6 +275,7 @@ mod tests {
     fn test_s3_remote_and_defaults() {
         let text = r#"
             data_dir = "/var/lib/windsock"
+            key_file = "/etc/windsock/repo.key"
             [remote]
             type = "s3"
             endpoint = "http://10.0.0.2:9000"
@@ -299,7 +308,7 @@ mod tests {
         let path = dir.path().join("windsock.toml");
         std::fs::write(
             &path,
-            "data_dir = \"d\"\nkeys = []\n[remote]\ntype = \"dir\"\npath = \"r\"\n",
+            "data_dir = \"d\"\nkey_file = \"k\"\nkeys = []\n[remote]\ntype = \"dir\"\npath = \"r\"\n",
         )
         .unwrap();
         assert!(Config::load(&path).is_err());

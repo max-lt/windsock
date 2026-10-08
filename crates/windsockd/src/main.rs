@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use engine::Engine;
+use keys::RepoKey;
 use remote::{DirRemote, Startup, Sweep, Verdict};
 use s3remote::{Retry, S3Config, S3Remote};
 use tokio::signal::unix::{SignalKind, signal};
@@ -24,7 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use config::{Config, RemoteConfig};
+use config::{Config, REPO_KEY_FILE, RemoteConfig};
 use listener::{
     ConnectionActivity, LimitedListener, Timeouts, connection_limit, soft_fd_limit, track_requests,
 };
@@ -74,12 +75,32 @@ fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
 
 fn init(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
+    // The key first: a second init must fail before it can replace the key of a remote.
+    let key_path = dir.join(REPO_KEY_FILE);
+    write_secret(
+        &key_path,
+        hex::encode(config::random_bytes::<32>()?).as_bytes(),
+    )?;
     let path = dir.join(CONFIG_FILE);
     let text = toml::to_string(&Config::local()?).context("cannot write the configuration")?;
     write_secret(&path, text.as_bytes())?;
 
     info!(config = %path.display(), "wrote a configuration; the S3 access key and secret are in it");
+    info!(
+        key = %key_path.display(),
+        "wrote a repository key; keep a copy offline: without it, the data in the remote is lost"
+    );
     Ok(())
+}
+
+/// Reads a file that holds 32 bytes in hex.
+fn read_key(path: &Path) -> Result<[u8; 32]> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(text.trim(), &mut bytes)
+        .with_context(|| format!("{} is not a hex key", path.display()))?;
+    Ok(bytes)
 }
 
 /// The node identity, made on the first start.
@@ -91,11 +112,7 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
         info!(path = %path.display(), "made a new node key");
     }
 
-    let text = std::fs::read_to_string(&path)?;
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(text.trim(), &mut bytes)
-        .with_context(|| format!("{} is not a hex key", path.display()))?;
-    Ok(SigningKey::from_bytes(&bytes))
+    Ok(SigningKey::from_bytes(&read_key(&path)?))
 }
 
 /// Below this, a slow flush can take longer than half the horizon and never commit.
@@ -214,6 +231,7 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     }
     std::fs::create_dir_all(&config.data_dir)?;
     let key = node_key(&config.data_dir)?;
+    let repo_key = RepoKey::from_bytes(read_key(&config.key_file)?);
 
     match remote::check_before_serving(&*remote).await {
         Startup::Conformant => info!(store, "the remote keeps the storage contract"),
@@ -229,7 +247,14 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         ),
     }
 
-    let engine = Engine::open(config.data_dir.join("engine"), remote, key, config.engine()).await?;
+    let engine = Engine::open(
+        config.data_dir.join("engine"),
+        remote,
+        key,
+        repo_key,
+        config.engine(),
+    )
+    .await?;
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");
 

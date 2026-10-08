@@ -149,6 +149,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "keys",
  "remote",
  "s3api",
  "s3proto",
@@ -224,8 +225,9 @@ checksum = "0d74937895e761d5984206f82ca8ff7725d0fd8021921011921894b41ab1b9f7"
 name = "cache"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
+ "chunking",
+ "keys",
  "model",
  "tempfile",
  "thiserror",
@@ -290,6 +292,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fastcdc",
+ "keys",
  "model",
  "ruzstd",
  "serde",
@@ -528,6 +531,7 @@ dependencies = [
  "hex",
  "index",
  "journal",
+ "keys",
  "model",
  "pack",
  "postcard",
@@ -1129,6 +1133,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "chunking",
+ "keys",
  "model",
  "postcard",
  "serde",
@@ -1449,6 +1454,7 @@ dependencies = [
  "form_urlencoded",
  "hex",
  "http-body-util",
+ "keys",
  "postcard",
  "quick-xml",
  "remote",
@@ -1485,6 +1491,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "keys",
  "quick-xml",
  "remote",
  "rustls",
@@ -2177,6 +2184,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "keys",
  "remote",
  "rustix",
  "s3api",

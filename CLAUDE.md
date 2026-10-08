@@ -23,7 +23,9 @@ A milestone is complete only when `cargo clippy --all-targets -- -D warnings` an
 All crates live in `crates/<name>`. Crate names have no project prefix.
 The daemon crate is `windsockd`.
 
-- `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
+- `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId, KeyId).
+- `keys`: the repository key (`docs/encryption.md`): hash key, seal key and key ID derived with
+  `blake3::derive_key`, keyed blake3, sealed objects (XChaCha20-Poly1305), random bytes.
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
   one-chunk read.
@@ -161,6 +163,8 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | Serialization                | `serde`, `postcard`                                                                   |
 | Errors                       | `thiserror`                                                                           |
 | Signatures                   | `ed25519-dalek` v2                                                                    |
+| Encryption                   | `chacha20poly1305` 0.11, no default features, `alloc`                                 |
+| Random bytes                 | `getrandom` 0.4                                                                       |
 | Logging                      | `tracing`                                                                             |
 | Local index                  | `fjall` v3                                                                            |
 | Tests                        | `tempfile`                                                                            |

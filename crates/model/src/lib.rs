@@ -70,6 +70,11 @@ id! {
     NodeId
 }
 
+id! {
+    /// Public name of a repository key, derived from it.
+    KeyId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

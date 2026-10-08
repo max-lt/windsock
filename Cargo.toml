@@ -16,6 +16,7 @@ journal = { path = "crates/journal" }
 index = { path = "crates/index" }
 engine = { path = "crates/engine" }
 cache = { path = "crates/cache" }
+keys = { path = "crates/keys" }
 s3api = { path = "crates/s3api" }
 s3proto = { path = "crates/s3proto" }
 s3remote = { path = "crates/s3remote" }
@@ -40,10 +41,12 @@ subtle = "2"
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
 blake3 = { version = "1", features = ["pure"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 bytes = "1"
 ed25519-dalek = "2"
 fastcdc = "5"
 fjall = "3"
+getrandom = "0.4"
 hex = "0.4"
 postcard = { version = "1", features = ["alloc"] }
 ruzstd = "0.9"

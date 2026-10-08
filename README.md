@@ -56,30 +56,30 @@ key pair from step 4.
 
 - AWS CLI: `aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://demo/`
 - boto3: `boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1",
-  aws_access_key_id=AK, aws_secret_access_key=SK, config=Config(s3={"addressing_style": "path"}))`
+aws_access_key_id=AK, aws_secret_access_key=SK, config=Config(s3={"addressing_style": "path"}))`
 
 ## Configuration
 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to
 the configuration file.
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `data_dir` | `data` | Engine state, write buffer, chunk cache, multipart parts, node key |
-| `listen` | `127.0.0.1:9000` | S3 address |
-| `max_connections` | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors |
-| `idle_timeout_secs` | `60` | A connection with no request in progress closes after this time |
-| `request_timeout_secs` | `300` | A body upload that receives no byte for this time is cut. Each byte received starts the time again |
-| `remote.type` | `dir` | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA) |
-| `[[keys]]` | one new pair | Key pairs that S3 clients sign with. Every key reaches every bucket |
-| `sync_interval_secs` | `10` | How often the proxy reads the writes of other proxies |
-| `engine.cache_bytes` | 16 GiB | Chunk cache size. `0` turns the cache off |
-| `engine.flush_delay_ms` | `1000` | Longest time a write waits in the buffer before it goes to the remote |
-| `engine.buffer_limit_bytes` | 8 GiB | Writes fail with `503 SlowDown` above this |
-| `gc.enabled` | `false` | Set to `true` on one proxy per remote |
-| `gc.interval_secs` | `3600` | How often the GC runs |
-| `gc.horizon_secs` | `86400` | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning |
-| `gc.retention_secs` | `86400` | Old versions stay readable for this time |
+| Setting                     | Default                                    | Meaning                                                                                                                                       |
+| --------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data_dir`                  | `data`                                     | Engine state, write buffer, chunk cache, multipart parts, node key                                                                            |
+| `listen`                    | `127.0.0.1:9000`                           | S3 address                                                                                                                                    |
+| `max_connections`           | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors                         |
+| `idle_timeout_secs`         | `60`                                       | A connection with no request in progress closes after this time                                                                               |
+| `request_timeout_secs`      | `300`                                      | A body upload that receives no byte for this time is cut. Each byte received starts the time again                                            |
+| `remote.type`               | `dir`                                      | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA)       |
+| `[[keys]]`                  | one new pair                               | Key pairs that S3 clients sign with. Every key reaches every bucket                                                                           |
+| `sync_interval_secs`        | `10`                                       | How often the proxy reads the writes of other proxies                                                                                         |
+| `engine.cache_bytes`        | 16 GiB                                     | Chunk cache size. `0` turns the cache off                                                                                                     |
+| `engine.flush_delay_ms`     | `1000`                                     | Longest time a write waits in the buffer before it goes to the remote                                                                         |
+| `engine.buffer_limit_bytes` | 8 GiB                                      | Writes fail with `503 SlowDown` above this                                                                                                    |
+| `gc.enabled`                | `false`                                    | Set to `true` on one proxy per remote                                                                                                         |
+| `gc.interval_secs`          | `3600`                                     | How often the GC runs                                                                                                                         |
+| `gc.horizon_secs`           | `86400`                                    | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning |
+| `gc.retention_secs`         | `86400`                                    | Old versions stay readable for this time                                                                                                      |
 
 The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 

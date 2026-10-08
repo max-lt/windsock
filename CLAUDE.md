@@ -14,6 +14,7 @@ cargo test                                   # all tests (about 280; windsockd c
 cargo test -p model                          # one crate
 cargo clippy --all-targets -- -D warnings    # lint, zero warnings, tests included
 cargo fmt --check                            # format check
+npx --yes prettier@3 --check '**/*.md'       # Markdown format check (--write to fix)
 scripts/bench.sh                             # bench, release build, a few minutes
 ```
 
@@ -149,33 +150,33 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 `cargo clippy --all-targets --features windsockd/tls,s3remote/tls -- -D warnings`, and
 `cargo test -p s3remote -p windsockd --features tls`.
 
-| Purpose | Crate |
-|---|---|
-| Hashing | `blake3` with feature `pure` (the default build compiles C and asm) |
-| Chunking | `fastcdc` v5, `v2020` module |
-| Compression | `ruzstd`, level `Fastest` (standard zstd frames) |
-| Async | `tokio`, `async-trait` |
-| Buffers | `bytes` |
-| Hex encoding | `hex` |
-| Serialization | `serde`, `postcard` |
-| Errors | `thiserror` |
-| Signatures | `ed25519-dalek` v2 |
-| Logging | `tracing` |
-| Local index | `fjall` v3 |
-| Tests | `tempfile` |
-| Model checking | `stateright` |
-| HTTP server | `axum` 0.8 |
-| HTTP client | `hyper` 1, `hyper-util` (`client-legacy`) |
-| Daemon errors | `anyhow` (only in `windsockd`) |
-| Configuration | `toml` 0.8 |
-| Log output | `tracing-subscriber` with `env-filter` |
-| XML | `quick-xml` with `serialize` |
-| SigV4 | `hmac`, `sha2`, `subtle` |
-| URL form encoding | `form_urlencoded` |
-| fd limit | `rustix` (`process`) |
-| HTTP body type (`windsockd`) | `http-body` 1 |
-| TLS (feature `tls` only) | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
-| HTTP tests | `tower` (`util`), `http-body-util` |
+| Purpose                      | Crate                                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| Hashing                      | `blake3` with feature `pure` (the default build compiles C and asm)                   |
+| Chunking                     | `fastcdc` v5, `v2020` module                                                          |
+| Compression                  | `ruzstd`, level `Fastest` (standard zstd frames)                                      |
+| Async                        | `tokio`, `async-trait`                                                                |
+| Buffers                      | `bytes`                                                                               |
+| Hex encoding                 | `hex`                                                                                 |
+| Serialization                | `serde`, `postcard`                                                                   |
+| Errors                       | `thiserror`                                                                           |
+| Signatures                   | `ed25519-dalek` v2                                                                    |
+| Logging                      | `tracing`                                                                             |
+| Local index                  | `fjall` v3                                                                            |
+| Tests                        | `tempfile`                                                                            |
+| Model checking               | `stateright`                                                                          |
+| HTTP server                  | `axum` 0.8                                                                            |
+| HTTP client                  | `hyper` 1, `hyper-util` (`client-legacy`)                                             |
+| Daemon errors                | `anyhow` (only in `windsockd`)                                                        |
+| Configuration                | `toml` 0.8                                                                            |
+| Log output                   | `tracing-subscriber` with `env-filter`                                                |
+| XML                          | `quick-xml` with `serialize`                                                          |
+| SigV4                        | `hmac`, `sha2`, `subtle`                                                              |
+| URL form encoding            | `form_urlencoded`                                                                     |
+| fd limit                     | `rustix` (`process`)                                                                  |
+| HTTP body type (`windsockd`) | `http-body` 1                                                                         |
+| TLS (feature `tls` only)     | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
+| HTTP tests                   | `tower` (`util`), `http-body-util`                                                    |
 
 Add a crate to this table when a milestone adds it.
 

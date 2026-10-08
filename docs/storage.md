@@ -22,15 +22,15 @@ Windsock does not use a conditional overwrite (`If-Match`). Thus a store does no
 
 ## Stores
 
-| Store | Result | Source |
-|---|---|---|
-| Local directory (`DirRemote`) | Keeps the contract | Windsock tests |
-| Windsock S3 server (`windsockd`) | Keeps the contract | Windsock tests |
-| SeaweedFS 4.48 | Keeps the contract | Windsock test on 2026-10-07 |
-| Garage 2.4.1 | Does not keep it: it ignores `If-None-Match: *` and overwrites | Windsock test on 2026-10-07 |
-| Amazon S3, Cloudflare R2 | Not tested by Windsock. Their documentation describes `If-None-Match` on PUT | Provider documentation |
-| Backblaze B2 | Not tested. Its S3 API does not document `If-None-Match` on PUT | Provider documentation |
-| MinIO community edition | Not tested. The project is archived, and its downloads answer 410 Gone | Windsock check on 2026-10-07 |
+| Store                            | Result                                                                       | Source                       |
+| -------------------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
+| Local directory (`DirRemote`)    | Keeps the contract                                                           | Windsock tests               |
+| Windsock S3 server (`windsockd`) | Keeps the contract                                                           | Windsock tests               |
+| SeaweedFS 4.48                   | Keeps the contract                                                           | Windsock test on 2026-10-07  |
+| Garage 2.4.1                     | Does not keep it: it ignores `If-None-Match: *` and overwrites               | Windsock test on 2026-10-07  |
+| Amazon S3, Cloudflare R2         | Not tested by Windsock. Their documentation describes `If-None-Match` on PUT | Provider documentation       |
+| Backblaze B2                     | Not tested. Its S3 API does not document `If-None-Match` on PUT              | Provider documentation       |
+| MinIO community edition          | Not tested. The project is archived, and its downloads answer 410 Gone       | Windsock check on 2026-10-07 |
 
 Windsock speaks the S3 dialect only.
 

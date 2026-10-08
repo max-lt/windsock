@@ -287,6 +287,20 @@ async fn test_slow_upload_that_makes_progress_is_not_cut() {
 }
 
 #[test]
+fn test_diagnose_reports_that_a_directory_remote_keeps_the_storage_contract() {
+    let (_dir, config, _) = init();
+
+    let output = Command::new(BIN)
+        .arg("diagnose")
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ok storage contract"));
+}
+
+#[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();
 

@@ -126,7 +126,10 @@ async fn test_probe_accepts_a_store_that_refuses_a_second_create() {
     let server = server().await;
     let remote = S3Remote::new(config(&server.endpoint, "probe-ok/")).unwrap();
 
-    remote::check_create_only(&remote).await.unwrap();
+    assert_eq!(
+        remote::probe(&remote).await.unwrap(),
+        remote::Verdict::Conformant
+    );
 }
 
 /// A store that answers 200 to every PUT, so a second create overwrites the first.
@@ -135,12 +138,11 @@ async fn test_probe_refuses_a_store_that_overwrites_on_create() {
     let (endpoint, _) = scripted(|_, _| respond(StatusCode::OK, "")).await;
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    let result = remote::check_create_only(&remote).await;
+    let verdict = remote::probe(&remote).await.unwrap();
 
-    assert!(matches!(
-        result,
-        Err(remote::ProbeError::NotCreateOnly { .. })
-    ));
+    assert!(
+        matches!(verdict, remote::Verdict::Violation(reason) if reason.contains("If-None-Match"))
+    );
 }
 
 /// An engine whose remote is an S3 bucket served by another engine.

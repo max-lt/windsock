@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
 use engine::Engine;
-use remote::{DirRemote, Sweep};
+use remote::{DirRemote, Startup, Sweep, Verdict};
 use s3remote::{Retry, S3Config, S3Remote};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
@@ -49,8 +49,11 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["init", dir] => init(Path::new(dir)),
-        ["run", path] => run(&Config::load(Path::new(path))?).await,
-        _ => bail!("usage: windsockd init <dir> | windsockd run <config>"),
+        ["run", path] => run(&Config::load(Path::new(path))?, Mode::Serve).await,
+        ["diagnose", path] => run(&Config::load(Path::new(path))?, Mode::Diagnose).await,
+        _ => bail!(
+            "usage: windsockd init <dir> | windsockd run <config> | windsockd diagnose <config>"
+        ),
     }
 }
 
@@ -98,22 +101,20 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
 /// Below this, a slow flush can take longer than half the horizon and never commit.
 const SHORT_HORIZON_SECS: u64 = 3600;
 
-async fn run(config: &Config) -> Result<()> {
-    if config.gc.horizon_secs < SHORT_HORIZON_SECS {
-        warn!(
-            horizon_secs = config.gc.horizon_secs,
-            "gc.horizon_secs is under one hour: a flush that plans and uploads for longer than \
-             half of it fails with StalePlan and never commits"
-        );
-    }
-    std::fs::create_dir_all(&config.data_dir)?;
-    let key = node_key(&config.data_dir)?;
+/// What `windsockd` does with the remote of a configuration.
+#[derive(Clone, Copy)]
+enum Mode {
+    Serve,
+    /// Check the storage contract once, then exit.
+    Diagnose,
+}
 
+async fn run(config: &Config, mode: Mode) -> Result<()> {
     match &config.remote {
         RemoteConfig::Dir { path } => {
             info!(remote = %path.display(), "remote is a local directory");
             let store = format!("directory {}", path.display());
-            serve(config, Arc::new(DirRemote::open(path)?), &store, key).await
+            act(config, Arc::new(DirRemote::open(path)?), &store, mode).await
         }
         RemoteConfig::S3 {
             endpoint,
@@ -143,8 +144,38 @@ async fn run(config: &Config) -> Result<()> {
                 ca_pem,
             })?;
             let store = format!("S3 endpoint {endpoint}, bucket {bucket}");
-            serve(config, Arc::new(remote), &store, key).await
+            act(config, Arc::new(remote), &store, mode).await
         }
+    }
+}
+
+async fn act<R: Sweep + 'static>(
+    config: &Config,
+    remote: Arc<R>,
+    store: &str,
+    mode: Mode,
+) -> Result<()> {
+    match mode {
+        Mode::Serve => serve(config, remote, store).await,
+        Mode::Diagnose => diagnose(&*remote, store).await,
+    }
+}
+
+async fn diagnose(remote: &impl Sweep, store: &str) -> Result<()> {
+    match remote::probe(remote).await {
+        Ok(Verdict::Conformant) => {
+            info!(
+                store,
+                "ok storage contract (create, reject-create, read-after-write, \
+                 list-after-write, ranged read)"
+            );
+            Ok(())
+        }
+        Ok(Verdict::Violation(reason)) => {
+            bail!("the {store} does not keep the storage contract: {reason}")
+        }
+        Err(error) => Err(anyhow::Error::new(error))
+            .with_context(|| format!("could not check the storage contract of the {store}")),
     }
 }
 
@@ -173,16 +204,30 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve<R: Sweep + 'static>(
-    config: &Config,
-    remote: Arc<R>,
-    store: &str,
-    key: SigningKey,
-) -> Result<()> {
-    remote::check_create_only(&*remote)
-        .await
-        .with_context(|| format!("the {store} cannot hold a Windsock journal"))?;
-    info!(store, "the remote refuses a second create of one key");
+async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str) -> Result<()> {
+    if config.gc.horizon_secs < SHORT_HORIZON_SECS {
+        warn!(
+            horizon_secs = config.gc.horizon_secs,
+            "gc.horizon_secs is under one hour: a flush that plans and uploads for longer than \
+             half of it fails with StalePlan and never commits"
+        );
+    }
+    std::fs::create_dir_all(&config.data_dir)?;
+    let key = node_key(&config.data_dir)?;
+
+    match remote::check_before_serving(&*remote).await {
+        Startup::Conformant => info!(store, "the remote keeps the storage contract"),
+        Startup::Unverified(error) => warn!(
+            store,
+            %error,
+            attempts = remote::STARTUP_ATTEMPTS,
+            "could not check the storage contract: starting anyway"
+        ),
+        Startup::Violation(reason) => bail!(
+            "the {store} does not keep the storage contract, so Windsock cannot run on it \
+             safely: {reason}"
+        ),
+    }
 
     let engine = Engine::open(config.data_dir.join("engine"), remote, key, config.engine()).await?;
     let engine = Arc::new(engine);

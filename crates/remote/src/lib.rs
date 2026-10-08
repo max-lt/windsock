@@ -1,7 +1,7 @@
 //! Remote object stores. The remote holds the only durable copy of the data.
 //!
 //! [`Remote`] has no delete operation. Only the GC deletes, and only through [`Sweep`].
-//! The startup probe also deletes its own probe key.
+//! The storage probe also deletes its own probe objects.
 
 #[cfg(any(test, feature = "contract"))]
 pub mod contract;
@@ -15,7 +15,7 @@ use bytes::Bytes;
 
 pub use dir::DirRemote;
 pub use memory::MemoryRemote;
-pub use probe::{PROBE_PREFIX, ProbeError, check_create_only};
+pub use probe::{PROBE_PREFIX, STARTUP_ATTEMPTS, Startup, Verdict, check_before_serving, probe};
 
 /// A remote operation failed.
 #[derive(Debug, thiserror::Error)]

@@ -7,7 +7,7 @@ the contract in `docs/storage.md`) holds the only durable copy of the data.
 
 ```bash
 cargo build                                  # build everything
-cargo test                                   # all tests (about 280; windsockd cluster tests ~85 s)
+cargo test                                   # all tests (about 330; windsockd cluster tests ~60 s)
 cargo test -p model                          # one crate
 cargo clippy --all-targets -- -D warnings    # lint, zero warnings, tests included
 cargo fmt --check                            # format check

@@ -65,3 +65,15 @@ strip = true
 opt-level = 3
 codegen-units = 1
 lto = true
+
+# Hashing, compression and encryption run unoptimized in a dev build, 50 times slower: a test that
+# writes tens of MB then passes its time limits on a fast machine only. The generic code of
+# ruzstd and chacha20poly1305 compiles in chunking and keys, so these two crates need it too.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.chunking]
+opt-level = 3
+
+[profile.dev.package.keys]
+opt-level = 3

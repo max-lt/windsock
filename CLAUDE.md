@@ -48,9 +48,10 @@ The daemon crate is `windsockd`.
   `buckets.rs`, `write.rs` (puts fsynced in the buffer), `read.rs` (buffer, then index, cache and
   remote), `sync.rs` (other chains, manifests, chunk locations, sync on miss), `flush.rs` (plan,
   upload, intent, commit, group commit). Also `buffer.rs` (NVMe write-back log: segments, replay,
-  intent file, group fsync), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix
-  policy: chunking, compression, create-only, cache), `gc.rs` (condemn, delete after H, version
-  prune) and `snapshot.rs` (snapshots, bootstrap, journal prune).
+  intent file, group fsync), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs`
+  (per-prefix policy: chunking, compression, create-only, cache), `key_check.rs` (`key-id`: one
+  repository key per remote), `gc.rs` (condemn, delete after H, version prune) and `snapshot.rs`
+  (snapshots, bootstrap, journal prune).
 - `s3api`: S3 over HTTP (axum) on the engine. `auth.rs`: SigV4 in the header (payload hash checked,
   aws-chunked decoded, 15 min clock skew), keys from configuration. `handlers/`: `bucket.rs`,
   `object.rs`, `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects
@@ -68,9 +69,13 @@ The daemon crate is `windsockd`.
 ## Invariants
 
 - The remote is the source of truth. Local state is a cache. A proxy can rebuild it from the remote.
-- Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once. One
+- Every remote object is immutable. `nodes/<node_id>` is an empty marker, written once. `key-id`
+  holds the ID of the repository key, written once with a create-only write. One
   exception: the journal prune replaces a log entry once with its redacted form (same hash, same
   signature), so the key stays taken and the chain stays valid.
+- The remote holds no data, bucket, object key or metadata in clear (`docs/encryption.md`). A
+  proxy opens only with the repository key whose ID is in `key-id`. A seal nonce never repeats
+  under one key.
 - Only the GC deletes remote objects, plus the storage probe, which deletes its own objects under
   `probe/`. The write path never deletes.
 - The store must keep the storage contract in `docs/storage.md`: conditional create,

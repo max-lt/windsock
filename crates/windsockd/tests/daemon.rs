@@ -301,6 +301,42 @@ fn test_diagnose_reports_that_a_directory_remote_keeps_the_storage_contract() {
 }
 
 #[test]
+fn test_proxy_with_another_repository_key_does_not_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let first = dir.path().join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    let daemon = start(
+        &common::cluster_config(&first, &remote, 1000, "enabled = false"),
+        "info",
+    );
+    assert!(daemon.stop());
+
+    let second = dir.path().join("second");
+    std::fs::create_dir_all(&second).unwrap();
+    let config = common::cluster_config(&second, &remote, 1000, "enabled = false");
+    std::fs::write(second.join("repo.key"), hex::encode([43u8; 32])).unwrap();
+    let mut child = Command::new(BIN)
+        .arg("run")
+        .arg(&config)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the daemon serves with another repository key");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("another repository key"));
+}
+
+#[test]
 fn test_init_writes_a_repository_key_for_the_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 

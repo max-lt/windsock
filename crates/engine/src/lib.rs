@@ -10,6 +10,7 @@ mod buffer;
 mod config;
 mod flush;
 mod gc;
+mod key_check;
 mod manifest;
 mod plan;
 mod read;
@@ -30,7 +31,7 @@ use ed25519_dalek::SigningKey;
 use index::{ChunkLocation, Index, IndexError};
 use journal::{Action, Commit, Entry, Journal, JournalError};
 use keys::RepoKey;
-use model::{ChunkId, NodeId, ObjectId, PackId};
+use model::{ChunkId, KeyId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
 use tokio::sync::Notify;
@@ -43,6 +44,7 @@ use plan::{Fetch, Nonces, Planner};
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::ObjectState;
+pub use key_check::KEY_ID_KEY;
 pub use manifest::{ChunkRef, INLINE_MAX, MANIFESTS_PREFIX, Manifest, manifest_id, manifest_key};
 pub use snapshot::SNAPSHOTS_PREFIX;
 
@@ -87,6 +89,10 @@ pub enum EngineError {
     StalePlan,
     #[error("broken chains: {0:?}")]
     BrokenChains(Vec<NodeId>),
+    #[error(
+        "the remote has another repository key than {0}: use the key file of its other proxies"
+    )]
+    WrongKey(KeyId),
     #[error("corrupt data: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -198,6 +204,7 @@ impl<R: Remote + 'static> Engine<R> {
         config: Config,
     ) -> Result<Self> {
         let dir = dir.as_ref();
+        key_check::check_key(&*remote, &key).await?;
         let key = Arc::new(key);
         let index = Index::open(dir.join(INDEX_DIR))?;
         let journal = Journal::new(remote.clone(), signing_key, key.clone(), index.frontiers()?);

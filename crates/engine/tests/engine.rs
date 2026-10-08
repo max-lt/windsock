@@ -134,6 +134,30 @@ async fn count<R: Remote>(remote: &R, prefix: &str) -> usize {
     remote.list(prefix).await.unwrap().len()
 }
 
+#[tokio::test]
+async fn test_open_refuses_a_remote_of_another_repository_key() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    let stored = remote.get(engine::KEY_ID_KEY).await.unwrap().unwrap();
+    assert_eq!(stored.as_ref(), repo_key().id().as_bytes());
+
+    let dir = tempfile::tempdir().unwrap();
+    let other = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2u8; 32]),
+        RepoKey::from_bytes([43u8; 32]),
+        Config::default(),
+    )
+    .await;
+
+    assert!(
+        matches!(other, Err(EngineError::WrongKey(id)) if id == RepoKey::from_bytes([43u8; 32]).id())
+    );
+    // The same key opens again: the check reads the key ID that the first open wrote.
+    restart(&remote, 1, a, Config::default()).await;
+}
+
 /// The threat model: a reader of the remote sees no data, no bucket, no key, no metadata.
 #[tokio::test]
 async fn test_remote_holds_no_clear_data_names_or_metadata() {

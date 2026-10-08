@@ -38,7 +38,7 @@ struct Dead<T> {
 }
 
 impl<R: Sweep + 'static> Engine<R> {
-    /// Runs the GC once. Run it on one proxy only: two runners are safe, but cost twice.
+    /// Runs the GC once. Run it on one proxy per remote: two runners are not model-checked.
     pub async fn gc(&self) -> Result<GcReport> {
         let started = buffer::unix_nanos();
         // A broken chain can hold puts of packs that look dead, and it pins the stable HLC.

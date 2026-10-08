@@ -89,8 +89,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   not enforce this rule. No lock stops a second GC runner. The GC protocol is model-checked with
   one GC runner and two writers only, so two GC runners on one remote are not verified.
 
-- The remote store must keep the storage contract in `docs/storage.md`. Backblaze B2 and
-  Garage do not. Run `windsockd diagnose <config>` before you use a new store.
+- The remote store must keep the storage contract in `docs/storage.md`. Garage does not.
+  Backblaze B2 does not document a conditional create. Run `windsockd diagnose <config>` before
+  you use a new store.
 - An `https` S3 remote needs the feature `tls`: `cargo build --release -p windsockd --features tls`.
   This feature compiles C (the `ring` crypto provider). The default build has no TLS and refuses an
   `https` endpoint. `ca_file` adds a PEM file of CA certificates to the public roots.
@@ -102,4 +103,4 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 
 ## Development
 
-See `CLAUDE.md` for the build, test and code rules, and `../windsock-todo.md` for the design.
+See `CLAUDE.md` for the build, test and code rules.

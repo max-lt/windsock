@@ -1,10 +1,7 @@
 # Windsock
 
-S3-compatible proxy and cache. The remote object store (Backblaze B2 or any
-S3-compatible store) holds the only durable copy of the data.
-
-Design, decisions and milestones: `../windsock-todo.md`. State: milestones 0 to 14 are done. The
-section "Hand-over" of that file lists the open decisions and the known limits: read it first.
+S3-compatible proxy and cache. The remote (a local directory or an S3-compatible store that keeps
+the contract in `docs/storage.md`) holds the only durable copy of the data.
 
 ## Build and test
 
@@ -60,7 +57,7 @@ The daemon crate is `windsockd`.
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
   `README.md` has the steps to run it locally.
 - `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with
-  `scripts/bench.sh`; the numbers are in `../windsock-todo.md`, milestone 14.
+  `scripts/bench.sh`, which writes the report to `bench.md`.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.

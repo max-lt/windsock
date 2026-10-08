@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 model.workspace = true
+keys.workspace = true
 pack.workspace = true
 journal.workspace = true
 blake3.workspace = true

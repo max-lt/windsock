@@ -37,7 +37,8 @@ The daemon crate is `windsockd`.
   `If-None-Match: *`, retries with backoff and time limits. HTTPS only with the feature `tls`
   (rustls + ring, public roots plus an optional PEM CA file).
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
-  chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
+  chains (causal DAG, no merge entries), redactable actions sealed in the remote form, chain
+  validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
   condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
@@ -97,7 +98,8 @@ The daemon crate is `windsockd`.
   The version prune drops versions below (stable HLC - R), and refuses to run when the stable HLC
   is more than R ahead of the GC clock.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
-- An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
+- An entry signs the keyed hash of its actions, not the sealed actions: a purge can drop them and
+  keep the chain. A reader opens the actions and checks them against that hash.
 - An entry lists in `seen` the last entry of every other chain its writer had applied (not read).
   The index applies an entry only after everything in its `seen`.
 - Index state is a function of the set of applied entries, never of their order. A conflict is

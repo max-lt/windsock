@@ -1,15 +1,16 @@
 //! Snapshot format: the index state at its applied frontiers, for bootstrap.
 //!
-//! Layout: `VERSION | postcard(Snapshot)`. A reader checks the bytes against the
+//! Layout: `VERSION | sealed postcard(Snapshot)`. A reader checks the bytes against the
 //! blake3 hash in the snapshot key.
 
 use journal::Frontiers;
+use keys::{Nonce, RepoKey};
 use model::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::{BucketState, IndexError, ObjectState};
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -25,14 +26,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn encode(&self) -> Vec<u8> {
+    /// Seals the snapshot with `nonce`, which must never repeat.
+    pub fn encode(&self, key: &RepoKey, nonce: &Nonce) -> Vec<u8> {
+        let plain = postcard::to_allocvec(self).expect("a snapshot always serializes");
         let mut bytes = vec![VERSION];
-        bytes.extend(postcard::to_allocvec(self).expect("a snapshot always serializes"));
+        bytes.extend(key.seal(nonce, &plain));
         bytes
     }
 
-    /// Checks `bytes` against their blake3 `hash` and decodes them.
-    pub fn decode(hash: &[u8; 32], bytes: &[u8]) -> Result<Self, IndexError> {
+    /// Checks `bytes` against their blake3 `hash`, opens and decodes them.
+    pub fn decode(key: &RepoKey, hash: &[u8; 32], bytes: &[u8]) -> Result<Self, IndexError> {
         let bad = || IndexError::Corrupt(postcard::Error::DeserializeBadEncoding);
 
         if blake3::hash(bytes).as_bytes() != hash {
@@ -42,7 +45,8 @@ impl Snapshot {
         let Some((&VERSION, body)) = bytes.split_first() else {
             return Err(bad());
         };
+        let plain = key.open(body).map_err(|_| bad())?;
 
-        Ok(postcard::from_bytes(body)?)
+        Ok(postcard::from_bytes(&plain)?)
     }
 }

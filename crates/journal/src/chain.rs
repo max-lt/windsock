@@ -64,10 +64,6 @@ impl Frontier {
             return Err(ChainError::BadSignature { seq: entry.seq });
         }
 
-        if !entry.actions_are_intact() {
-            return Err(ChainError::ActionsMismatch { seq: entry.seq });
-        }
-
         Ok(Frontier {
             next_seq: entry.seq + 1,
             last_hash: entry.hash(),
@@ -95,11 +91,16 @@ pub enum ChainError {
     BadSignature { seq: u64 },
     #[error("entry {seq} carries actions that were not signed")]
     ActionsMismatch { seq: u64 },
+    #[error(
+        "entry {seq} carries actions that do not open: another repository key, or corrupt data"
+    )]
+    SealedActions { seq: u64 },
 }
 
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
+    use keys::RepoKey;
     use model::ObjectId;
 
     use super::*;
@@ -107,6 +108,10 @@ mod tests {
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn repo() -> RepoKey {
+        RepoKey::from_bytes([42u8; 32])
     }
 
     fn node(seed: u8) -> NodeId {
@@ -123,7 +128,15 @@ mod tests {
     }
 
     fn sign(seed: u8, seq: u64, prev: EntryHash, hlc: u64) -> Entry {
-        Entry::sign(&key(seed), seq, prev, hlc, Seen::new(), vec![put()])
+        Entry::sign(
+            &key(seed),
+            &repo(),
+            seq,
+            prev,
+            hlc,
+            Seen::new(),
+            vec![put()],
+        )
     }
 
     #[test]
@@ -195,7 +208,7 @@ mod tests {
                 hash: [0u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(1), 0, [0u8; 32], 10, seen, vec![put()]);
+        let entry = Entry::sign(&key(1), &repo(), 0, [0u8; 32], 10, seen, vec![put()]);
 
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),
@@ -211,20 +224,6 @@ mod tests {
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),
             Err(ChainError::BadSignature { seq: 0 })
-        );
-    }
-
-    #[test]
-    fn test_swapped_actions_are_rejected() {
-        let mut entry = sign(1, 0, [0u8; 32], 10);
-        entry.actions = Some(vec![Action::Delete {
-            bucket: "b".into(),
-            key: "k".into(),
-        }]);
-
-        assert_eq!(
-            Frontier::GENESIS.extend(node(1), &entry),
-            Err(ChainError::ActionsMismatch { seq: 0 })
         );
     }
 

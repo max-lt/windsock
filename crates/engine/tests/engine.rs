@@ -134,6 +134,50 @@ async fn count<R: Remote>(remote: &R, prefix: &str) -> usize {
     remote.list(prefix).await.unwrap().len()
 }
 
+/// The threat model: a reader of the remote sees no data, no bucket, no key, no metadata.
+#[tokio::test]
+async fn test_remote_holds_no_clear_data_names_or_metadata() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket("tenant-zephyr", None).await.unwrap();
+    let metadata = BTreeMap::from([("x-amz-meta-owner".to_string(), "marguerite".to_string())]);
+    for (key, len) in [("small-ledger", 100), ("large-ledger", 600_000)] {
+        let data = b"plaintext-windsock ".repeat(len / 19);
+        a.engine
+            .put(
+                "tenant-zephyr",
+                key,
+                Bytes::from(data),
+                metadata.clone(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    }
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+
+    let keys = remote.list("").await.unwrap();
+    for prefix in ["packs/", "log/", "snapshots/"] {
+        assert!(keys.iter().any(|k| k.starts_with(prefix)), "no {prefix}");
+    }
+    for key in keys {
+        let bytes = remote.get(&key).await.unwrap().unwrap();
+        for clear in [
+            &b"plaintext-windsock"[..],
+            b"tenant-zephyr",
+            b"ledger",
+            b"marguerite",
+        ] {
+            assert!(
+                !bytes.windows(clear.len()).any(|w| w == clear),
+                "{key} holds {}",
+                String::from_utf8_lossy(clear)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_buffered_writes_are_readable_before_the_flush() {
     let remote = Arc::new(MemoryRemote::default());

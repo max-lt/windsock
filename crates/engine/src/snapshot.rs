@@ -31,7 +31,7 @@ impl<R: Remote + 'static> Engine<R> {
     pub async fn snapshot(&self) -> Result<String> {
         self.sync().await?;
 
-        let bytes = self.index().snapshot()?.encode();
+        let bytes = self.index().snapshot()?.encode(&self.key, &keys::random());
         let hash = blake3::hash(&bytes);
         let key = format!("{SNAPSHOTS_PREFIX}{:020}-{hash}", buffer::unix_nanos());
         self.remote.put(&key, Bytes::from(bytes)).await?;
@@ -60,7 +60,7 @@ impl<R: Remote + 'static> Engine<R> {
                 continue;
             };
 
-            match Snapshot::decode(&hash, &bytes) {
+            match Snapshot::decode(&self.key, &hash, &bytes) {
                 Ok(snapshot) => return Ok(Some(snapshot)),
                 Err(e) => warn!(key, %e, "skipped a bad snapshot"),
             }
@@ -107,15 +107,14 @@ impl<R: Remote + 'static> Engine<R> {
                 let Some(bytes) = self.remote.get(&key).await? else {
                     continue;
                 };
-                let entry: Entry = postcard::from_bytes(&bytes)
+                let entry = Entry::decode(&self.key, &bytes)
                     .map_err(|e| EngineError::Corrupt(format!("{key}: {e}")))?;
 
                 if entry.actions.is_none() {
                     continue;
                 }
 
-                let bytes =
-                    postcard::to_allocvec(&entry.redacted()).expect("an entry always serializes");
+                let bytes = entry.redacted().encode(&self.key, &keys::random());
                 self.remote.put(&key, Bytes::from(bytes)).await?;
                 redacted += 1;
             }

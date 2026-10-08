@@ -376,10 +376,13 @@ async fn test_broken_chain_fails_alone_and_recovers() {
     let broken = writers[2].engine.node();
     let key = journal::entry_key(broken, 0);
     let good = remote.get(&key).await.unwrap().unwrap();
-    let mut tampered: journal::Entry = postcard::from_bytes(&good).unwrap();
+    let mut tampered = journal::Entry::decode(&repo_key(), &good).unwrap();
     tampered.actions = Some(vec![]);
     remote
-        .put(&key, Bytes::from(postcard::to_allocvec(&tampered).unwrap()))
+        .put(
+            &key,
+            Bytes::from(tampered.encode(&repo_key(), &keys::random())),
+        )
         .await
         .unwrap();
 
@@ -419,6 +422,7 @@ async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
     let far_future = u64::MAX / 2;
     let entry = journal::Entry::sign(
         &ahead,
+        &repo_key(),
         0,
         [0u8; 32],
         far_future,
@@ -428,7 +432,7 @@ async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
     remote
         .put(
             &entry.remote_key(),
-            Bytes::from(postcard::to_allocvec(&entry).unwrap()),
+            Bytes::from(entry.encode(&repo_key(), &keys::random())),
         )
         .await
         .unwrap();

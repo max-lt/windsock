@@ -200,7 +200,7 @@ impl<R: Remote + 'static> Engine<R> {
         let dir = dir.as_ref();
         let key = Arc::new(key);
         let index = Index::open(dir.join(INDEX_DIR))?;
-        let journal = Journal::new(remote.clone(), signing_key, index.frontiers()?);
+        let journal = Journal::new(remote.clone(), signing_key, key.clone(), index.frontiers()?);
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
         let cache = match config.cache_bytes {

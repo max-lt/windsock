@@ -204,6 +204,7 @@ impl BucketState {
 mod tests {
     use ed25519_dalek::SigningKey;
     use journal::{Action, Link};
+    use keys::RepoKey;
 
     use super::*;
 
@@ -226,7 +227,15 @@ mod tests {
             manifest_id: manifest(seed),
             inline_manifest: None,
         };
-        Entry::sign(&key(seed), seq, [0u8; 32], hlc, seen, vec![action])
+        Entry::sign(
+            &key(seed),
+            &RepoKey::from_bytes([42u8; 32]),
+            seq,
+            [0u8; 32],
+            hlc,
+            seen,
+            vec![action],
+        )
     }
 
     fn link(seed: u8, seq: u64) -> (NodeId, Link) {

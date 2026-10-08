@@ -638,6 +638,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use journal::Journal;
+    use keys::RepoKey;
     use remote::MemoryRemote;
 
     use super::*;
@@ -646,8 +647,17 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    fn repo() -> RepoKey {
+        RepoKey::from_bytes([42u8; 32])
+    }
+
     fn journal(remote: &Arc<MemoryRemote>, seed: u8) -> Journal<MemoryRemote> {
-        Journal::new(remote.clone(), key(seed), Frontiers::new())
+        Journal::new(
+            remote.clone(),
+            key(seed),
+            Arc::new(repo()),
+            Frontiers::new(),
+        )
     }
 
     fn manifest(n: u8) -> ObjectId {
@@ -802,7 +812,12 @@ mod tests {
 
         a.append(put("k", 2), Seen::new()).await.unwrap();
         let mut index = Index::open(dir.path()).unwrap();
-        let mut reader = Journal::new(remote.clone(), key(9), index.frontiers().unwrap());
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            Arc::new(repo()),
+            index.frontiers().unwrap(),
+        );
         let entries = reader.sync_all().await.unwrap();
 
         assert_eq!(entries.len(), 1, "only the new entry is read");
@@ -842,7 +857,7 @@ mod tests {
                 hash: [9u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(2), 0, [0u8; 32], 99, forged_link, put("k", 2));
+        let entry = Entry::sign(&key(2), &repo(), 0, [0u8; 32], 99, forged_link, put("k", 2));
 
         assert!(matches!(
             index.apply(vec![entry]),
@@ -879,6 +894,7 @@ mod tests {
         let index = Index::open_temporary().unwrap();
         let entry = Entry::sign(
             &key(1),
+            &repo(),
             0,
             [0u8; 32],
             1,
@@ -930,6 +946,7 @@ mod tests {
         let mut index = Index::open_temporary().unwrap();
         let entry = Entry::sign(
             &key(1),
+            &repo(),
             0,
             [0u8; 32],
             1,
@@ -990,7 +1007,15 @@ mod tests {
             packs: vec![PackId::from_bytes([pack; 32])],
             manifests: vec![manifest(pack)],
         };
-        Entry::sign(&key(seed), 0, [0u8; 32], hlc, Seen::new(), vec![action])
+        Entry::sign(
+            &key(seed),
+            &repo(),
+            0,
+            [0u8; 32],
+            hlc,
+            Seen::new(),
+            vec![action],
+        )
     }
 
     #[test]
@@ -1048,8 +1073,8 @@ mod tests {
                 hash: [0u8; 32],
             },
         )]);
-        let pending = Entry::sign(&key(1), 0, [0u8; 32], 7, waits, put("k", 3));
-        let applied = Entry::sign(&key(2), 0, [0u8; 32], 20, Seen::new(), put("j", 4));
+        let pending = Entry::sign(&key(1), &repo(), 0, [0u8; 32], 7, waits, put("k", 3));
+        let applied = Entry::sign(&key(2), &repo(), 0, [0u8; 32], 20, Seen::new(), put("j", 4));
 
         index.apply(vec![pending, applied]).unwrap();
 
@@ -1068,8 +1093,8 @@ mod tests {
     #[test]
     fn test_stable_hlc_is_the_slowest_chain() {
         let mut index = Index::open_temporary().unwrap();
-        let slow = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), put("a", 1));
-        let fast = Entry::sign(&key(2), 0, [0u8; 32], 30, Seen::new(), put("b", 2));
+        let slow = Entry::sign(&key(1), &repo(), 0, [0u8; 32], 10, Seen::new(), put("a", 1));
+        let fast = Entry::sign(&key(2), &repo(), 0, [0u8; 32], 30, Seen::new(), put("b", 2));
 
         assert_eq!(index.stable_hlc().unwrap(), 0);
         index.apply(vec![slow, fast]).unwrap();
@@ -1088,8 +1113,16 @@ mod tests {
                 key: "gone".into(),
             },
         ];
-        let first = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), actions);
-        let rewrite = Entry::sign(&key(1), 1, first.hash(), 20, Seen::new(), put("kept", 5));
+        let first = Entry::sign(&key(1), &repo(), 0, [0u8; 32], 10, Seen::new(), actions);
+        let rewrite = Entry::sign(
+            &key(1),
+            &repo(),
+            1,
+            first.hash(),
+            20,
+            Seen::new(),
+            put("kept", 5),
+        );
         index.apply(vec![first, rewrite]).unwrap();
 
         assert_eq!(index.prune_versions(15).unwrap(), 2);
@@ -1161,8 +1194,8 @@ mod tests {
         };
 
         assert_eq!(
-            blake3::hash(&snapshot.encode()).to_string(),
-            "9c6fbf9848442f5b3fbf82aec4b65a4452a57651382f53a7ca8836475899a2b1"
+            blake3::hash(&snapshot.encode(&repo(), &[1u8; 24])).to_string(),
+            "d288493f4989cc26a1e153fc4cf3a9635b6af9b0e563fbc26c404be0fafc9b72"
         );
     }
 
@@ -1171,11 +1204,11 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let (source, _) = busy_index(&remote).await;
         let snapshot = source.snapshot().unwrap();
-        let bytes = snapshot.encode();
-        let decoded = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes).unwrap();
+        let bytes = snapshot.encode(&repo(), &[1u8; 24]);
+        let decoded = Snapshot::decode(&repo(), blake3::hash(&bytes).as_bytes(), &bytes).unwrap();
 
         let mut target = Index::open_temporary().unwrap();
-        let stray = Entry::sign(&key(5), 3, [0u8; 32], 1, Seen::new(), put("z", 9));
+        let stray = Entry::sign(&key(5), &repo(), 3, [0u8; 32], 1, Seen::new(), put("z", 9));
         target.apply(vec![stray]).unwrap();
         target.load(&decoded).unwrap();
 
@@ -1197,9 +1230,21 @@ mod tests {
             .unwrap()
             .snapshot()
             .unwrap()
-            .encode();
+            .encode(&repo(), &[1u8; 24]);
 
-        assert!(Snapshot::decode(&[0u8; 32], &bytes).is_err());
+        assert!(Snapshot::decode(&repo(), &[0u8; 32], &bytes).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_decode_rejects_another_key() {
+        let bytes = Index::open_temporary()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .encode(&repo(), &[1u8; 24]);
+        let other = RepoKey::from_bytes([43u8; 32]);
+
+        assert!(Snapshot::decode(&other, blake3::hash(&bytes).as_bytes(), &bytes).is_err());
     }
 
     /// After a load, the index has no hash for the entries under the frontier.
@@ -1219,8 +1264,8 @@ mod tests {
                 },
             )])
         };
-        let old_link = Entry::sign(&key(2), 0, [0u8; 32], 99, links(1), put("k", 3));
-        let last_link = Entry::sign(&key(3), 0, [0u8; 32], 99, links(4), put("j", 4));
+        let old_link = Entry::sign(&key(2), &repo(), 0, [0u8; 32], 99, links(1), put("k", 3));
+        let last_link = Entry::sign(&key(3), &repo(), 0, [0u8; 32], 99, links(4), put("j", 4));
 
         assert_eq!(target.apply(vec![old_link, last_link]).unwrap(), 2);
         assert_eq!(target.resolve("b", "k").unwrap(), Some(manifest(3)));
@@ -1239,7 +1284,7 @@ mod tests {
                 hash: [9u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(2), 0, [0u8; 32], 99, forged, put("k", 3));
+        let entry = Entry::sign(&key(2), &repo(), 0, [0u8; 32], 99, forged, put("k", 3));
 
         assert!(matches!(
             target.apply(vec![entry]),

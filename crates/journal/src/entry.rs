@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use keys::{Nonce, RepoKey};
 use model::{NodeId, ObjectId, PackId};
 use serde::{Deserialize, Serialize};
 
@@ -55,8 +56,9 @@ pub type Seen = BTreeMap<NodeId, Link>;
 
 /// One entry of a node chain, signed by the node.
 ///
-/// The signature covers `blake3(actions)` and not the actions themselves, so a
-/// purge can drop them and keep the chain valid.
+/// The signature covers the keyed hash of the actions and not the actions
+/// themselves, so a purge can drop them and keep the chain valid. The remote
+/// form seals the actions: see [`Entry::encode`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub node: NodeId,
@@ -84,9 +86,34 @@ struct Content<'a> {
     actions_hash: &'a [u8; 32],
 }
 
-fn actions_hash(actions: &[Action]) -> [u8; 32] {
+/// Keyed, so a reader of the remote cannot test a guess of the actions against it.
+fn actions_hash(key: &RepoKey, actions: &[Action]) -> [u8; 32] {
     let bytes = postcard::to_allocvec(actions).expect("actions always serialize");
-    *blake3::hash(&bytes).as_bytes()
+    key.hash(&bytes)
+}
+
+/// The remote form of an entry: the same fields, with the actions sealed.
+#[derive(Serialize, Deserialize)]
+struct Stored {
+    node: NodeId,
+    seq: u64,
+    prev: EntryHash,
+    hlc: u64,
+    seen: Seen,
+    actions_hash: [u8; 32],
+    actions: Option<Vec<u8>>,
+    signature: ([u8; 32], [u8; 32]),
+}
+
+/// Remote bytes that do not give an entry of this repository.
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    #[error("not a valid entry")]
+    Malformed,
+    #[error("the actions do not open: another repository key, or corrupt data")]
+    Sealed,
+    #[error("the actions are not the signed ones")]
+    ActionsMismatch,
 }
 
 fn content_hash(
@@ -110,19 +137,20 @@ fn content_hash(
 }
 
 impl Entry {
-    /// Builds and signs an entry. The node is the public key of `key`.
+    /// Builds and signs an entry. The node is the public key of `signing_key`.
     pub fn sign(
-        key: &SigningKey,
+        signing_key: &SigningKey,
+        key: &RepoKey,
         seq: u64,
         prev: EntryHash,
         hlc: u64,
         seen: Seen,
         actions: Vec<Action>,
     ) -> Self {
-        let node = NodeId::from_bytes(key.verifying_key().to_bytes());
-        let actions_hash = actions_hash(&actions);
+        let node = NodeId::from_bytes(signing_key.verifying_key().to_bytes());
+        let actions_hash = actions_hash(key, &actions);
         let hash = content_hash(node, seq, &prev, hlc, &seen, &actions_hash);
-        let signature = key.sign(&hash).to_bytes();
+        let signature = signing_key.sign(&hash).to_bytes();
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
         r.copy_from_slice(&signature[..32]);
@@ -167,11 +195,52 @@ impl Entry {
             .is_ok()
     }
 
-    /// Checks that the actions, when present, are the ones that were signed.
-    pub fn actions_are_intact(&self) -> bool {
-        self.actions
-            .as_ref()
-            .is_none_or(|actions| actions_hash(actions) == self.actions_hash)
+    /// The remote form. The actions are sealed with `nonce`, which must never repeat.
+    pub fn encode(&self, key: &RepoKey, nonce: &Nonce) -> Vec<u8> {
+        let actions = self.actions.as_ref().map(|actions| {
+            let plain = postcard::to_allocvec(actions).expect("actions always serialize");
+            key.seal(nonce, &plain)
+        });
+        let stored = Stored {
+            node: self.node,
+            seq: self.seq,
+            prev: self.prev,
+            hlc: self.hlc,
+            seen: self.seen.clone(),
+            actions_hash: self.actions_hash,
+            actions,
+            signature: self.signature,
+        };
+        postcard::to_allocvec(&stored).expect("an entry always serializes")
+    }
+
+    /// Reads the remote form. The actions, when present, must open and be the signed ones.
+    /// The signature and the chain links are the job of [`crate::Frontier::extend`].
+    pub fn decode(key: &RepoKey, bytes: &[u8]) -> Result<Self, DecodeError> {
+        let stored: Stored = postcard::from_bytes(bytes).map_err(|_| DecodeError::Malformed)?;
+        let actions = match &stored.actions {
+            None => None,
+            Some(sealed) => {
+                let plain = key.open(sealed).map_err(|_| DecodeError::Sealed)?;
+                let actions: Vec<Action> =
+                    postcard::from_bytes(&plain).map_err(|_| DecodeError::Malformed)?;
+                if actions_hash(key, &actions) != stored.actions_hash {
+                    return Err(DecodeError::ActionsMismatch);
+                }
+                Some(actions)
+            }
+        };
+
+        Ok(Self {
+            node: stored.node,
+            seq: stored.seq,
+            prev: stored.prev,
+            hlc: stored.hlc,
+            seen: stored.seen,
+            actions_hash: stored.actions_hash,
+            actions,
+            signature: stored.signature,
+        })
     }
 
     /// The same entry without its actions. Its hash and signature do not change.
@@ -206,6 +275,10 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32])
     }
 
+    fn repo() -> RepoKey {
+        RepoKey::from_bytes([42u8; 32])
+    }
+
     fn put() -> Action {
         Action::Put {
             bucket: "b".into(),
@@ -227,16 +300,15 @@ mod tests {
 
     #[test]
     fn test_signed_entry_verifies() {
-        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
 
         assert!(entry.signature_is_valid());
-        assert!(entry.actions_are_intact());
         assert_eq!(entry.node.as_bytes(), &key().verifying_key().to_bytes());
     }
 
     #[test]
     fn test_changed_content_fails_verification() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let mut entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
         entry.hlc += 1;
 
         assert!(!entry.signature_is_valid());
@@ -244,38 +316,93 @@ mod tests {
 
     #[test]
     fn test_changed_seen_fails_verification() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let mut entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
         entry.seen.clear();
 
         assert!(!entry.signature_is_valid());
     }
 
     #[test]
-    fn test_changed_actions_are_not_intact() {
-        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+    fn test_decode_rejects_actions_that_were_not_signed() {
+        let mut entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
         entry.actions = Some(vec![Action::Delete {
             bucket: "b".into(),
             key: "k".into(),
         }]);
+        let bytes = entry.encode(&repo(), &[1u8; 24]);
 
-        assert!(entry.signature_is_valid());
-        assert!(!entry.actions_are_intact());
+        assert!(matches!(
+            Entry::decode(&repo(), &bytes),
+            Err(DecodeError::ActionsMismatch)
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_another_key() {
+        let entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let bytes = entry.encode(&repo(), &[1u8; 24]);
+
+        assert!(matches!(
+            Entry::decode(&RepoKey::from_bytes([43u8; 32]), &bytes),
+            Err(DecodeError::Sealed)
+        ));
+    }
+
+    #[test]
+    fn test_remote_form_roundtrip() {
+        let entry = Entry::sign(&key(), &repo(), 3, [9u8; 32], 42, seen(), vec![put()]);
+        let decoded = Entry::decode(&repo(), &entry.encode(&repo(), &[1u8; 24])).unwrap();
+
+        assert_eq!(decoded, entry);
+        assert!(decoded.signature_is_valid());
+    }
+
+    #[test]
+    fn test_remote_form_hides_the_actions() {
+        let action = Action::Delete {
+            bucket: "tenant-bucket".into(),
+            key: "secret-key".into(),
+        };
+        let entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![action]);
+        let bytes = entry.encode(&repo(), &[1u8; 24]);
+
+        assert!(!bytes.windows(13).any(|w| w == b"tenant-bucket"));
+        assert!(!bytes.windows(10).any(|w| w == b"secret-key"));
+    }
+
+    #[test]
+    fn test_actions_hash_depends_on_the_key() {
+        let entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let other = Entry::sign(
+            &key(),
+            &RepoKey::from_bytes([43u8; 32]),
+            0,
+            [0u8; 32],
+            1,
+            seen(),
+            vec![put()],
+        );
+
+        assert_ne!(entry.actions_hash, other.actions_hash);
     }
 
     #[test]
     fn test_redacted_entry_keeps_hash_and_signature() {
-        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()]);
+        let entry = Entry::sign(&key(), &repo(), 0, [0u8; 32], 1, seen(), vec![put()]);
         let redacted = entry.redacted();
 
         assert_eq!(redacted.actions, None);
         assert_eq!(redacted.hash(), entry.hash());
         assert!(redacted.signature_is_valid());
-        assert!(redacted.actions_are_intact());
+        assert_eq!(
+            Entry::decode(&repo(), &redacted.encode(&repo(), &[1u8; 24])).unwrap(),
+            redacted
+        );
     }
 
     #[test]
     fn test_entry_roundtrips_through_postcard() {
-        let entry = Entry::sign(&key(), 3, [9u8; 32], 42, seen(), vec![put()]);
+        let entry = Entry::sign(&key(), &repo(), 3, [9u8; 32], 42, seen(), vec![put()]);
         let bytes = postcard::to_allocvec(&entry).unwrap();
         let decoded: Entry = postcard::from_bytes(&bytes).unwrap();
 

@@ -75,3 +75,14 @@ The encryption does not hide:
 - The node IDs, the seq, the HLC and the `seen` links of each journal entry.
 - The access pattern: which objects a proxy reads, and when.
 - The condemn and the delete of a pack or a manifest by the GC.
+
+## Cost
+
+Measured on 2026-10-08 with `scripts/bench.sh` on a shared cloud VM (4 vCPU, Xeon 2.1 GHz,
+DirRemote), two runs before and two runs after the encryption:
+
+- Writes: no change. A put is acknowledged from the local buffer, before the seal.
+- Reads from the cache: no change. The cache holds raw chunks.
+- Cold reads: about 0.8 ms more for each GET (p50 3.2 ms before, 4.0 ms after).
+- One core seals 650 MB/s and opens 1.1 GB/s. Keyed blake3 runs at the speed of blake3.
+- Storage: 40 bytes for each stored chunk.

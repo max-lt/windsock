@@ -117,6 +117,9 @@ The daemon crate is `windsockd`.
 - If this repair fails, the buffer refuses all writes until a restart (`BufferBroken`).
 - A signed entry goes to the intent file before its create. A restart retries that entry before it signs a new one.
 - Proxies do not coordinate. The index merge is LWW: HLC first, then NodeId.
+- One GC runner per remote (`gc.enabled` on one proxy). This is a configuration rule, not a code
+  guarantee: no lock enforces it, and the model check has one GC runner. A lease on create-only
+  keys cannot fence a GC that pauses past its lease, so it would not make the rule safe.
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.
 - `windsockd` accepts at most `max_connections` connections (default: soft fd limit - 256), so a
   flush always has descriptors.

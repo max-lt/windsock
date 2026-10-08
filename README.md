@@ -76,7 +76,7 @@ the configuration file.
 | `engine.cache_bytes`        | 16 GiB                                     | Chunk cache size. `0` turns the cache off                                                                                                     |
 | `engine.flush_delay_ms`     | `1000`                                     | Longest time a write waits in the buffer before it goes to the remote                                                                         |
 | `engine.buffer_limit_bytes` | 8 GiB                                      | Writes fail with `503 SlowDown` above this                                                                                                    |
-| `gc.enabled`                | `false`                                    | Set to `true` on one proxy per remote                                                                                                         |
+| `gc.enabled`                | `false`                                    | Set to `true` on one proxy per remote. Windsock does not enforce this: see Limits                                                             |
 | `gc.interval_secs`          | `3600`                                     | How often the GC runs                                                                                                                         |
 | `gc.horizon_secs`           | `86400`                                    | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning |
 | `gc.retention_secs`         | `86400`                                    | Old versions stay readable for this time                                                                                                      |
@@ -84,6 +84,10 @@ the configuration file.
 The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 
 ## Limits
+
+- Run the GC on one proxy per remote: set `gc.enabled = true` on that proxy only. Windsock does
+  not enforce this rule. No lock stops a second GC runner. The GC protocol is model-checked with
+  one GC runner and two writers only, so two GC runners on one remote are not verified.
 
 - The remote store must keep the storage contract in `docs/storage.md`. Backblaze B2 and
   Garage do not. Run `windsockd diagnose <config>` before you use a new store.

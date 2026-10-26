@@ -53,7 +53,8 @@ Most of that time is the first build (under a minute on an M-series Mac).
    remote, then stops. While the remote fails, it tries again every 5 s, logs one warning a
    minute, and does not stop. A second signal stops it at once: the buffered data stays on the
    local disk and goes to the remote at the next start. Give the service manager a stop timeout
-   long enough for the buffer to upload (systemd `TimeoutStopSec`).
+   long enough for the buffer to upload (systemd `TimeoutStopSec`). A signal during the replay at
+   start ends the process at once. The next start replays the buffer again.
 
 ### Other S3 clients
 

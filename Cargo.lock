@@ -1432,6 +1432,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

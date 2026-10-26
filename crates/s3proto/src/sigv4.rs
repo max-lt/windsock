@@ -183,7 +183,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// The signing key of one secret, day and region.
 pub fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
-    let date_key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let date_key = hmac(
+        zeroize::Zeroizing::new(format!("AWS4{secret}")).as_bytes(),
+        date.as_bytes(),
+    );
     let region_key = hmac(&date_key, region.as_bytes());
     let service_key = hmac(&region_key, b"s3");
     hmac(&service_key, b"aws4_request")

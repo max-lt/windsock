@@ -27,6 +27,8 @@ All crates live in `crates/<name>`. Crate names have no project prefix.
 The daemon crate is `windsockd`.
 
 - `model`: shared identifiers (ChunkId, PackId, ObjectId, NodeId).
+- `seal`: the repository secret (`repo.key`), its two subkeys, keyed chunk IDs, the FastCDC seed,
+  and the seal of each object that goes to the remote (XChaCha20-Poly1305).
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
 - `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
   one-chunk read.
@@ -164,6 +166,7 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | Serialization                | `serde`, `postcard`                                                                   |
 | Errors                       | `thiserror`                                                                           |
 | Signatures                   | `ed25519-dalek` v2                                                                    |
+| Encryption                   | `chacha20poly1305` 0.10 (XChaCha20-Poly1305, RustCrypto)                              |
 | Logging                      | `tracing`                                                                             |
 | Local index                  | `fjall` v3                                                                            |
 | Tests                        | `tempfile`                                                                            |

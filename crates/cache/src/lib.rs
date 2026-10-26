@@ -15,7 +15,7 @@ use bytes::Bytes;
 use model::ChunkId;
 use seal::Keys;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Makes temporary file names unique inside one process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -124,6 +124,8 @@ pub struct ChunkCache {
     max_bytes: u64,
     lru: Mutex<Lru>,
     flights: Flights,
+    /// The last write failed. One warning marks the start of the failures, not each one.
+    write_failing: std::sync::atomic::AtomicBool,
 }
 
 impl ChunkCache {
@@ -148,6 +150,7 @@ impl ChunkCache {
             max_bytes,
             lru: Mutex::new(lru),
             flights: Mutex::new(HashMap::new()),
+            write_failing: std::sync::atomic::AtomicBool::new(false),
         };
         cache.remove_files(&evicted).await;
         Ok(cache)
@@ -164,6 +167,25 @@ impl ChunkCache {
 
     fn path(&self, id: ChunkId) -> PathBuf {
         path_of(&self.dir, id)
+    }
+
+    /// Writes a chunk, and logs once when writes start to fail and once when they work again.
+    /// A read never waits on the cache: a failed write only means a later read goes to the remote.
+    pub async fn keep(&self, id: ChunkId, raw: &[u8]) {
+        use std::sync::atomic::Ordering;
+
+        match self.insert(id, raw).await {
+            Ok(()) => {
+                if self.write_failing.swap(false, Ordering::SeqCst) {
+                    info!("cache writes work again");
+                }
+            }
+            Err(e) => {
+                if !self.write_failing.swap(true, Ordering::SeqCst) {
+                    warn!(%e, "cache writes fail, reads go to the remote");
+                }
+            }
+        }
     }
 
     /// The raw chunk, or `None` on a miss. A file that fails the hash check is removed.
@@ -313,6 +335,49 @@ mod tests {
         assert_eq!(lru.evict_over(20), [ids[1]]);
         assert_eq!(lru.bytes, 20);
         assert!(lru.touch(ids[0]) && lru.touch(ids[2]) && !lru.touch(ids[1]));
+    }
+
+    /// Log output, kept in memory.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failing_writes_warn_once_and_a_working_write_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for n in 0..50 {
+            let (id, data) = chunk(n, 100);
+            cache.keep(id, &data).await;
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (id, data) = chunk(200, 100);
+        cache.keep(id, &data).await;
+
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("cache writes fail").count(), 1, "{logs}");
+        assert_eq!(logs.matches("cache writes work again").count(), 1, "{logs}");
     }
 
     #[tokio::test]

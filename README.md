@@ -76,6 +76,9 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
 because the proxy deletes empty segments.
 
+If the chunk cache disk is full or cannot be written, the proxy logs `cache writes fail, reads go to
+the remote` once, and `cache writes work again` when a write works. Reads go on from the remote.
+
 ## Configuration
 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to

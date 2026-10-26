@@ -357,9 +357,7 @@ pub(crate) async fn cached(cache: &ChunkCache, id: ChunkId) -> Option<Vec<u8>> {
 }
 
 pub(crate) async fn keep(cache: &ChunkCache, id: ChunkId, raw: &[u8]) {
-    if let Err(e) = cache.insert(id, raw).await {
-        warn!(chunk = %id, %e, "cache write failed");
-    }
+    cache.keep(id, raw).await;
 }
 
 pub(crate) fn no_such_key(bucket: &str, key: &str) -> EngineError {

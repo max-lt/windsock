@@ -340,6 +340,25 @@ fn test_run_refuses_a_repository_key_that_other_users_can_read() {
 }
 
 #[test]
+fn test_run_refuses_a_node_key_that_other_users_can_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, config, _) = init();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let key = data.join("node.key");
+    std::fs::write(&key, "01".repeat(32)).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = Command::new(BIN).arg("run").arg(&config).output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("node.key can be read by other users")
+    );
+}
+
+#[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();
 

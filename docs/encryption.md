@@ -45,6 +45,9 @@ longer than its content.
 | `repo/key-check`       | A known value                                             | Nothing else                                                      |
 | `nodes/<node>`         | Empty marker                                              | The node ID                                                       |
 
+No read and no GC path reads the pack footer. The integrity of a pack rests on the seal of each
+chunk.
+
 A reader of the remote can see the number and the size of the objects, the time of each
 journal entry, and which proxy wrote it.
 

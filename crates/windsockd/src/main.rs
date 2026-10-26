@@ -92,9 +92,21 @@ fn init(dir: &Path) -> Result<()> {
 
 /// The secret of the remote. A missing file is an error: a new key could not read the data.
 fn repo_key(path: &Path) -> Result<RepoKey> {
+    refuse_if_others_can_read(path)?;
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read the repository key {}. Copy it from another proxy of this remote: a new \
+             key cannot read the data",
+            path.display()
+        )
+    })?;
+    RepoKey::from_hex(&text).with_context(|| format!("{} is not a repository key", path.display()))
+}
+
+/// Refuses a secret file that other users can read, as ssh does.
+fn refuse_if_others_can_read(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    // The key reads all data of the remote: refuse it when other users can read it, as ssh does.
     if let Ok(metadata) = std::fs::metadata(path)
         && metadata.permissions().mode() & 0o077 != 0
     {
@@ -104,14 +116,7 @@ fn repo_key(path: &Path) -> Result<RepoKey> {
             path.display()
         );
     }
-    let text = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "cannot read the repository key {}. Copy it from another proxy of this remote: a new \
-             key cannot read the data",
-            path.display()
-        )
-    })?;
-    RepoKey::from_hex(&text).with_context(|| format!("{} is not a repository key", path.display()))
+    Ok(())
 }
 
 /// The node identity, made on the first start.
@@ -123,6 +128,7 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
         info!(path = %path.display(), "made a new node key");
     }
 
+    refuse_if_others_can_read(&path)?;
     let text = std::fs::read_to_string(&path)?;
     let mut bytes = [0u8; 32];
     hex::decode_to_slice(text.trim(), &mut bytes)

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine, EngineError, RepoKey, WriteMode};
-use remote::{MemoryRemote, Remote};
+use remote::{MemoryRemote, Remote, Sweep};
 use tempfile::TempDir;
 
 const BUCKET: &str = "bkt";
@@ -331,4 +331,26 @@ async fn test_objects_at_size_limits_roundtrip_through_a_sealed_remote() {
         let data = get(&reader.engine, &format!("s{size}")).await.unwrap();
         assert_eq!(data, random_bytes(i as u8, *size), "size {size}");
     }
+}
+
+#[tokio::test]
+async fn test_remote_with_a_journal_and_no_key_check_is_refused_at_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    remote.delete("repo/key-check").await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await;
+
+    let Err(EngineError::WrongRepoKey(reason)) = result else {
+        panic!("a journal with no key check opens");
+    };
+    assert!(reason.contains("without encryption"), "{reason}");
 }

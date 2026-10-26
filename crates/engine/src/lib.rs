@@ -264,6 +264,16 @@ impl<R: Remote + 'static> Engine<R> {
             KEY_CHECK.as_bytes(),
         );
 
+        // A journal with no key check comes from a build before the seal, or from another tool.
+        if self.remote.get(KEY_CHECK_KEY).await?.is_none()
+            && !self.remote.list(journal::LOG_PREFIX).await?.is_empty()
+        {
+            return Err(EngineError::WrongRepoKey(format!(
+                "the remote has a journal and no {KEY_CHECK_KEY}: it was written without \
+                 encryption, so this build cannot read it"
+            )));
+        }
+
         match self.remote.create(KEY_CHECK_KEY, Bytes::from(check)).await {
             Ok(()) => return Ok(()),
             Err(RemoteError::AlreadyExists(_)) => {}

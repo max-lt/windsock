@@ -412,6 +412,8 @@ async fn test_broken_chain_fails_alone_and_recovers() {
 #[tokio::test]
 async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
     let remote = Arc::new(TestRemote::default());
+    // The first proxy writes the key check of the remote before any entry.
+    drop(proxy(&remote, 1).await);
     let ahead = SigningKey::from_bytes(&[9u8; 32]);
     let node = model::NodeId::from_bytes(ahead.verifying_key().to_bytes());
     let far_future = u64::MAX / 2;

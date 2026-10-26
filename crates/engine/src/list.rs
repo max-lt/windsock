@@ -160,3 +160,17 @@ fn past_group(group: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_past_group_skips_surrogates_and_the_last_char() {
+        assert_eq!(past_group("a/").as_deref(), Some("a0"));
+        assert_eq!(past_group("a\u{7f}").as_deref(), Some("a\u{80}"));
+        assert_eq!(past_group("a\u{d7ff}").as_deref(), Some("a\u{e000}"));
+        assert_eq!(past_group("a\u{10ffff}").as_deref(), Some("b"));
+        assert_eq!(past_group("\u{10ffff}\u{10ffff}"), None);
+    }
+}

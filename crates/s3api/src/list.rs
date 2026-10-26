@@ -241,7 +241,17 @@ mod tests {
         }
 
         fn key(&mut self) -> String {
-            const PARTS: [&str; 6] = ["a", "b", "/", "c", "\u{e9}", "b/"];
+            const PARTS: [&str; 9] = [
+                "a",
+                "b",
+                "/",
+                "c",
+                "\u{e9}",
+                "b/",
+                "\u{7f}",
+                "\u{d7ff}",
+                "\u{10ffff}",
+            ];
             (0..1 + self.below(6))
                 .map(|_| PARTS[self.below(PARTS.len())])
                 .collect()
@@ -303,8 +313,9 @@ mod tests {
         let keys: Vec<String> = live.into_iter().collect();
 
         for _ in 0..400 {
-            let prefix = match rng.below(3) {
+            let prefix = match rng.below(4) {
                 0 => String::new(),
+                1 => format!("{}zz", keys[rng.below(keys.len())]),
                 _ => {
                     let key = &keys[rng.below(keys.len())];
                     let cut = key
@@ -315,11 +326,20 @@ mod tests {
                     key[..cut].to_string()
                 }
             };
-            let delimiter = [None, Some("/"), Some("b"), Some("b/")][rng.below(4)];
+            let delimiter = [
+                None,
+                Some("/"),
+                Some("b"),
+                Some("b/"),
+                Some(""),
+                Some("/b"),
+                Some("\u{10ffff}"),
+            ][rng.below(7)];
             let max_keys = [1, 2, 3, 7, 50, 1000][rng.below(6)];
-            let after = match rng.below(4) {
+            let after = match rng.below(5) {
                 0 => Some(After::Key(rng.key())),
                 1 => Some(After::Prefix(rng.key())),
+                2 => Some(After::Key(format!("{}\u{10ffff}", keys[keys.len() - 1]))),
                 _ => None,
             };
             let under: Vec<String> = keys
@@ -350,5 +370,77 @@ mod tests {
                 want_after = Some(next);
             }
         }
+    }
+
+    /// 1000 keys under one common prefix fill one entry: the page is whole, and the next one is empty.
+    #[tokio::test]
+    async fn test_one_common_prefix_over_many_keys_is_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine::Engine::open(
+            dir.path(),
+            std::sync::Arc::new(remote::MemoryRemote::default()),
+            ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+            engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            engine::Config::default(),
+        )
+        .await
+        .unwrap();
+        engine.create_bucket("bkt", None).await.unwrap();
+        for i in 0..1000 {
+            let key = format!("d/{i:04}");
+            let put = engine.put(
+                "bkt",
+                &key,
+                bytes::Bytes::new(),
+                Default::default(),
+                engine::WriteMode::Overwrite,
+            );
+            put.await.unwrap();
+            if i == 500 {
+                engine.flush().await.unwrap();
+            }
+        }
+        engine
+            .put(
+                "bkt",
+                "d/",
+                bytes::Bytes::new(),
+                Default::default(),
+                engine::WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        let query = |after| engine::ListQuery {
+            prefix: "",
+            delimiter: Some("/"),
+            after,
+            max_keys: 1,
+        };
+
+        let first = engine.list_page("bkt", &query(None)).await.unwrap();
+        let next = engine
+            .list_page("bkt", &query(Some(engine::ListAfter::Prefix("d/".into()))))
+            .await
+            .unwrap();
+        let exact = engine::ListQuery {
+            prefix: "d/",
+            delimiter: Some("/"),
+            after: None,
+            max_keys: 1,
+        };
+        let own = engine.list_page("bkt", &exact).await.unwrap();
+
+        assert_eq!(
+            first.entries,
+            [engine::ListEntry::CommonPrefix("d/".into())]
+        );
+        assert!(!first.truncated);
+        assert!(next.entries.is_empty() && !next.truncated, "{next:?}");
+        assert_eq!(
+            engine_names(&own),
+            ["d/"],
+            "a key equal to the prefix is an object"
+        );
+        assert!(own.truncated);
     }
 }

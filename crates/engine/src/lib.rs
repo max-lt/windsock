@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +81,8 @@ pub enum EngineError {
     PreconditionFailed { bucket: String, key: String },
     #[error("range {start}..{end} is outside the object ({size} bytes)")]
     InvalidRange { start: u64, end: u64, size: u64 },
+    #[error("the proxy is stopping and takes no new write")]
+    Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
     #[error("the buffer fsync failed, so the write is not stored")]
@@ -192,6 +195,8 @@ pub struct Engine<R> {
     /// Start of the last sync that succeeded: GC rule 1 for dedup.
     fresh_sync: Mutex<Option<Instant>>,
     flush_wanted: Notify,
+    /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
+    draining: AtomicBool,
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -238,6 +243,7 @@ impl<R: Remote + 'static> Engine<R> {
             last_sync: Mutex::new(None),
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
+            draining: AtomicBool::new(false),
         };
 
         engine.check_repo_key().await?;

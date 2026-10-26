@@ -443,3 +443,47 @@ async fn test_broken_chain_seen_from_the_other_proxy() {
     assert!(a.wait_for("gc run", Duration::from_secs(30)).is_some());
     assert!(a.stop() && b.stop());
 }
+
+/// Sets the mode of every directory in `root`.
+fn chmod_dirs(root: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            chmod_dirs(&path, mode);
+        }
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// At SIGTERM the daemon waits until the remote has its buffer, however long the remote fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stop_waits_until_the_remote_has_the_buffer() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    let data = random_bytes(7, 200_000);
+    let mut a = start(&cluster.config("a", 600_000, false), "info");
+    assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
+    assert_eq!(put(&a, "/shared/kept", &data).await.status, StatusCode::OK);
+
+    chmod_dirs(&cluster.remote(), 0o500);
+    a.terminate();
+    let failed = a.wait_for("final flush failed", Duration::from_secs(30));
+    let running = a.wait_exit(Duration::from_secs(6)).is_none();
+    chmod_dirs(&cluster.remote(), 0o700);
+
+    assert!(
+        failed.is_some(),
+        "the final flush meets the read-only remote"
+    );
+    assert!(running, "the daemon waits for the remote");
+    assert!(
+        a.wait_for("buffer flushed: stopped", Duration::from_secs(60))
+            .is_some()
+    );
+    assert_eq!(a.wait_exit(Duration::from_secs(10)), Some(true));
+    let b = start(&cluster.config("b", 100, false), "info");
+    eventually(&b, "/shared/kept", &data, Duration::from_secs(30)).await;
+    assert!(b.stop());
+}

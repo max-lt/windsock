@@ -110,6 +110,13 @@ impl Daemon {
 
     /// SIGTERM, then the exit status.
     pub fn stop(mut self) -> bool {
+        self.terminate();
+        self.wait_exit(Duration::from_secs(60))
+            .expect("the daemon did not stop")
+    }
+
+    /// SIGTERM, and no wait.
+    pub fn terminate(&self) {
         let pid = self.child.id().to_string();
         assert!(
             Command::new("kill")
@@ -118,13 +125,18 @@ impl Daemon {
                 .unwrap()
                 .success()
         );
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+    /// The exit status, or `None` while the daemon still runs after `limit`.
+    pub fn wait_exit(&mut self, limit: Duration) -> Option<bool> {
+        let deadline = Instant::now() + limit;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                return status.success();
+                return Some(status.success());
             }
-            assert!(Instant::now() < deadline, "the daemon did not stop");
+            if Instant::now() >= deadline {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }

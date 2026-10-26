@@ -85,6 +85,8 @@ impl From<EngineError> for S3Error {
                 ("PreconditionFailed", StatusCode::PRECONDITION_FAILED)
             }
             EngineError::InvalidRange { .. } => ("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE),
+            // Another proxy, or this one after its restart, takes the write.
+            EngineError::Draining => ("ServiceUnavailable", StatusCode::SERVICE_UNAVAILABLE),
             // The buffer drains when the remote comes back: clients back off and retry.
             EngineError::BufferFull { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
             // A full local disk frees up when the flusher uploads: clients back off and retry.

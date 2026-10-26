@@ -162,6 +162,44 @@ async fn test_flushed_object_is_read_from_the_remote() {
 }
 
 #[tokio::test]
+async fn test_draining_engine_refuses_writes_and_flushes_what_it_has() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "kept", b"before the drain").await;
+
+    a.engine.drain();
+    let refused = a
+        .engine
+        .put(
+            BUCKET,
+            "late",
+            Bytes::from_static(b"x"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+        .await;
+    a.engine.flush().await.unwrap();
+
+    assert!(matches!(refused, Err(EngineError::Draining)), "{refused:?}");
+    assert!(matches!(
+        a.engine.delete(BUCKET, "kept").await,
+        Err(EngineError::Draining)
+    ));
+    assert!(matches!(
+        a.engine.create_bucket("other", None).await,
+        Err(EngineError::Draining)
+    ));
+    assert_eq!(a.engine.buffered_bytes().await, 0);
+    let fresh = proxy(&remote, 2).await;
+    assert_eq!(
+        get(&fresh.engine, "kept").await.unwrap(),
+        b"before the drain"
+    );
+    assert_eq!(keys(&fresh.engine).await, ["kept"]);
+}
+
+#[tokio::test]
 async fn test_two_engines_converge() {
     let remote = Arc::new(MemoryRemote::default());
     let a = proxy(&remote, 1).await;

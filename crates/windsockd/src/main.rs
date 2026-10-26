@@ -34,8 +34,8 @@ const CONFIG_FILE: &str = "windsock.toml";
 const NODE_KEY_FILE: &str = "node.key";
 const REPO_KEY_FILE: &str = "repo.key";
 
-/// The buffer flushes on shutdown within this time; what remains replays at the next start.
-const SHUTDOWN_FLUSH_LIMIT: Duration = Duration::from_secs(60);
+/// Pause between two final flushes while the remote fails.
+const SHUTDOWN_RETRY: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -338,7 +338,7 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         listener,
         router.into_make_service_with_connect_info::<ConnectionActivity>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(drain_on_signal(engine.clone()))
     .await?;
 
     // A flush cut by the abort is safe: its intent file finishes it at the next flush.
@@ -346,11 +346,39 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         task.abort();
     }
 
-    match tokio::time::timeout(SHUTDOWN_FLUSH_LIMIT, engine.flush()).await {
-        Ok(Ok(())) => info!("buffer flushed: stopped"),
-        Ok(Err(e)) => warn!(%e, "final flush failed: the buffer replays at the next start"),
-        Err(_) => warn!("final flush timed out: the buffer replays at the next start"),
+    tokio::select! {
+        () = flush_until_empty(&engine) => info!("buffer flushed: stopped"),
+        () = shutdown_signal() => {
+            let bytes = engine.buffered_bytes().await;
+            warn!(bytes, "second signal: stopped before the remote has the buffer; it flushes at the next start");
+        }
     }
 
     Ok(())
+}
+
+/// Refuses new writes at the first signal, so the final flush empties the buffer.
+async fn drain_on_signal<R: Sweep + 'static>(engine: Arc<Engine<R>>) {
+    shutdown_signal().await;
+    engine.drain();
+    let bytes = engine.buffered_bytes().await;
+    info!(
+        bytes,
+        "draining: new writes get 503, the buffer goes to the remote; a second signal stops at once"
+    );
+}
+
+/// Flushes until the remote has every buffered write. A failed flush waits, then tries again.
+async fn flush_until_empty<R: Sweep + 'static>(engine: &Engine<R>) {
+    loop {
+        match engine.flush().await {
+            Ok(()) if engine.buffered_bytes().await == 0 => return,
+            Ok(()) => {}
+            Err(e) => {
+                let bytes = engine.buffered_bytes().await;
+                warn!(%e, bytes, "final flush failed: trying again");
+            }
+        }
+        tokio::time::sleep(SHUTDOWN_RETRY).await;
+    }
 }

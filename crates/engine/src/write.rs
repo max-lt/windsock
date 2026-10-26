@@ -102,6 +102,16 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(buffer.durability(record))
     }
 
+    /// Refuses every write from now on. A write that holds the buffer lock still lands.
+    pub fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Bytes in the buffer that are not in the remote yet.
+    pub async fn buffered_bytes(&self) -> u64 {
+        self.buffer.lock().await.bytes()
+    }
+
     /// Appends a record. Returns its number for [`Engine::acknowledge`].
     pub(crate) async fn append(&self, buffer: &mut Buffer, op: Op, data: &[u8]) -> Result<u64> {
         self.append_at(buffer, buffer::unix_nanos(), op, data).await
@@ -114,6 +124,10 @@ impl<R: Remote + 'static> Engine<R> {
         op: Op,
         data: &[u8],
     ) -> Result<u64> {
+        if self.draining.load(Ordering::SeqCst) {
+            return Err(EngineError::Draining);
+        }
+
         let limit = self.config.buffer_limit;
 
         if buffer.bytes() + data.len() as u64 > limit {

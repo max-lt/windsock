@@ -48,7 +48,12 @@ Most of that time is the first build (under a minute on an M-series Mac).
    s3 "http://127.0.0.1:9000/demo?list-type=2"
    ```
 
-6. Stop the daemon with Ctrl-C. It writes the buffered data to the remote, then stops.
+6. Stop the daemon with Ctrl-C or SIGTERM. From that signal, the daemon refuses new writes with
+   503 ServiceUnavailable. It writes the buffered data to the remote, then stops. While the remote
+   fails, it tries again every 5 s and does not stop. A second signal stops it at once: the
+   buffered data stays on the local disk and goes to the remote at the next start. Give the
+   service manager a stop timeout long enough for the buffer to upload (systemd
+   `TimeoutStopSec`).
    Start it again with step 3: the file is still there.
 
 ### Other S3 clients

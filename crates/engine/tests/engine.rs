@@ -412,6 +412,71 @@ async fn test_remote_holds_no_bucket_key_or_data_in_clear() {
     }
 }
 
+/// The ETag, the metadata, the size and the names: nothing that identifies an object is in clear.
+#[tokio::test]
+async fn test_remote_holds_no_etag_metadata_or_size_and_names_show_nothing() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket("tenant-bucket", None).await.unwrap();
+    // A size whose decimal form and 8-byte form are unlikely in random bytes.
+    let data = random_bytes(9, 9_437_197);
+    let metadata = BTreeMap::from([
+        (
+            "content-type".to_string(),
+            "application/x-windsock-probe".to_string(),
+        ),
+        (
+            "x-amz-meta-owner".to_string(),
+            "owner-value-in-clear".to_string(),
+        ),
+    ]);
+    let info = a
+        .engine
+        .put(
+            "tenant-bucket",
+            "secret-object-name",
+            Bytes::from(data.clone()),
+            metadata,
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+
+    let etag_hex = hex::encode(info.content_hash);
+    let first_chunk_hash = blake3::hash(&data[..16 * 1024]).to_hex().to_string();
+    let size = data.len() as u64;
+    let needles: Vec<(&str, Vec<u8>)> = vec![
+        ("etag hex", etag_hex.clone().into_bytes()),
+        ("etag bytes", info.content_hash.to_vec()),
+        ("content type", b"application/x-windsock-probe".to_vec()),
+        ("metadata value", b"owner-value-in-clear".to_vec()),
+        ("metadata name", b"x-amz-meta-owner".to_vec()),
+        ("size decimal", size.to_string().into_bytes()),
+        ("size u64", size.to_le_bytes().to_vec()),
+    ];
+    let names = remote.list("").await.unwrap();
+
+    for key in &names {
+        for word in [
+            "tenant-bucket",
+            "secret-object-name",
+            &etag_hex,
+            &first_chunk_hash[..16],
+        ] {
+            assert!(!key.contains(word), "the name {key} holds {word}");
+        }
+        let stored = remote.get(key).await.unwrap().unwrap();
+        for (what, needle) in &needles {
+            assert!(
+                !stored.windows(needle.len()).any(|w| w == needle.as_slice()),
+                "{key} holds the {what} in clear"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_manifest_on_the_remote_is_sealed() {
     let remote = Arc::new(MemoryRemote::default());

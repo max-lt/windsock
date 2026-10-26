@@ -39,6 +39,7 @@ async fn server() -> Server {
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
         Config::default(),
     )
     .await
@@ -155,6 +156,7 @@ async fn test_engine_runs_on_an_s3_remote() {
             dir.path().to_path_buf(),
             remote.clone(),
             SigningKey::from_bytes(&[seed; 32]),
+            engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
             Config::default(),
         )
     };

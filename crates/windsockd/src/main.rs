@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
-use engine::Engine;
+use engine::{Engine, RepoKey};
 use remote::{DirRemote, Startup, Sweep, Verdict};
 use s3remote::{Retry, S3Config, S3Remote};
 use tokio::signal::unix::{SignalKind, signal};
@@ -31,6 +31,7 @@ use listener::{
 
 const CONFIG_FILE: &str = "windsock.toml";
 const NODE_KEY_FILE: &str = "node.key";
+const REPO_KEY_FILE: &str = "repo.key";
 
 /// The buffer flushes on shutdown within this time; what remains replays at the next start.
 const SHUTDOWN_FLUSH_LIMIT: Duration = Duration::from_secs(60);
@@ -77,9 +78,28 @@ fn init(dir: &Path) -> Result<()> {
     let path = dir.join(CONFIG_FILE);
     let text = toml::to_string(&Config::local()?).context("cannot write the configuration")?;
     write_secret(&path, text.as_bytes())?;
-
     info!(config = %path.display(), "wrote a configuration; the S3 access key and secret are in it");
+
+    let key_path = dir.join(REPO_KEY_FILE);
+    write_secret(&key_path, RepoKey::generate()?.to_hex().as_bytes())?;
+    warn!(
+        repo_key = %key_path.display(),
+        "wrote a new repository key. Keep a copy away from the remote: without it, nobody can \
+         read the data. Give every other proxy of this remote the same file"
+    );
     Ok(())
+}
+
+/// The secret of the remote. A missing file is an error: a new key could not read the data.
+fn repo_key(path: &Path) -> Result<RepoKey> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read the repository key {}. Copy it from another proxy of this remote: a new \
+             key cannot read the data",
+            path.display()
+        )
+    })?;
+    RepoKey::from_hex(&text).with_context(|| format!("{} is not a repository key", path.display()))
 }
 
 /// The node identity, made on the first start.
@@ -229,7 +249,14 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         ),
     }
 
-    let engine = Engine::open(config.data_dir.join("engine"), remote, key, config.engine()).await?;
+    let engine = Engine::open(
+        config.data_dir.join("engine"),
+        remote,
+        key,
+        repo_key(&config.repo_key)?.keys(),
+        config.engine(),
+    )
+    .await?;
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");
 

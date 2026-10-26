@@ -101,6 +101,13 @@ impl Sweep for CountingRemote {
     }
 }
 
+/// The bench data is thrown away. A fixed key lets two bench runs share one remote.
+pub fn bench_keys() -> engine::Keys {
+    engine::RepoKey::from_hex(&"07".repeat(32))
+        .expect("a constant hex key parses")
+        .keys()
+}
+
 /// An engine behind the S3 router on a free local port.
 pub struct Server {
     pub engine: Arc<Engine<CountingRemote>>,
@@ -120,6 +127,7 @@ impl Server {
             engine_dir,
             remote,
             SigningKey::from_bytes(&[seed; 32]),
+            bench_keys(),
             config,
         )
         .await?;

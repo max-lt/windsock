@@ -62,9 +62,15 @@ async fn open<R: Remote + 'static>(
     config: Config,
 ) -> Proxy<R> {
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, config)
-        .await
-        .unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
     Proxy { dir, engine }
 }
 

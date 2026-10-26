@@ -83,9 +83,15 @@ fn config(retention: Duration) -> Config {
 async fn proxy_with(remote: &Arc<TestRemote>, seed: u8, config: Config) -> Proxy {
     let dir = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, config)
-        .await
-        .unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
     Proxy { _dir: dir, engine }
 }
 

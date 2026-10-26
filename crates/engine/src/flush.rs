@@ -95,6 +95,7 @@ impl<R: Remote + 'static> Engine<R> {
             self.config.pack_target,
             self.config.own_pack_threshold,
             nonces,
+            self.keys.clone(),
         );
         let mut planned = Vec::new();
         let mut objects = 0;

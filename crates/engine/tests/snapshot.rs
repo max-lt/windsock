@@ -69,9 +69,15 @@ struct Proxy {
 
 async fn open(remote: &Arc<TestRemote>, seed: u8, dir: TempDir) -> Proxy {
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, Config::default())
-        .await
-        .unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
     Proxy { dir, engine }
 }
 
@@ -239,9 +245,15 @@ async fn test_short_interval_writes_a_new_snapshot() {
         ..Config::default()
     };
     let key = SigningKey::from_bytes(&[1u8; 32]);
-    let a = Engine::open(dir.path(), remote.clone(), key, config)
-        .await
-        .unwrap();
+    let a = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
     a.create_bucket(BUCKET, None).await.unwrap();
     a.flush().await.unwrap();
 

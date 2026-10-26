@@ -299,7 +299,7 @@ impl<R: Remote + 'static> Engine<R> {
             .map(|entry| {
                 let offset = (entry.offset - start) as usize;
                 let stored = &bytes[offset..offset + entry.stored_len as usize];
-                Ok(pack::read_chunk(entry, stored)?)
+                Ok(pack::read_chunk(&self.keys, entry, stored)?)
             })
             .collect()
     }

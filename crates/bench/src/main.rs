@@ -315,7 +315,14 @@ async fn replay(args: &Args, dir: &Path, m: &mut Measures) -> Result<(), Error> 
     let remote = Arc::new(open_remote(args, dir, "replay-remote")?);
     let engine_dir = dir.join("replay-engine");
     let key = SigningKey::from_bytes(&[9u8; 32]);
-    let engine = Engine::open(&engine_dir, remote.clone(), key.clone(), config()).await?;
+    let engine = Engine::open(
+        &engine_dir,
+        remote.clone(),
+        key.clone(),
+        support::bench_keys(),
+        config(),
+    )
+    .await?;
     engine.create_bucket(BUCKET, None).await?;
 
     let mut written = 0;
@@ -337,7 +344,7 @@ async fn replay(args: &Args, dir: &Path, m: &mut Measures) -> Result<(), Error> 
     drop(engine);
 
     let start = Instant::now();
-    let reopened = Engine::open(&engine_dir, remote, key, config()).await?;
+    let reopened = Engine::open(&engine_dir, remote, key, support::bench_keys(), config()).await?;
     let elapsed = start.elapsed().as_secs_f64();
     drop(reopened);
 

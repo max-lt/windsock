@@ -6,6 +6,7 @@ use std::ops::Range;
 use chunking::Chunk;
 use model::{ChunkId, PackId};
 use pack::{Nonce, Pack, PackBuilder, PackEntry};
+use seal::Keys;
 
 #[cfg(test)]
 use crate::config::CacheMode;
@@ -80,11 +81,13 @@ pub(crate) struct Planner {
     /// Chunks already placed in this batch.
     placed: HashMap<ChunkId, Slot>,
     objects: Vec<PlannedObject>,
+    keys: Keys,
 }
 
 impl Planner {
-    pub fn new(pack_target: usize, own_pack_threshold: usize, nonces: Nonces) -> Self {
+    pub fn new(pack_target: usize, own_pack_threshold: usize, nonces: Nonces, keys: Keys) -> Self {
         Self {
+            keys,
             pack_target,
             own_pack_threshold,
             nonces,
@@ -107,8 +110,8 @@ impl Planner {
         mut stored: impl FnMut(ChunkId) -> Result<Option<ChunkRef>, E>,
     ) -> Result<Added, E> {
         let chunks: Vec<Chunk<'_>> = match policy.chunking {
-            Chunking::ContentDefined => chunking::chunks(data).collect(),
-            Chunking::Fixed => chunking::fixed_chunks(data).collect(),
+            Chunking::ContentDefined => chunking::chunks(&self.keys, data).collect(),
+            Chunking::Fixed => chunking::fixed_chunks(&self.keys, data).collect(),
         };
         let spans = chunks
             .iter()
@@ -258,6 +261,10 @@ mod tests {
     use super::*;
     use crate::manifest;
 
+    fn test_keys() -> Keys {
+        seal::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys()
+    }
+
     fn random_bytes(seed: u8, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
         blake3::Hasher::new()
@@ -295,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_small_objects_share_one_pack() {
-        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]), test_keys());
 
         assert!(add(&mut planner, &random_bytes(1, 1000)).is_empty());
         assert!(add(&mut planner, &random_bytes(2, 1000)).is_empty());
@@ -310,7 +317,7 @@ mod tests {
     #[test]
     fn test_shared_pack_closes_at_target_size() {
         let chunk = chunking::MAX_SIZE;
-        let mut planner = Planner::new(2 * chunk, 1 << 30, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(2 * chunk, 1 << 30, Nonces::new([0u8; 32]), test_keys());
 
         let closed = add(&mut planner, &random_bytes(1, 3 * chunk));
         let (last, manifests) = planner.finish();
@@ -323,7 +330,12 @@ mod tests {
 
     #[test]
     fn test_large_object_gets_its_own_pack() {
-        let mut planner = Planner::new(1 << 30, 2 * chunking::MAX_SIZE, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(
+            1 << 30,
+            2 * chunking::MAX_SIZE,
+            Nonces::new([0u8; 32]),
+            test_keys(),
+        );
 
         add(&mut planner, &random_bytes(1, 1000));
         let closed = add(&mut planner, &random_bytes(2, 2 * chunking::MAX_SIZE));
@@ -338,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_chunk_seen_twice_in_a_batch_is_packed_once() {
-        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]), test_keys());
         let data = random_bytes(1, 1000);
 
         add(&mut planner, &data);
@@ -355,14 +367,14 @@ mod tests {
         let location = ChunkRef {
             pack: PackId::from_bytes([9u8; 32]),
             entry: PackEntry {
-                chunk_id: chunking::chunk_id(&data),
+                chunk_id: test_keys().chunk_id(&data),
                 offset: 5,
                 stored_len: 1000,
                 raw_len: 1000,
                 compression: Compression::None,
             },
         };
-        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]), test_keys());
 
         planner
             .add(&data, [0u8; 32], BTreeMap::new(), fixed(), |_| {
@@ -379,7 +391,7 @@ mod tests {
     fn test_two_flushes_of_the_same_data_get_new_keys() {
         let data = random_bytes(1, 1000);
         let flush = |seed: u8| {
-            let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([seed; 32]));
+            let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([seed; 32]), test_keys());
             add(&mut planner, &data);
             let (last, manifests) = planner.finish();
             (
@@ -397,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_empty_object_has_no_chunks() {
-        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]));
+        let mut planner = Planner::new(1 << 30, 1 << 30, Nonces::new([0u8; 32]), test_keys());
 
         add(&mut planner, b"");
         let (last, manifests) = planner.finish();

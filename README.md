@@ -14,7 +14,9 @@ Most of that time is the first build (under a minute on an M-series Mac).
    cargo build --release -p windsockd
    ```
 
-2. Make a configuration. This writes `./local/windsock.toml` with a new access key and secret.
+2. Make a configuration. This writes `./local/windsock.toml` with a new access key and secret, and
+   `./local/repo.key`, the secret of the remote. Keep a copy of `repo.key` away from the remote:
+   without it, nobody can read the data.
    The remote is the directory `./local/remote`. The file is readable by you only.
 
    ```bash
@@ -66,6 +68,7 @@ the configuration file.
 | Setting                     | Default                                    | Meaning                                                                                                                                       |
 | --------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `data_dir`                  | `data`                                     | Engine state, write buffer, chunk cache, multipart parts, node key                                                                            |
+| `repo_key`                  | `repo.key`                                 | The secret of the remote: it keys the chunk IDs and encrypts all remote objects. Every proxy of one remote needs the same file                |
 | `listen`                    | `127.0.0.1:9000`                           | S3 address                                                                                                                                    |
 | `max_connections`           | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors                         |
 | `idle_timeout_secs`         | `60`                                       | A connection with no request in progress closes after this time                                                                               |

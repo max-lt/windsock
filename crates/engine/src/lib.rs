@@ -32,6 +32,7 @@ use journal::{Action, Commit, Entry, Journal, JournalError};
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
+pub use seal::{Keys, RepoKey};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -174,6 +175,8 @@ pub struct Engine<R> {
     index: Mutex<Index>,
     buffer: tokio::sync::Mutex<Buffer>,
     cache: Option<ChunkCache>,
+    /// The repository keys: chunk IDs, the FastCDC seed, and the seal of remote objects.
+    keys: Keys,
     /// One flush at a time.
     flushing: tokio::sync::Mutex<()>,
     /// One buffer fsync at a time. The writes that arrive during an fsync share the next one.
@@ -191,6 +194,7 @@ impl<R: Remote + 'static> Engine<R> {
         dir: impl AsRef<Path>,
         remote: Arc<R>,
         signing_key: SigningKey,
+        keys: Keys,
         config: Config,
     ) -> Result<Self> {
         let dir = dir.as_ref();
@@ -200,7 +204,7 @@ impl<R: Remote + 'static> Engine<R> {
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
         let cache = match config.cache_bytes {
             0 => None,
-            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes).await?),
+            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),
         };
 
         if !buffer.is_empty() {
@@ -209,6 +213,7 @@ impl<R: Remote + 'static> Engine<R> {
 
         let engine = Self {
             node: journal.node(),
+            keys,
             remote,
             config,
             buffer_dir,

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 model.workspace = true
+seal.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
 ruzstd.workspace = true

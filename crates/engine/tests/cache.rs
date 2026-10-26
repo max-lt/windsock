@@ -75,9 +75,15 @@ fn config(cache: CacheMode, cache_bytes: u64) -> Config {
 async fn proxy(remote: &Arc<CountingRemote>, seed: u8, config: Config) -> Proxy {
     let dir = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
-    let engine = Engine::open(dir.path(), remote.clone(), key, config)
-        .await
-        .unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
     Proxy { dir, engine }
 }
 

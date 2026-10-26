@@ -152,6 +152,7 @@ mod tests {
             dir,
             Arc::new(MemoryRemote::default()),
             SigningKey::from_bytes(&[3; 32]),
+            crate::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
             Config::default(),
         )
         .await

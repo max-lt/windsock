@@ -32,6 +32,7 @@ async fn server() -> Server {
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
         Config::default(),
     )
     .await

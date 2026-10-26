@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Engine state, multipart parts and the node key. Relative to the file.
     pub data_dir: PathBuf,
+    /// The secret of the remote, shared by all its proxies. Relative to the file.
+    #[serde(default = "default_repo_key")]
+    pub repo_key: PathBuf,
     /// The S3 address, `host:port`.
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -110,6 +113,10 @@ fn default_listen() -> String {
     "127.0.0.1:9000".to_string()
 }
 
+fn default_repo_key() -> PathBuf {
+    PathBuf::from("repo.key")
+}
+
 fn default_idle_timeout() -> u64 {
     60
 }
@@ -143,6 +150,7 @@ impl Config {
 
         let base = path.parent().unwrap_or(Path::new("."));
         config.data_dir = base.join(&config.data_dir);
+        config.repo_key = base.join(&config.repo_key);
         match &mut config.remote {
             RemoteConfig::Dir { path } => *path = base.join(&*path),
             RemoteConfig::S3 {
@@ -177,6 +185,7 @@ impl Config {
     pub fn local() -> Result<Self> {
         Ok(Self {
             data_dir: PathBuf::from("data"),
+            repo_key: default_repo_key(),
             listen: default_listen(),
             remote: RemoteConfig::Dir {
                 path: PathBuf::from("remote"),
@@ -238,6 +247,7 @@ mod tests {
         let config = Config::load(&path).unwrap();
 
         assert_eq!(config.data_dir, dir.path().join("data"));
+        assert_eq!(config.repo_key, dir.path().join("repo.key"));
         assert_eq!(
             config.remote,
             RemoteConfig::Dir {

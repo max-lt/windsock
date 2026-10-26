@@ -218,6 +218,7 @@ dependencies = [
  "blake3",
  "bytes",
  "model",
+ "seal",
  "tempfile",
  "thiserror",
  "tokio",
@@ -284,6 +285,7 @@ dependencies = [
  "fastcdc",
  "model",
  "ruzstd",
+ "seal",
  "serde",
  "thiserror",
 ]
@@ -501,6 +503,7 @@ dependencies = [
  "pack",
  "postcard",
  "remote",
+ "seal",
  "serde",
  "tempfile",
  "thiserror",
@@ -1085,6 +1088,7 @@ dependencies = [
  "chunking",
  "model",
  "postcard",
+ "seal",
  "serde",
  "thiserror",
 ]

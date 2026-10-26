@@ -1,0 +1,301 @@
+//! A remote with changed, moved or swapped sealed objects: every read fails closed.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ed25519_dalek::SigningKey;
+use engine::{Config, Engine, EngineError, RepoKey, WriteMode};
+use remote::{MemoryRemote, Remote};
+use tempfile::TempDir;
+
+const BUCKET: &str = "bkt";
+
+struct Proxy {
+    _dir: TempDir,
+    engine: Engine<MemoryRemote>,
+}
+
+async fn proxy(remote: &Arc<MemoryRemote>, seed: u8) -> Proxy {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[seed; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    Proxy { _dir: dir, engine }
+}
+
+fn random_bytes(seed: u8, len: usize) -> Vec<u8> {
+    let mut out = vec![0; len];
+    blake3::Hasher::new()
+        .update(&[seed])
+        .finalize_xof()
+        .fill(&mut out);
+    out
+}
+
+/// A writer with two large objects: each has its own packs and a manifest on the remote.
+/// Returns the data of `a`.
+async fn written(remote: &Arc<MemoryRemote>) -> Vec<u8> {
+    let writer = proxy(remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    for (seed, key) in [(1, "a"), (2, "b")] {
+        writer
+            .engine
+            .put(
+                BUCKET,
+                key,
+                Bytes::from(random_bytes(seed, 8 * 1024 * 1024)),
+                BTreeMap::new(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        writer.engine.flush().await.unwrap();
+    }
+    random_bytes(1, 8 * 1024 * 1024)
+}
+
+async fn keys(remote: &MemoryRemote, prefix: &str) -> Vec<String> {
+    remote.list(prefix).await.unwrap()
+}
+
+async fn flip(remote: &MemoryRemote, key: &str, at: impl Fn(usize) -> usize) {
+    let mut bytes = remote.get(key).await.unwrap().unwrap().to_vec();
+    let i = at(bytes.len());
+    bytes[i] ^= 1;
+    remote.put(key, Bytes::from(bytes)).await.unwrap();
+}
+
+async fn get(engine: &Engine<MemoryRemote>, key: &str) -> Result<Bytes, EngineError> {
+    engine.get(BUCKET, key, None).await.map(|o| o.data)
+}
+
+#[tokio::test]
+async fn test_changed_byte_in_a_sealed_chunk_fails_the_read() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    for pack in keys(&remote, "packs/").await {
+        flip(&remote, &pack, |len| len / 2).await;
+    }
+
+    let reader = proxy(&remote, 2).await;
+
+    let error = get(&reader.engine, "a").await.unwrap_err();
+    assert!(error.to_string().contains("does not open"), "{error}");
+    assert!(error.to_string().contains("pack "), "{error}");
+}
+
+#[tokio::test]
+async fn test_changed_byte_in_a_pack_footer_does_not_change_a_read() {
+    let remote = Arc::new(MemoryRemote::default());
+    let data = written(&remote).await;
+    for pack in keys(&remote, "packs/").await {
+        flip(&remote, &pack, |len| len - 9).await;
+    }
+
+    let reader = proxy(&remote, 2).await;
+
+    assert_eq!(get(&reader.engine, "a").await.unwrap(), data);
+}
+
+#[tokio::test]
+async fn test_changed_byte_in_a_manifest_fails_the_read() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    for manifest in keys(&remote, "manifests/").await {
+        flip(&remote, &manifest, |len| len - 1).await;
+    }
+
+    let reader = proxy(&remote, 2).await;
+
+    let error = get(&reader.engine, "a").await.unwrap_err();
+    assert!(error.to_string().contains("does not open"), "{error}");
+    assert!(error.to_string().contains("manifest "), "{error}");
+}
+
+#[tokio::test]
+async fn test_changed_byte_in_journal_actions_breaks_that_chain_and_stops_the_gc() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    let entry = keys(&remote, "log/").await.remove(0);
+    // The last 64 bytes are the signature: the byte before them is in the sealed actions.
+    flip(&remote, &entry, |len| len - 65).await;
+
+    let reader = proxy(&remote, 2).await;
+    let report = reader.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken.len(), 1);
+    let error = reader.engine.gc().await.unwrap_err();
+    assert!(matches!(error, EngineError::BrokenChains(_)));
+}
+
+#[tokio::test]
+async fn test_manifest_moved_to_another_key_does_not_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    let manifests = keys(&remote, "manifests/").await;
+    let first = remote.get(&manifests[0]).await.unwrap().unwrap();
+    remote.put(&manifests[1], first).await.unwrap();
+
+    let reader = proxy(&remote, 2).await;
+    let results = [
+        get(&reader.engine, "a").await,
+        get(&reader.engine, "b").await,
+    ];
+
+    assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+    for error in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert!(error.to_string().contains("does not open"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn test_pack_moved_to_another_key_does_not_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    let packs = keys(&remote, "packs/").await;
+    let first = remote.get(&packs[0]).await.unwrap().unwrap();
+    remote.put(&packs[1], first).await.unwrap();
+
+    let reader = proxy(&remote, 2).await;
+    let results = [
+        get(&reader.engine, "a").await,
+        get(&reader.engine, "b").await,
+    ];
+
+    assert!(results.iter().any(|r| r.is_err()));
+    for error in results.iter().filter_map(|r| r.as_ref().err()) {
+        assert!(error.to_string().contains("does not open"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn test_journal_entry_moved_to_another_seq_breaks_the_chain() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    let entries = keys(&remote, "log/").await;
+    let first = remote.get(&entries[0]).await.unwrap().unwrap();
+    remote.put(&entries[1], first).await.unwrap();
+
+    let reader = proxy(&remote, 2).await;
+
+    assert_eq!(reader.engine.sync().await.unwrap().broken.len(), 1);
+}
+
+#[tokio::test]
+async fn test_key_check_moved_or_changed_refuses_the_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    flip(&remote, "repo/key-check", |len| len - 1).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a changed key check opens");
+    };
+    assert!(matches!(error, EngineError::WrongRepoKey(_)));
+}
+
+#[test]
+fn test_repo_key_of_the_wrong_length_or_not_hex_is_refused() {
+    let good = "07".repeat(32);
+    for bad in [
+        &good[..63],
+        &good[..62],
+        &format!("{good}00"),
+        &"zz".repeat(32),
+        "",
+    ] {
+        assert!(RepoKey::from_hex(bad).is_err(), "{bad:?} is accepted");
+    }
+}
+
+#[tokio::test]
+async fn test_repo_key_with_one_flipped_bit_is_refused_at_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        RepoKey::from_hex(&format!("06{}", "07".repeat(31)))
+            .unwrap()
+            .keys(),
+        Config::default(),
+    )
+    .await;
+
+    assert!(matches!(result, Err(EngineError::WrongRepoKey(_))));
+}
+
+/// A store that answers a ranged read with fewer bytes than it asked.
+struct ShortRanges(MemoryRemote);
+
+#[async_trait::async_trait]
+impl Remote for ShortRanges {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), remote::RemoteError> {
+        self.0.put(key, data).await
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), remote::RemoteError> {
+        self.0.create(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, remote::RemoteError> {
+        self.0.get(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Bytes>, remote::RemoteError> {
+        let read = self.0.get_range(key, range).await?;
+        Ok(read.map(|bytes| bytes.slice(..bytes.len() / 2)))
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, remote::RemoteError> {
+        self.0.list(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn test_short_ranged_read_from_the_remote_fails_the_read() {
+    let memory = Arc::new(MemoryRemote::default());
+    written(&memory).await;
+    let short = Arc::new(ShortRanges(MemoryRemote::default()));
+    for key in memory.list("").await.unwrap() {
+        let bytes = memory.get(&key).await.unwrap().unwrap();
+        short.0.put(&key, bytes).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let reader = Engine::open(
+        dir.path(),
+        short,
+        SigningKey::from_bytes(&[2; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+
+    let result = reader.get(BUCKET, "a", None).await;
+
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+}

@@ -295,16 +295,29 @@ impl<R: Remote + 'static> Engine<R> {
 
         let start = first.offset;
         let range = start..last.range().end;
-        let Some(bytes) = self.remote.get_range(&pack_key(pack), range).await? else {
+        let Some(bytes) = self
+            .remote
+            .get_range(&pack_key(pack), range.clone())
+            .await?
+        else {
             return Err(EngineError::Corrupt(format!("pack {pack} is missing")));
         };
+        // The remote is not trusted: a short answer must fail the read, not the process.
+        if bytes.len() as u64 != range.end - range.start {
+            return Err(EngineError::Corrupt(format!(
+                "pack {pack}: the remote returned {} bytes for {range:?}",
+                bytes.len()
+            )));
+        }
 
         entries
             .iter()
             .map(|entry| {
                 let offset = (entry.offset - start) as usize;
                 let stored = &bytes[offset..offset + entry.stored_len as usize];
-                Ok(pack::read_chunk(&self.keys, entry, stored)?)
+                pack::read_chunk(&self.keys, entry, stored).map_err(|e| {
+                    EngineError::Corrupt(format!("pack {pack}, chunk {}: {e}", entry.chunk_id))
+                })
             })
             .collect()
     }

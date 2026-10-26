@@ -1326,3 +1326,23 @@ async fn test_complete_after_a_plain_put_on_the_same_key_wins() {
         "from the upload"
     );
 }
+
+/// 10 000 copies of one attribute name: a quadratic duplicate check would take far longer.
+#[tokio::test]
+async fn test_xml_with_many_duplicate_attributes_answers_quickly() {
+    let server = with_bucket().await;
+    let attributes = " a=\"1\"".repeat(10_000);
+    let padding = " ".repeat((4 << 20) - attributes.len() - 64);
+    let body = format!("<Delete{attributes}{padding}></Delete>");
+    assert!(body.len() <= 4 << 20);
+
+    let started = std::time::Instant::now();
+    let reply = run(&server, call("POST", "/bkt?delete").body(body)).await;
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+}

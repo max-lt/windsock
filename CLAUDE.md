@@ -184,7 +184,7 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | Daemon errors                | `anyhow` (only in `windsockd`)                                                        |
 | Configuration                | `toml` 0.8                                                                            |
 | Log output                   | `tracing-subscriber` with `env-filter`                                                |
-| XML                          | `quick-xml` with `serialize`                                                          |
+| XML                          | `quick-xml` 0.41 with `serialize`                                                     |
 | SigV4                        | `hmac`, `sha2`, `subtle`                                                              |
 | URL form encoding            | `form_urlencoded`                                                                     |
 | fd limit                     | `rustix` (`process`)                                                                  |

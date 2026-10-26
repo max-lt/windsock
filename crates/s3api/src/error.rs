@@ -6,6 +6,9 @@ use axum::response::IntoResponse;
 use engine::EngineError;
 use tracing::warn;
 
+/// Seconds a client waits before it sends a write again after a 503.
+pub const RETRY_AFTER_SECS: u64 = 5;
+
 /// An S3 error: the code clients match on, the HTTP status, and a message.
 #[derive(Debug, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -110,10 +113,15 @@ impl From<EngineError> for S3Error {
 impl IntoResponse for S3Error {
     fn into_response(self) -> axum::response::Response {
         let body = crate::xml::error(self.code, &self.message);
-
-        Response::builder()
+        let mut response = Response::builder()
             .status(self.status)
-            .header("content-type", "application/xml")
+            .header("content-type", "application/xml");
+        // A 503 clears by itself: a full buffer uploads, a stopping proxy hands over to another.
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            response = response.header("retry-after", RETRY_AFTER_SECS);
+        }
+
+        response
             .body(Body::from(body))
             .expect("static headers are valid")
     }

@@ -5,7 +5,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::{Daemon, Reply, call, chains, cluster_config, count, start, test_keys};
+use common::{Daemon, Reply, call, chains, cluster_config, count, spawn, start, test_keys};
 use hyper::StatusCode;
 use tempfile::TempDir;
 
@@ -471,7 +471,11 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
     chmod_dirs(&cluster.remote(), 0o500);
     a.terminate();
     let failed = a.wait_for("final flush failed", Duration::from_secs(30));
-    let running = a.wait_exit(Duration::from_secs(6)).is_none();
+    let read = get(&a, "/shared/kept").await;
+    let head = call(&a, &test_keys(), "HEAD", "/shared/kept", b"").await;
+    let write = put(&a, "/shared/late", b"after the signal").await;
+    let warnings = a.count_after("final flush failed", Duration::from_secs(12));
+    let running = a.wait_exit(Duration::from_secs(1)).is_none();
     chmod_dirs(&cluster.remote(), 0o700);
 
     assert!(
@@ -479,6 +483,17 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
         "the final flush meets the read-only remote"
     );
     assert!(running, "the daemon waits for the remote");
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body, data, "reads go on during the drain");
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(write.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(write.headers["retry-after"], "5");
+    assert!(
+        write.text().contains("<Code>ServiceUnavailable</Code>"),
+        "{}",
+        write.text()
+    );
+    assert_eq!(warnings, 1, "one warning a minute, not one per retry");
     assert!(
         a.wait_for("buffer flushed: stopped", Duration::from_secs(60))
             .is_some()
@@ -486,5 +501,70 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
     assert_eq!(a.wait_exit(Duration::from_secs(10)), Some(true));
     let b = start(&cluster.config("b", 100, false), "info");
     eventually(&b, "/shared/kept", &data, Duration::from_secs(30)).await;
+    assert!(b.stop());
+}
+
+/// A second signal stops the daemon at once, also when the first was SIGINT. The buffer stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_second_signal_stops_at_once_and_keeps_the_buffer() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    let config = cluster.config("a", 600_000, false);
+    let mut a = start(&config, "info");
+    assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
+    assert_eq!(
+        put(&a, "/shared/kept", b"buffered").await.status,
+        StatusCode::OK
+    );
+
+    chmod_dirs(&cluster.remote(), 0o500);
+    a.signal("INT");
+    assert!(a.wait_for("draining", Duration::from_secs(10)).is_some());
+    a.signal("TERM");
+    let status = a.wait_exit(Duration::from_secs(5));
+    chmod_dirs(&cluster.remote(), 0o700);
+
+    assert_eq!(
+        status,
+        Some(true),
+        "the second signal stops the daemon at once"
+    );
+    assert!(a.logged("second signal") || a.count_after("second signal", Duration::ZERO) == 1);
+    let a = start(&config, "info");
+    eventually(&a, "/shared/kept", b"buffered", Duration::from_secs(30)).await;
+    assert!(a.stop());
+    let b = start(&cluster.config("b", 100, false), "info");
+    eventually(&b, "/shared/kept", b"buffered", Duration::from_secs(30)).await;
+    assert!(b.stop());
+}
+
+/// A signal during the replay at start stops the daemon and loses no buffered write.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_signal_during_the_start_replay_keeps_the_buffer() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    // The default horizon: a 3 s one is shorter than this flush, which then never commits.
+    let config = cluster.config_with("a", 600_000, "");
+    let data = random_bytes(9, 30 * 1024 * 1024);
+    let a = start(&config, "info");
+    assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
+    assert_eq!(put(&a, "/shared/kept", &data).await.status, StatusCode::OK);
+    a.crash();
+
+    let mut a = spawn(&config, "info");
+    assert!(
+        a.wait_for("storage contract", Duration::from_secs(30))
+            .is_some()
+    );
+    a.terminate();
+    let status = a.wait_exit(Duration::from_secs(30));
+
+    assert!(status.is_some(), "the daemon stops");
+    assert_eq!(a.count_after("panicked", Duration::ZERO), 0);
+    let a = start(&config, "info");
+    assert!(a.logged("replayed buffered writes"));
+    assert!(a.stop());
+    let b = start(&cluster.config_with("b", 100, ""), "info");
+    eventually(&b, "/shared/kept", &data, Duration::from_secs(60)).await;
     assert!(b.stop());
 }

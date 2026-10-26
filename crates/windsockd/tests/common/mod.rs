@@ -33,6 +33,21 @@ pub struct Daemon {
 
 /// Starts `windsockd run` and waits for its listening address in the log.
 pub fn start(config: &Path, log: &str) -> Daemon {
+    listening(spawn(config, log))
+}
+
+/// Waits for the listening address of `daemon` in its log.
+fn listening(mut daemon: Daemon) -> Daemon {
+    let line = daemon
+        .wait_for("address=", Duration::from_secs(30))
+        .expect("the daemon logs its address");
+    let at = line.find("address=").unwrap() + "address=".len();
+    daemon.address = line[at..].split_whitespace().next().unwrap().to_string();
+    daemon
+}
+
+/// Starts `windsockd run` and does not wait for it to listen.
+pub fn spawn(config: &Path, log: &str) -> Daemon {
     let mut command = Command::new(BIN);
     command.arg("run").arg(config);
     attach(command, log)
@@ -46,7 +61,7 @@ pub fn start_with_fd_limit(config: &Path, log: &str, fds: u64) -> Daemon {
         .arg(format!("ulimit -n {fds} && exec \"$0\" run \"$1\""))
         .arg(BIN)
         .arg(config);
-    attach(command, log)
+    listening(attach(command, log))
 }
 
 fn attach(mut command: Command, log: &str) -> Daemon {
@@ -66,18 +81,12 @@ fn attach(mut command: Command, log: &str) -> Daemon {
         }
     });
 
-    let mut daemon = Daemon {
+    Daemon {
         child,
         address: String::new(),
         lines,
         seen: Vec::new(),
-    };
-    let line = daemon
-        .wait_for("address=", Duration::from_secs(30))
-        .expect("the daemon logs its address");
-    let at = line.find("address=").unwrap() + "address=".len();
-    daemon.address = line[at..].split_whitespace().next().unwrap().to_string();
-    daemon
+    }
 }
 
 impl Daemon {
@@ -117,14 +126,28 @@ impl Daemon {
 
     /// SIGTERM, and no wait.
     pub fn terminate(&self) {
+        self.signal("TERM");
+    }
+
+    /// Sends the signal `name` (`TERM`, `INT`), and does not wait.
+    pub fn signal(&self, name: &str) {
         let pid = self.child.id().to_string();
         assert!(
             Command::new("kill")
-                .args(["-TERM", &pid])
+                .args([&format!("-{name}"), &pid])
                 .status()
                 .unwrap()
                 .success()
         );
+    }
+
+    /// Reads the log for `time`, then counts the lines read so far that contain `needle`.
+    pub fn count_after(&mut self, needle: &str, time: Duration) -> usize {
+        self.wait_for("\0 no line has this", time);
+        self.seen
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
     }
 
     /// The exit status, or `None` while the daemon still runs after `limit`.

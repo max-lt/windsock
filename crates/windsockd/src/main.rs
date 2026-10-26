@@ -8,11 +8,12 @@
 mod config;
 mod listener;
 
+use std::future::IntoFuture;
 use std::io::IsTerminal;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::SigningKey;
@@ -20,6 +21,7 @@ use engine::{Engine, RepoKey};
 use remote::{DirRemote, Startup, Sweep, Verdict};
 use s3remote::{Retry, S3Config, S3Remote};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -36,6 +38,8 @@ const REPO_KEY_FILE: &str = "repo.key";
 
 /// Pause between two final flushes while the remote fails.
 const SHUTDOWN_RETRY: Duration = Duration::from_secs(5);
+/// At most one warning in this time while the final flush fails.
+const SHUTDOWN_WARN_EVERY: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -334,50 +338,65 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         upload: Duration::from_secs(config.request_timeout_secs),
     };
     let listener = LimitedListener::new(listener, max_connections, timeouts);
-    axum::serve(
+    let draining = Arc::new(Notify::new());
+    let server = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<ConnectionActivity>(),
     )
-    .with_graceful_shutdown(drain_on_signal(engine.clone()))
-    .await?;
+    .with_graceful_shutdown(drain_then_flush(engine.clone(), draining.clone()))
+    .into_future();
+    let second_signal = async {
+        draining.notified().await;
+        shutdown_signal().await;
+    };
+
+    tokio::select! {
+        result = server => {
+            result?;
+            info!("buffer flushed: stopped");
+        }
+        () = second_signal => {
+            let bytes = engine.buffered_bytes().await;
+            warn!(bytes, "second signal: stopped before the remote has the buffer; it flushes at the next start");
+        }
+    }
 
     // A flush cut by the abort is safe: its intent file finishes it at the next flush.
     for task in background {
         task.abort();
     }
 
-    tokio::select! {
-        () = flush_until_empty(&engine) => info!("buffer flushed: stopped"),
-        () = shutdown_signal() => {
-            let bytes = engine.buffered_bytes().await;
-            warn!(bytes, "second signal: stopped before the remote has the buffer; it flushes at the next start");
-        }
-    }
-
     Ok(())
 }
 
-/// Refuses new writes at the first signal, so the final flush empties the buffer.
-async fn drain_on_signal<R: Sweep + 'static>(engine: Arc<Engine<R>>) {
+/// At the first signal, refuses new writes and flushes the buffer. The server keeps serving
+/// reads, and 503 for writes, until the remote has every buffered write.
+async fn drain_then_flush<R: Sweep + 'static>(engine: Arc<Engine<R>>, draining: Arc<Notify>) {
     shutdown_signal().await;
     engine.drain();
+    draining.notify_one();
     let bytes = engine.buffered_bytes().await;
     info!(
         bytes,
         "draining: new writes get 503, the buffer goes to the remote; a second signal stops at once"
     );
+    flush_until_empty(&engine).await;
 }
 
 /// Flushes until the remote has every buffered write. A failed flush waits, then tries again.
 async fn flush_until_empty<R: Sweep + 'static>(engine: &Engine<R>) {
+    let mut warned: Option<Instant> = None;
+
     loop {
         match engine.flush().await {
             Ok(()) if engine.buffered_bytes().await == 0 => return,
             Ok(()) => {}
-            Err(e) => {
+            Err(e) if warned.is_none_or(|at| at.elapsed() >= SHUTDOWN_WARN_EVERY) => {
+                warned = Some(Instant::now());
                 let bytes = engine.buffered_bytes().await;
                 warn!(%e, bytes, "final flush failed: trying again");
             }
+            Err(_) => {}
         }
         tokio::time::sleep(SHUTDOWN_RETRY).await;
     }

@@ -393,6 +393,8 @@ async fn test_remote_holds_no_bucket_key_or_data_in_clear() {
         .await
         .unwrap();
     a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+    assert!(!remote.list("snapshots/").await.unwrap().is_empty());
 
     for key in remote.list("").await.unwrap() {
         let stored = remote.get(&key).await.unwrap().unwrap();

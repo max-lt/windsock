@@ -155,6 +155,26 @@ async fn test_new_proxy_starts_from_the_snapshot() {
     );
 }
 
+/// A proxy with another repository key cannot open the snapshot, so it does not load it.
+#[tokio::test]
+async fn test_proxy_with_another_key_does_not_load_the_snapshot() {
+    let remote = Arc::new(TestRemote::default());
+    history(&remote).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        engine::RepoKey::from_hex(&"08".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(engine.versions(BUCKET, "x").unwrap().is_none());
+}
+
 #[tokio::test]
 async fn test_lagging_reader_loads_the_snapshot_at_a_redacted_entry() {
     let remote = Arc::new(TestRemote::default());

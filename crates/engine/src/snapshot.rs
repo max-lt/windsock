@@ -31,10 +31,15 @@ impl<R: Remote + 'static> Engine<R> {
     pub async fn snapshot(&self) -> Result<String> {
         self.sync().await?;
 
-        let bytes = self.index().snapshot()?.encode();
-        let hash = blake3::hash(&bytes);
-        let key = format!("{SNAPSHOTS_PREFIX}{:020}-{hash}", buffer::unix_nanos());
-        self.remote.put(&key, Bytes::from(bytes)).await?;
+        let plain = self.index().snapshot()?.encode();
+        let time = buffer::unix_nanos();
+        let sealed = self
+            .keys
+            .sealer()
+            .seal(seal::Kind::Snapshot, &time.to_le_bytes(), &plain);
+        let hash = blake3::hash(&sealed);
+        let key = format!("{SNAPSHOTS_PREFIX}{time:020}-{hash}");
+        self.remote.put(&key, Bytes::from(sealed)).await?;
 
         info!(key, "wrote a snapshot");
         Ok(key)
@@ -53,14 +58,30 @@ impl<R: Remote + 'static> Engine<R> {
     /// The newest snapshot that reads back intact.
     pub(crate) async fn latest_snapshot(&self) -> Result<Option<Snapshot>> {
         for key in self.remote.list(SNAPSHOTS_PREFIX).await?.iter().rev() {
-            let Some((_, hash)) = parse_key(key) else {
+            let Some((time, hash)) = parse_key(key) else {
                 continue;
             };
-            let Some(bytes) = self.remote.get(key).await? else {
+            let Some(sealed) = self.remote.get(key).await? else {
                 continue;
             };
+            if blake3::hash(&sealed).as_bytes() != &hash {
+                warn!(key, "skipped a snapshot that does not match its key");
+                continue;
+            }
+            let plain =
+                match self
+                    .keys
+                    .sealer()
+                    .open(seal::Kind::Snapshot, &time.to_le_bytes(), &sealed)
+                {
+                    Ok(plain) => plain,
+                    Err(e) => {
+                        warn!(key, %e, "skipped a snapshot that does not open");
+                        continue;
+                    }
+                };
 
-            match Snapshot::decode(&hash, &bytes) {
+            match Snapshot::decode(blake3::hash(&plain).as_bytes(), &plain) {
                 Ok(snapshot) => return Ok(Some(snapshot)),
                 Err(e) => warn!(key, %e, "skipped a bad snapshot"),
             }

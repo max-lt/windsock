@@ -22,15 +22,16 @@ Windsock does not use a conditional overwrite (`If-Match`). Thus a store does no
 
 ## Stores
 
-| Store                            | Result                                                                       | Source                       |
-| -------------------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
-| Local directory (`DirRemote`)    | Keeps the contract                                                           | Windsock tests               |
-| Windsock S3 server (`windsockd`) | Keeps the contract                                                           | Windsock tests               |
-| SeaweedFS 4.48                   | Keeps the contract                                                           | Windsock test on 2026-10-07  |
-| Garage 2.4.1                     | Does not keep it: it ignores `If-None-Match: *` and overwrites               | Windsock test on 2026-10-07  |
-| Amazon S3, Cloudflare R2         | Not tested by Windsock. Their documentation describes `If-None-Match` on PUT | Provider documentation       |
-| Backblaze B2                     | Not tested. Its S3 API does not document `If-None-Match` on PUT              | Provider documentation       |
-| MinIO community edition          | Not tested. The project is archived, and its downloads answer 410 Gone       | Windsock check on 2026-10-07 |
+| Store                            | Result                                                                     | Source                       |
+| -------------------------------- | -------------------------------------------------------------------------- | ---------------------------- |
+| Local directory (`DirRemote`)    | Keeps the contract                                                         | Windsock tests               |
+| Windsock S3 server (`windsockd`) | Keeps the contract                                                         | Windsock tests               |
+| SeaweedFS 4.48                   | Keeps the contract                                                         | Windsock test on 2026-10-07  |
+| Garage 2.4.1                     | Does not keep it: it ignores `If-None-Match: *` and overwrites             | Windsock test on 2026-10-07  |
+| Cloudflare R2                    | Keeps the contract. See [Cloudflare R2](#cloudflare-r2)                    | Windsock test on 2026-10-26  |
+| Amazon S3                        | Not tested by Windsock. Its documentation describes `If-None-Match` on PUT | Provider documentation       |
+| Backblaze B2                     | Not tested. Its S3 API does not document `If-None-Match` on PUT            | Provider documentation       |
+| MinIO community edition          | Not tested. The project is archived, and its downloads answer 410 Gone     | Windsock check on 2026-10-07 |
 
 Windsock speaks the S3 dialect only.
 
@@ -70,6 +71,31 @@ stays under `probe/`. Windsock never reads it. Do not put other data under `prob
 key prefix of a Windsock remote.
 
 Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
+
+## Cloudflare R2
+
+Test on 2026-10-26 with a release build, feature `tls`, from a Mac on a home link.
+
+- R2 refuses a PUT with no `Content-Length` with 411 `MissingContentLength`. The node marker
+  `nodes/<id>` is an empty object, and hyper sends no length for an empty body. Windsock sets
+  `Content-Length` on every request.
+- The storage test passes. A proxy with no state reads back every object that another proxy
+  wrote, with multipart objects and ranged reads.
+
+Latency, 64 KiB objects, 10 samples:
+
+| Step                                          | p50    | Min    | Max      |
+| --------------------------------------------- | ------ | ------ | -------- |
+| PUT acknowledged until its log entry is in R2 | 704 ms | 439 ms | 2 962 ms |
+| GET of a chunk not in the cache               | 150 ms | 129 ms | 266 ms   |
+| GET of a chunk in the cache                   | 3 ms   | 2 ms   | 3 ms     |
+
+Shutdown, 20 objects of 1 MiB:
+
+- SIGTERM right after the puts: the drain takes 3.9 s. During the drain, a PUT gets 503 with
+  `Retry-After: 5`, and a GET gets 200. A proxy with no state then reads the 20 objects.
+- A second SIGTERM 0.5 s after the first stops the daemon with 20 MiB in the buffer. The next
+  start replays and uploads them. A proxy with no state then reads the 20 objects.
 
 ## Versioned buckets
 

@@ -693,3 +693,100 @@ async fn test_empty_credentials_are_refused_at_start() {
         assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 }
+
+/// A Windsock S3 server that waits `delay` before each answer, and counts the calls it serves at once.
+async fn slow_server(delay: Duration) -> (Server, Arc<AtomicU32>) {
+    let base = server().await;
+    let busy = Arc::new(AtomicU32::new(0));
+    let peak = Arc::new(AtomicU32::new(0));
+    let (now, most) = (busy.clone(), peak.clone());
+    let proxy = Router::new().fallback(move |request: Request| {
+        let (now, most) = (now.clone(), most.clone());
+        let target = base.endpoint.clone();
+        async move {
+            let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(n, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            let reply = forward(&target, request).await;
+            now.fetch_sub(1, Ordering::SeqCst);
+            reply
+        }
+    });
+    let endpoint = serve(proxy).await;
+    (
+        Server {
+            _dir: base._dir,
+            endpoint,
+        },
+        peak,
+    )
+}
+
+/// Sends `request` on to `target` and returns its answer.
+async fn forward(target: &str, request: Request) -> Response<Body> {
+    use http_body_util::BodyExt;
+
+    let (mut parts, body) = request.into_parts();
+    let body = body.collect().await.unwrap().to_bytes();
+    let path = parts.uri.path_and_query().unwrap().as_str().to_string();
+    parts.uri = format!("{target}{path}").parse().unwrap();
+    let request = hyper::Request::from_parts(parts, http_body_util::Full::new(body));
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http();
+    let reply = client.request(request).await.unwrap();
+    let (parts, body) = reply.into_parts();
+    Response::from_parts(parts, Body::new(body))
+}
+
+/// With 65 slow reads in flight, a put is acknowledged from the buffer, and the 65th read waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_slow_remote_with_a_full_cap_still_acknowledges_puts() {
+    let (slow, peak) = slow_server(Duration::from_millis(200)).await;
+    let remote = Arc::new(S3Remote::new(config(&slow.endpoint, "")).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2u8; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    engine.create_bucket("bkt2", None).await.unwrap();
+    peak.store(0, Ordering::SeqCst);
+
+    let start = Instant::now();
+    let reads: Vec<_> = (0..s3remote::MAX_IN_FLIGHT + 1)
+        .map(|_| {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.get("packs/none").await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let put_start = Instant::now();
+    engine
+        .put(
+            "bkt2",
+            "k",
+            Bytes::from("v"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    let put = put_start.elapsed();
+    for read in reads {
+        assert_eq!(read.await.unwrap().unwrap(), None);
+    }
+
+    assert!(put < Duration::from_millis(150), "put took {put:?}");
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "the 65th read waits for a slot"
+    );
+    assert_eq!(
+        peak.load(Ordering::SeqCst) as usize,
+        s3remote::MAX_IN_FLIGHT
+    );
+}

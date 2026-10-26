@@ -309,12 +309,13 @@ async fn test_proxy_killed_in_the_middle_of_a_flush() {
     );
 
     let b = start(&b_config, "info");
+    // The replay flush of 70 MB in a debug build takes up to 42 s when other tests run.
     for (i, data) in objects.iter().enumerate() {
         eventually(
             &a,
             &format!("/shared/big-{i}"),
             data,
-            Duration::from_secs(30),
+            Duration::from_secs(120),
         )
         .await;
     }

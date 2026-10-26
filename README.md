@@ -60,6 +60,12 @@ key pair from step 4.
 - boto3: `boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1",
 aws_access_key_id=AK, aws_secret_access_key=SK, config=Config(s3={"addressing_style": "path"}))`
 
+## Encryption
+
+Windsock encrypts all data that it writes to the remote with the key in `repo.key`. Back up that
+file: without it, nobody can read the data. `docs/encryption.md` tells how to keep the key, how to
+share it between the daemons of a cluster, and what each error means.
+
 ## Configuration
 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to

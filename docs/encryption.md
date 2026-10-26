@@ -20,6 +20,23 @@ place, away from the remote and away from its backups.
 Each proxy also has its own signing key, `node.key`. The signing key proves which proxy wrote a
 journal entry. It does not give access to the data.
 
+## For the operator
+
+- `windsockd init <dir>` writes `<dir>/repo.key`: 64 hex characters, mode 600.
+- `windsockd run` refuses `repo.key` and `node.key` when other users can read them. Run
+  `chmod 600` on the file.
+- Make a copy of `repo.key` at once. Keep the copy away from the remote and away from its backups.
+  If you lose the key, you lose the data: no tool can read the remote without it.
+- A cluster has one `repo.key`. To add a daemon, copy `repo.key` from a daemon of the cluster into
+  the directory of the new daemon, then set mode 600. Each daemon makes its own `node.key`. Do not
+  copy `node.key`.
+- A daemon with another key does not start. The error is
+  `repo.key is not the key of this remote`. Copy the key of the cluster.
+- Windsock cannot change the key of a remote. Key rotation does not exist.
+- The error `the remote has a journal and no repo/key-check: it was written without encryption`
+  means that a build before the encryption wrote this remote. This build cannot read it. Use a new
+  remote, or read the data with the old build and write it again through this build.
+
 ## What the key does
 
 blake3 `derive_key` makes two subkeys from `repo.key`:

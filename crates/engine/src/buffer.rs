@@ -599,6 +599,21 @@ impl Buffer {
             .map(|((_, k), object)| (k.as_str(), object))
     }
 
+    /// The first buffered object of `bucket` under `prefix` whose key is `from` or after it.
+    pub fn first_object_from<'a>(
+        &'a self,
+        bucket: &'a str,
+        prefix: &'a str,
+        from: &str,
+    ) -> Option<(&'a str, &'a BufferedObject)> {
+        let start = from.max(prefix);
+        self.objects
+            .range((bucket.to_string(), start.to_string())..)
+            .next()
+            .filter(|((b, k), _)| b == bucket && k.starts_with(prefix))
+            .map(|((_, k), object)| (k.as_str(), object))
+    }
+
     pub fn bucket(&self, name: &str) -> Option<&BufferedBucket> {
         self.buckets.get(name)
     }

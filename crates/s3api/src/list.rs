@@ -1,4 +1,4 @@
-//! Listing pages: delimiter roll-up, max-keys, and resume points. No I/O.
+//! Resume points of a listing, and the in-memory page model that the engine listing must match.
 
 use crate::S3Error;
 
@@ -30,6 +30,14 @@ impl After {
         }
     }
 
+    pub fn into_engine(self) -> engine::ListAfter {
+        match self {
+            Self::Key(key) => engine::ListAfter::Key(key),
+            Self::Prefix(prefix) => engine::ListAfter::Prefix(prefix),
+        }
+    }
+
+    #[cfg(test)]
     fn skips(&self, key: &str) -> bool {
         match self {
             Self::Key(after) => key <= after.as_str(),
@@ -38,6 +46,7 @@ impl After {
     }
 }
 
+#[cfg(test)]
 /// One entry of a page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -46,12 +55,14 @@ pub(crate) enum Item {
     CommonPrefix(String),
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Page {
     pub items: Vec<Item>,
     pub truncated: bool,
 }
 
+#[cfg(test)]
 impl Page {
     /// Where the next page starts.
     pub fn next(&self, keys: &[String]) -> Option<After> {
@@ -66,6 +77,7 @@ impl Page {
     }
 }
 
+#[cfg(test)]
 /// Cuts a page from `keys`, sorted and all under `prefix`. A key with `delimiter`
 /// after the prefix rolls up into one common prefix; each counts as one item.
 pub(crate) fn page(
@@ -215,5 +227,128 @@ mod tests {
         assert!(After::from_token("x00").is_err());
         assert!(After::from_token("kzz").is_err());
         assert!(After::from_token("").is_err());
+    }
+
+    /// A small xorshift: the same keys and queries on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+
+        fn key(&mut self) -> String {
+            const PARTS: [&str; 6] = ["a", "b", "/", "c", "\u{e9}", "b/"];
+            (0..1 + self.below(6))
+                .map(|_| PARTS[self.below(PARTS.len())])
+                .collect()
+        }
+    }
+
+    /// The engine page, in the shape of the model page.
+    fn engine_names(page: &engine::ListPage) -> Vec<String> {
+        page.entries
+            .iter()
+            .map(|entry| match entry {
+                engine::ListEntry::Object(info) => info.key.clone(),
+                engine::ListEntry::CommonPrefix(p) => format!("{p}*"),
+            })
+            .collect()
+    }
+
+    /// The engine listing matches the in-memory model on random keys, in the buffer and in the
+    /// index, with deletes, prefixes, delimiters, start points and page sizes.
+    #[tokio::test]
+    async fn test_engine_pages_match_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine::Engine::open(
+            dir.path(),
+            std::sync::Arc::new(remote::MemoryRemote::default()),
+            ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+            engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            engine::Config::default(),
+        )
+        .await
+        .unwrap();
+        engine.create_bucket("bkt", None).await.unwrap();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut live = std::collections::BTreeSet::new();
+
+        for round in 0..3 {
+            for _ in 0..150 {
+                let key = rng.key();
+                let put = engine.put(
+                    "bkt",
+                    &key,
+                    bytes::Bytes::from(key.clone()),
+                    Default::default(),
+                    engine::WriteMode::Overwrite,
+                );
+                put.await.unwrap();
+                live.insert(key);
+            }
+            for _ in 0..40 {
+                let key = rng.key();
+                if live.remove(&key) {
+                    engine.delete("bkt", &key).await.unwrap();
+                }
+            }
+            if round < 2 {
+                engine.flush().await.unwrap();
+            }
+        }
+        let keys: Vec<String> = live.into_iter().collect();
+
+        for _ in 0..400 {
+            let prefix = match rng.below(3) {
+                0 => String::new(),
+                _ => {
+                    let key = &keys[rng.below(keys.len())];
+                    let cut = key
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .nth(rng.below(3))
+                        .unwrap_or(0);
+                    key[..cut].to_string()
+                }
+            };
+            let delimiter = [None, Some("/"), Some("b"), Some("b/")][rng.below(4)];
+            let max_keys = [1, 2, 3, 7, 50, 1000][rng.below(6)];
+            let after = match rng.below(4) {
+                0 => Some(After::Key(rng.key())),
+                1 => Some(After::Prefix(rng.key())),
+                _ => None,
+            };
+            let under: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            let mut want_after = after.clone();
+            let mut got_after = after;
+
+            loop {
+                let want = page(&under, &prefix, delimiter, max_keys, want_after.as_ref());
+                let query = engine::ListQuery {
+                    prefix: &prefix,
+                    delimiter,
+                    after: got_after.clone().map(After::into_engine),
+                    max_keys,
+                };
+                let got = engine.list_page("bkt", &query).await.unwrap();
+                let context = format!("{prefix:?} {delimiter:?} {max_keys} {got_after:?}");
+
+                assert_eq!(engine_names(&got), names(&under, &want), "{context}");
+                assert_eq!(got.truncated, want.truncated, "{context}");
+                let Some(next) = want.next(&under) else {
+                    break;
+                };
+                got_after = Some(After::from_token(&next.token()).unwrap());
+                want_after = Some(next);
+            }
+        }
     }
 }

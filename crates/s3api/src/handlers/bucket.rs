@@ -1,7 +1,9 @@
 //! Service and bucket operations, and listings.
 
 use super::*;
-use crate::list::{After, Item, page};
+use engine::ListEntry;
+
+use crate::list::After;
 
 pub(crate) async fn list_buckets<R: Remote + 'static>(State(state): State<AppState<R>>) -> Reply {
     xml_reply(xml::list_buckets(&state.engine.list_buckets().await?))
@@ -107,16 +109,18 @@ async fn list_objects<R: Remote + 'static>(
         (false, _) => Some(After::Key(marker.clone())),
     };
 
-    let objects = state.engine.list(bucket, &prefix).await?;
-    let keys: Vec<String> = objects.iter().map(|o| o.key.clone()).collect();
-    let page = page(
-        &keys,
-        &prefix,
-        delimiter.as_deref(),
+    let query = engine::ListQuery {
+        prefix: &prefix,
+        delimiter: delimiter.as_deref(),
+        after: after.map(After::into_engine),
         max_keys,
-        after.as_ref(),
-    );
-    let next = page.next(&keys);
+    };
+    let page = state.engine.list_page(bucket, &query).await?;
+    let next = match (page.truncated, page.entries.last()) {
+        (true, Some(ListEntry::Object(info))) => Some(After::Key(info.key.clone())),
+        (true, Some(ListEntry::CommonPrefix(common))) => Some(After::Prefix(common.clone())),
+        _ => None,
+    };
 
     let encode = |text: &str| match encoding_type {
         Some(_) => form_urlencoded::byte_serialize(text.as_bytes()).collect(),
@@ -132,15 +136,15 @@ async fn list_objects<R: Remote + 'static>(
         objects: Vec::new(),
         common_prefixes: Vec::new(),
     };
-    for item in &page.items {
-        match item {
-            Item::Object(i) => listed.objects.push(ListedObject {
-                key: encode(&objects[*i].key),
-                size: objects[*i].size,
-                etag: etag(&objects[*i]),
-                last_modified: objects[*i].last_modified,
+    for entry in &page.entries {
+        match entry {
+            ListEntry::Object(info) => listed.objects.push(ListedObject {
+                key: encode(&info.key),
+                size: info.size,
+                etag: etag(info),
+                last_modified: info.last_modified,
             }),
-            Item::CommonPrefix(common) => listed.common_prefixes.push(encode(common)),
+            ListEntry::CommonPrefix(common) => listed.common_prefixes.push(encode(common)),
         }
     }
 

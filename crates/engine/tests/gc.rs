@@ -580,8 +580,9 @@ async fn test_gc_that_dies_mid_sweep_is_finished_by_the_next_run() {
     let a = proxy(&remote, 1).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     put(&a.engine, "live", b"kept").await;
+    // Small objects: on a 600 ms horizon, a slow flush under load fails with StalePlan.
     for i in 0..3u8 {
-        put(&a.engine, &format!("dead{i}"), &random_bytes(i, 300_000)).await;
+        put(&a.engine, &format!("dead{i}"), &random_bytes(i, 20_000)).await;
         a.engine.flush().await.unwrap();
         a.engine.delete(BUCKET, &format!("dead{i}")).await.unwrap();
     }

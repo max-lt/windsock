@@ -415,6 +415,29 @@ impl Index {
         Ok(out)
     }
 
+    /// The first object of `bucket` under `prefix` whose key is `from` or after it.
+    pub fn first_from(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        from: &str,
+    ) -> Result<Option<(String, ObjectState)>> {
+        let scan = object_key(bucket, prefix);
+        let start = object_key(bucket, from).max(scan.clone());
+        let skip = 1 + bucket.len();
+
+        let Some(guard) = self.objects.range(start..).next() else {
+            return Ok(None);
+        };
+        let (key, value) = guard.into_inner()?;
+        if !key.starts_with(&scan) {
+            return Ok(None);
+        }
+
+        let name = String::from_utf8_lossy(&key[skip..]).into_owned();
+        Ok(Some((name, postcard::from_bytes(&value)?)))
+    }
+
     pub fn bucket(&self, name: &str) -> Result<Option<BucketState>> {
         Ok(match self.buckets.get(name.as_bytes())? {
             Some(value) => Some(postcard::from_bytes(&value)?),

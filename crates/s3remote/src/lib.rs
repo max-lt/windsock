@@ -261,8 +261,10 @@ impl S3Remote {
         for (name, value) in &headers {
             request = request.header(name.as_str(), value.as_str());
         }
+        // hyper sends no length for an empty body, and R2 refuses such a PUT with 411.
         request
             .header("authorization", authorization)
+            .header("content-length", call.body.len())
             .body(Full::new(call.body.clone()))
             .expect("a signed request is valid")
     }

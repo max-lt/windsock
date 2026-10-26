@@ -405,3 +405,20 @@ async fn test_connection_closed_during_the_request_body_fails() {
     let body = Bytes::from(vec![7u8; 4 << 20]);
     assert!(remote.put("packs/p", body).await.is_err());
 }
+
+/// R2 answers 411 to a PUT with no Content-Length, and the node marker is an empty object.
+#[tokio::test]
+async fn test_empty_put_sends_a_content_length() {
+    let app = Router::new().fallback(|request: Request| async move {
+        match request.headers().get("content-length") {
+            Some(_) => respond(StatusCode::OK, ""),
+            None => respond(
+                StatusCode::LENGTH_REQUIRED,
+                "<Error><Code>MissingContentLength</Code><Message>no length</Message></Error>",
+            ),
+        }
+    });
+    let remote = S3Remote::new(config(&serve(app).await, "")).unwrap();
+
+    remote.put("nodes/a", Bytes::new()).await.unwrap();
+}

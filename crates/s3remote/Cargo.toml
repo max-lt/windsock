@@ -16,7 +16,7 @@ hyper-rustls = { workspace = true, optional = true }
 quick-xml.workspace = true
 rustls = { workspace = true, optional = true }
 serde.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 # The TLS server of the tests. hyper-rustls depends on it already: no extra build.
 tokio-rustls = { workspace = true, optional = true }

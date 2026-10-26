@@ -12,6 +12,7 @@ mod xml;
 
 use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -101,6 +102,20 @@ type Connector = hyper_rustls::HttpsConnector<HttpConnector>;
 #[cfg(not(feature = "tls"))]
 type Connector = HttpConnector;
 
+/// The error and every cause under it: hyper shows "client error (Connect)" and hides the TLS reason.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text = format!("{text}: {next}");
+        cause = next.source();
+    }
+    text
+}
+
+/// Calls to the remote at one time, and idle connections kept for reuse.
+pub const MAX_IN_FLIGHT: usize = 64;
+
 fn invalid(message: &str) -> RemoteError {
     RemoteError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -158,6 +173,8 @@ fn connector(ca_pem: Option<&[u8]>) -> Result<Connector, RemoteError> {
 
 pub struct S3Remote {
     client: Client<Connector, Full<Bytes>>,
+    /// Caps the open connections: a burst of reads waits here, not in the socket table.
+    in_flight: Semaphore,
     /// `http` or `https`.
     scheme: &'static str,
     /// `host[:port]`, for the `host` header.
@@ -188,10 +205,17 @@ impl S3Remote {
         if !config.prefix.is_empty() && !config.prefix.ends_with('/') {
             return Err(invalid("the key prefix must be empty or end with '/'"));
         }
+        if config.access_key.trim().is_empty() || config.secret_key.trim().is_empty() {
+            return Err(invalid(
+                "the access key and the secret key of the remote must not be empty",
+            ));
+        }
 
-        let client =
-            Client::builder(TokioExecutor::new()).build(connector(config.ca_pem.as_deref())?);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_max_idle_per_host(MAX_IN_FLIGHT)
+            .build(connector(config.ca_pem.as_deref())?);
         Ok(Self {
+            in_flight: Semaphore::new(MAX_IN_FLIGHT),
             client,
             scheme,
             authority,
@@ -276,11 +300,16 @@ impl S3Remote {
 
         policy
             .run(|| async {
+                let _slot = self
+                    .in_flight
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed");
                 let response = self
                     .client
                     .request(self.signed(&call))
                     .await
-                    .map_err(|e| RemoteError::Io(std::io::Error::other(e)))?;
+                    .map_err(|e| RemoteError::Io(std::io::Error::other(with_causes(&e))))?;
                 let status = response.status();
                 let headers = response.headers().clone();
                 let body = http_body_util::Limited::new(response.into_body(), call.max_reply)

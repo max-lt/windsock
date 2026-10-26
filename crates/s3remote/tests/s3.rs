@@ -591,3 +591,105 @@ async fn test_odd_etag_and_request_id_on_a_put_change_nothing() {
 
     remote.put("packs/a", Bytes::from("x")).await.unwrap();
 }
+
+/// A server that sends a full head, then the body one byte per second, or a chunked body with no end.
+async fn dribbling(chunked: bool) -> String {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+                let head = match chunked {
+                    true => "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n",
+                    false => "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n",
+                };
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let more: &[u8] = if chunked { b"1\r\nx\r\n" } else { b"x" };
+                    if socket.write_all(more).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    endpoint
+}
+
+#[tokio::test]
+async fn test_slow_and_endless_bodies_hit_the_attempt_timeout() {
+    for chunked in [false, true] {
+        let mut config = config(&dribbling(chunked).await, "");
+        config.retry.attempt_timeout = Duration::from_millis(500);
+        config.retry.total = Duration::from_secs(3);
+        let remote = S3Remote::new(config).unwrap();
+        let start = Instant::now();
+
+        let result = remote.get("packs/a").await;
+
+        assert!(matches!(result, Err(RemoteError::Io(_))), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+}
+
+/// A burst of reads shares a capped number of connections.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_burst_of_reads_opens_a_capped_number_of_connections() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicU32::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|_| async {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    Ok::<_, std::convert::Infallible>(Response::new(Body::from("data")))
+                });
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                    .await
+                    .ok();
+            });
+        }
+    });
+    let remote = Arc::new(S3Remote::new(config(&endpoint, "")).unwrap());
+
+    let reads: Vec<_> = (0..1000)
+        .map(|_| {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.get("packs/a").await })
+        })
+        .collect();
+    for read in reads {
+        assert_eq!(read.await.unwrap().unwrap().unwrap(), "data");
+    }
+
+    let opened = accepted.load(Ordering::SeqCst) as usize;
+    assert!(opened <= s3remote::MAX_IN_FLIGHT, "{opened} connections");
+}
+
+#[tokio::test]
+async fn test_empty_credentials_are_refused_at_start() {
+    for (access, secret) in [("", "secret"), ("key", ""), (" ", "secret")] {
+        let mut config = config("http://127.0.0.1:1", "");
+        config.access_key = access.into();
+        config.secret_key = secret.into();
+
+        let error = S3Remote::new(config).err().expect("refused");
+
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+}

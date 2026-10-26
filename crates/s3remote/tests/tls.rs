@@ -22,9 +22,21 @@ const SECRET: &str = "testsecret";
 const CA: &[u8] = include_bytes!("fixtures/ca.crt");
 const CERT: &[u8] = include_bytes!("fixtures/localhost.crt");
 const KEY: &[u8] = include_bytes!("fixtures/localhost.key");
+/// Self-signed leaf for localhost.
+const SELF_CERT: &[u8] = include_bytes!("fixtures/self.crt");
+const SELF_KEY: &[u8] = include_bytes!("fixtures/self.key");
+/// A leaf for other.example only, from the CA in `other-ca.crt`.
+const OTHER_CA: &[u8] = include_bytes!("fixtures/other-ca.crt");
+const OTHER_CERT: &[u8] = include_bytes!("fixtures/other.crt");
+const OTHER_KEY: &[u8] = include_bytes!("fixtures/other.key");
 
 /// A Windsock S3 server with the bucket `bkt`, on HTTPS with the test certificate.
 async fn tls_server() -> (TempDir, String) {
+    tls_server_with(CERT, KEY).await
+}
+
+/// A Windsock S3 server with the bucket `bkt`, on HTTPS with `cert` and `key`.
+async fn tls_server_with(cert: &[u8], key: &[u8]) -> (TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let remote = Arc::new(DirRemote::open(dir.path().join("remote")).unwrap());
     let engine = Engine::open(
@@ -43,10 +55,10 @@ async fn tls_server() -> (TempDir, String) {
         s3api::S3Config::new(keys, dir.path().join("uploads")),
     );
 
-    let certs = CertificateDer::pem_slice_iter(CERT)
+    let certs = CertificateDer::pem_slice_iter(cert)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let key = PrivateKeyDer::from_pem_slice(KEY).unwrap();
+    let key = PrivateKeyDer::from_pem_slice(key).unwrap();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -123,4 +135,26 @@ async fn test_ca_file_with_no_certificate_is_refused() {
     let result = S3Remote::new(config("https://127.0.0.1:1", "", Some(b"not a pem file")));
 
     assert!(result.is_err());
+}
+
+/// There is no switch that skips the certificate check.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_self_signed_certificate_is_refused() {
+    let (_dir, endpoint) = tls_server_with(SELF_CERT, SELF_KEY).await;
+    let remote = S3Remote::new(config(&endpoint, "", None)).unwrap();
+
+    let error = remote.get("any").await.unwrap_err();
+
+    assert!(error.to_string().contains("UnknownIssuer"), "{error}");
+}
+
+/// The certificate is trusted, but it names another host than the endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_certificate_for_another_hostname_is_refused() {
+    let (_dir, endpoint) = tls_server_with(OTHER_CERT, OTHER_KEY).await;
+    let remote = S3Remote::new(config(&endpoint, "", Some(OTHER_CA))).unwrap();
+
+    let error = remote.get("any").await.unwrap_err();
+
+    assert!(error.to_string().contains("not valid for name"), "{error}");
 }

@@ -53,6 +53,10 @@ const INDEX_DIR: &str = "index";
 const BUFFER_DIR: &str = "buffer";
 const CACHE_DIR: &str = "cache";
 
+/// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
+pub const KEY_CHECK_KEY: &str = "repo/key-check";
+const KEY_CHECK: &str = "windsock repository key check";
+
 pub fn pack_key(id: PackId) -> String {
     format!("{PACKS_PREFIX}{id}")
 }
@@ -87,6 +91,8 @@ pub enum EngineError {
     StalePlan,
     #[error("broken chains: {0:?}")]
     BrokenChains(Vec<NodeId>),
+    #[error("repo.key is not the key of this remote: {0}")]
+    WrongRepoKey(String),
     #[error("corrupt data: {0}")]
     Corrupt(String),
     #[error(transparent)]
@@ -233,6 +239,8 @@ impl<R: Remote + 'static> Engine<R> {
             flush_wanted: Notify::new(),
         };
 
+        engine.check_repo_key().await?;
+
         // A proxy with no state starts from the latest snapshot, not from every chain.
         // On failure, the first sync that meets a redacted entry loads it.
         if engine.index().frontiers()?.is_empty() {
@@ -243,6 +251,36 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         Ok(engine)
+    }
+
+    /// Opens the key check of the remote, or writes it when the remote has none. A proxy with
+    /// another key would write a chain that the other proxies cannot read.
+    async fn check_repo_key(&self) -> Result<()> {
+        let sealer = self.keys.sealer();
+        let check = sealer.seal(
+            seal::Kind::KeyCheck,
+            KEY_CHECK.as_bytes(),
+            KEY_CHECK.as_bytes(),
+        );
+
+        match self.remote.create(KEY_CHECK_KEY, Bytes::from(check)).await {
+            Ok(()) => return Ok(()),
+            Err(RemoteError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let Some(stored) = self.remote.get(KEY_CHECK_KEY).await? else {
+            return Err(EngineError::WrongRepoKey(format!(
+                "{KEY_CHECK_KEY} is gone"
+            )));
+        };
+        match sealer.open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored) {
+            Ok(plain) if plain == KEY_CHECK.as_bytes() => Ok(()),
+            Ok(_) => Err(EngineError::WrongRepoKey(format!(
+                "{KEY_CHECK_KEY} is changed"
+            ))),
+            Err(e) => Err(EngineError::WrongRepoKey(e.to_string())),
+        }
     }
 
     pub fn node(&self) -> NodeId {

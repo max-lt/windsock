@@ -155,24 +155,29 @@ async fn test_new_proxy_starts_from_the_snapshot() {
     );
 }
 
-/// A proxy with another repository key cannot open the snapshot, so it does not load it.
+/// A proxy with another key would write a chain that the other proxies cannot read.
 #[tokio::test]
-async fn test_proxy_with_another_key_does_not_load_the_snapshot() {
+async fn test_proxy_with_another_repository_key_is_refused_at_open() {
     let remote = Arc::new(TestRemote::default());
     history(&remote).await;
     let dir = tempfile::tempdir().unwrap();
 
-    let engine = Engine::open(
+    let result = Engine::open(
         dir.path(),
         remote.clone(),
         SigningKey::from_bytes(&[2; 32]),
         engine::RepoKey::from_hex(&"08".repeat(32)).unwrap().keys(),
         Config::default(),
     )
-    .await
-    .unwrap();
+    .await;
 
-    assert!(engine.versions(BUCKET, "x").unwrap().is_none());
+    assert!(matches!(result, Err(engine::EngineError::WrongRepoKey(_))));
+    assert!(remote.list("log/").await.unwrap().iter().all(|k| {
+        !k.contains(
+            &model::NodeId::from_bytes(SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes())
+                .to_string(),
+        )
+    }));
 }
 
 #[tokio::test]

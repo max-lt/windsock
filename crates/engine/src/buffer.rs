@@ -986,6 +986,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_open_of_2000_small_segments_takes_seconds_at_most() {
+        let dir = tempfile::tempdir().unwrap();
+        for seq in 0..2000u64 {
+            let key = format!("k{seq}");
+            let record = encode_record(&put(&key, b"v"), b"v");
+            tokio::fs::write(segment_path(dir.path(), seq), record)
+                .await
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(buffer.object("b", "k1999").is_some());
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[tokio::test]
     async fn test_corrupt_sealed_segment_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         {

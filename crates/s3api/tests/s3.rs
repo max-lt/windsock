@@ -895,3 +895,171 @@ async fn test_complete_with_a_wrong_part_etag_fails() {
 
     assert_eq!(reply.xml("Code").unwrap(), "InvalidPart");
 }
+
+async fn start_upload(server: &Server) -> String {
+    run(server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap()
+}
+
+fn complete_body(parts: &[(u32, &str)]) -> String {
+    let parts: String = parts
+        .iter()
+        .map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"))
+        .collect();
+    format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>")
+}
+
+async fn complete(server: &Server, id: &str, parts: &[(u32, &str)]) -> Reply {
+    let uri = format!("/bkt/big?uploadId={id}");
+    run(server, call("POST", &uri).body(complete_body(parts))).await
+}
+
+#[tokio::test]
+async fn test_complete_with_parts_out_of_order_is_refused() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let one = upload_part(&server, &id, 1, "a")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    let two = upload_part(&server, &id, 2, "b")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+
+    let reply = complete(&server, &id, &[(2, &two), (1, &one)]).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "InvalidPartOrder");
+}
+
+#[tokio::test]
+async fn test_complete_with_a_part_that_was_never_uploaded_is_refused() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let one = upload_part(&server, &id, 1, "a")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+
+    let reply = complete(&server, &id, &[(1, &one), (2, "\"missing\"")]).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "InvalidPart");
+}
+
+#[tokio::test]
+async fn test_complete_after_abort_and_second_complete_find_no_upload() {
+    let server = with_bucket().await;
+    let aborted = start_upload(&server).await;
+    let etag = upload_part(&server, &aborted, 1, "a")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    run(
+        &server,
+        call("DELETE", &format!("/bkt/big?uploadId={aborted}")),
+    )
+    .await;
+    let done = start_upload(&server).await;
+    let part = upload_part(&server, &done, 1, "b")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        complete(&server, &done, &[(1, &part)]).await.status,
+        StatusCode::OK
+    );
+
+    let after_abort = complete(&server, &aborted, &[(1, &etag)]).await;
+    let twice = complete(&server, &done, &[(1, &part)]).await;
+
+    assert_eq!(after_abort.status, StatusCode::NOT_FOUND);
+    assert_eq!(after_abort.xml("Code").unwrap(), "NoSuchUpload");
+    assert_eq!(twice.status, StatusCode::NOT_FOUND);
+    assert_eq!(twice.xml("Code").unwrap(), "NoSuchUpload");
+    assert_eq!(run(&server, call("GET", "/bkt/big")).await.text(), "b");
+}
+
+#[tokio::test]
+async fn test_conditional_get_on_dates_and_tags() {
+    let server = with_bucket().await;
+    let etag = put(&server, "k", "v")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    let past = "Mon, 01 Jan 2001 00:00:00 GMT";
+    let future = "Fri, 01 Jan 2100 00:00:00 GMT";
+    let get = |name: &'static str, value: &str| {
+        let value = value.to_string();
+        let server = &server;
+        async move {
+            run(server, call("GET", "/bkt/k").header(name, value))
+                .await
+                .status
+        }
+    };
+
+    assert_eq!(get("if-match", &etag).await, StatusCode::OK);
+    assert_eq!(get("if-none-match", "\"other\"").await, StatusCode::OK);
+    assert_eq!(get("if-modified-since", past).await, StatusCode::OK);
+    assert_eq!(
+        get("if-modified-since", future).await,
+        StatusCode::NOT_MODIFIED
+    );
+    assert_eq!(get("if-unmodified-since", future).await, StatusCode::OK);
+    assert_eq!(
+        get("if-unmodified-since", past).await,
+        StatusCode::PRECONDITION_FAILED
+    );
+}
+
+#[tokio::test]
+async fn test_range_edges() {
+    let server = with_bucket().await;
+    put(&server, "k", "0123456789").await;
+    put(&server, "empty", "").await;
+    let get = |key: &'static str, range: &'static str| {
+        let server = &server;
+        async move { run(server, call("GET", key).header("range", range)).await }
+    };
+
+    let past_end = get("/bkt/k", "bytes=5-100").await;
+    let long_suffix = get("/bkt/k", "bytes=-100").await;
+    let multi = get("/bkt/k", "bytes=0-1,3-4").await;
+    let on_empty = get("/bkt/empty", "bytes=0-0").await;
+
+    assert_eq!(past_end.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(past_end.text(), "56789");
+    assert_eq!(past_end.header("content-range"), Some("bytes 5-9/10"));
+    assert_eq!(long_suffix.text(), "0123456789");
+    assert_eq!(
+        multi.status,
+        StatusCode::OK,
+        "S3 serves the whole object for several ranges"
+    );
+    assert_eq!(multi.text(), "0123456789");
+    assert_eq!(on_empty.status, StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[tokio::test]
+async fn test_head_of_an_empty_object_and_of_a_missing_key() {
+    let server = with_bucket().await;
+    put(&server, "empty", "").await;
+
+    let empty = run(&server, call("HEAD", "/bkt/empty")).await;
+    let missing = run(&server, call("HEAD", "/bkt/missing")).await;
+
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_eq!(empty.header("content-length"), Some("0"));
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert!(missing.body.is_empty());
+}

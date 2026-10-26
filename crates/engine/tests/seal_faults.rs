@@ -299,3 +299,36 @@ async fn test_short_ranged_read_from_the_remote_fails_the_read() {
 
     assert!(matches!(result, Err(EngineError::Corrupt(_))));
 }
+
+/// Every sealed kind on its way through the remote: chunks and footers, manifests, journal
+/// actions, and the snapshot that a new proxy loads.
+#[tokio::test]
+async fn test_objects_at_size_limits_roundtrip_through_a_sealed_remote() {
+    const MAX: usize = 256 * 1024;
+    let sizes = [0, 1, 4095, 4096, 4097, MAX - 1, MAX, MAX + 1, (8 << 20) + 1];
+    let remote = Arc::new(MemoryRemote::default());
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    for (i, size) in sizes.iter().enumerate() {
+        writer
+            .engine
+            .put(
+                BUCKET,
+                &format!("s{size}"),
+                Bytes::from(random_bytes(i as u8, *size)),
+                BTreeMap::new(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+    }
+    writer.engine.flush().await.unwrap();
+    writer.engine.snapshot().await.unwrap();
+
+    let reader = proxy(&remote, 2).await;
+
+    for (i, size) in sizes.iter().enumerate() {
+        let data = get(&reader.engine, &format!("s{size}")).await.unwrap();
+        assert_eq!(data, random_bytes(i as u8, *size), "size {size}");
+    }
+}

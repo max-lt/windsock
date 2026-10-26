@@ -264,4 +264,43 @@ mod tests {
         assert!(RepoKey::from_hex("not hex").is_err());
         assert_eq!(format!("{key:?}"), "RepoKey(..)");
     }
+
+    #[test]
+    fn test_seal_roundtrips_at_every_size_limit() {
+        let sealer = keys(1).sealer().clone();
+        for len in [
+            0,
+            1,
+            255,
+            256,
+            64 * 1024,
+            256 * 1024 - 1,
+            256 * 1024,
+            256 * 1024 + 1,
+            9 << 20,
+        ] {
+            let plain: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            let blob = sealer.seal(Kind::PackChunk, b"id", &plain);
+
+            assert_eq!(blob.len(), len + OVERHEAD);
+            assert_eq!(
+                sealer.open(Kind::PackChunk, b"id", &blob).unwrap(),
+                plain,
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nonce_does_not_repeat_over_many_seals() {
+        let sealer = keys(1).sealer().clone();
+        let count = 20_000;
+
+        let nonces: std::collections::HashSet<Vec<u8>> = (0..count)
+            .map(|_| sealer.seal(Kind::Actions, b"", b"same")[1 + KEY_ID_LEN..HEADER_LEN].to_vec())
+            .collect();
+
+        assert_eq!(nonces.len(), count);
+    }
 }

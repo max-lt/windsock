@@ -287,4 +287,25 @@ mod tests {
             Err(DecodeError::Zstd(_))
         ));
     }
+
+    #[test]
+    fn test_other_key_gives_other_ids_and_other_cut_points() {
+        let other = seal::RepoKey::from_hex(&"08".repeat(32)).unwrap().keys();
+        let data = random_bytes(5, 2 * 1024 * 1024);
+
+        let ours: Vec<_> = chunks(keys(), &data).map(|c| (c.id, c.offset)).collect();
+        let again: Vec<_> = chunks(keys(), &data).map(|c| (c.id, c.offset)).collect();
+        let theirs: Vec<_> = chunks(&other, &data).map(|c| (c.id, c.offset)).collect();
+
+        assert_eq!(ours, again);
+        let our_ids: std::collections::HashSet<_> = ours.iter().map(|(id, _)| *id).collect();
+        assert!(theirs.iter().all(|(id, _)| !our_ids.contains(id)));
+        let our_cuts: Vec<_> = ours.iter().map(|(_, at)| *at).collect();
+        let their_cuts: Vec<_> = theirs.iter().map(|(_, at)| *at).collect();
+        assert_ne!(our_cuts, their_cuts);
+        assert_ne!(
+            fixed_chunks(keys(), &data).next().unwrap().id,
+            fixed_chunks(&other, &data).next().unwrap().id
+        );
+    }
 }

@@ -322,6 +322,23 @@ async fn test_a_silent_server_hits_the_time_limit() {
     );
 }
 
+/// A ranged read that gets far more bytes than it asked fails, and reads at most a bounded body.
+#[tokio::test]
+async fn test_ranged_read_with_a_huge_answer_fails() {
+    let (endpoint, _) = scripted(|_, _| {
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .body(Body::from(vec![0u8; 4 << 20]))
+            .unwrap()
+    })
+    .await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let error = remote.get_range("packs/p", 0..10).await.unwrap_err();
+
+    assert!(error.to_string().contains("length limit"), "{error}");
+}
+
 #[tokio::test]
 async fn test_list_follows_continuation_tokens() {
     let (endpoint, count) = scripted(|_, query| {

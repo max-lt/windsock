@@ -244,8 +244,15 @@ async fn test_repo_key_with_one_flipped_bit_is_refused_at_open() {
     assert!(matches!(result, Err(EngineError::WrongRepoKey(_))));
 }
 
-/// A store that answers a ranged read with fewer bytes than it asked.
-struct ShortRanges(MemoryRemote);
+/// How a store answers a ranged read.
+#[derive(Clone, Copy)]
+enum Answer {
+    Short,
+    Long,
+}
+
+/// A store that answers a ranged read with fewer or more bytes than it asked.
+struct ShortRanges(MemoryRemote, Answer);
 
 #[async_trait::async_trait]
 impl Remote for ShortRanges {
@@ -267,7 +274,10 @@ impl Remote for ShortRanges {
         range: std::ops::Range<u64>,
     ) -> Result<Option<Bytes>, remote::RemoteError> {
         let read = self.0.get_range(key, range).await?;
-        Ok(read.map(|bytes| bytes.slice(..bytes.len() / 2)))
+        Ok(read.map(|bytes| match self.1 {
+            Answer::Short => bytes.slice(..bytes.len() / 2),
+            Answer::Long => [bytes.as_ref(), b"extra"].concat().into(),
+        }))
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, remote::RemoteError> {
@@ -275,11 +285,10 @@ impl Remote for ShortRanges {
     }
 }
 
-#[tokio::test]
-async fn test_short_ranged_read_from_the_remote_fails_the_read() {
+async fn ranged_read_with(answer: Answer) -> Result<engine::Object, EngineError> {
     let memory = Arc::new(MemoryRemote::default());
     written(&memory).await;
-    let short = Arc::new(ShortRanges(MemoryRemote::default()));
+    let short = Arc::new(ShortRanges(MemoryRemote::default(), answer));
     for key in memory.list("").await.unwrap() {
         let bytes = memory.get(&key).await.unwrap().unwrap();
         short.0.put(&key, bytes).await.unwrap();
@@ -295,9 +304,36 @@ async fn test_short_ranged_read_from_the_remote_fails_the_read() {
     .await
     .unwrap();
 
-    let result = reader.get(BUCKET, "a", None).await;
+    reader.get(BUCKET, "a", None).await
+}
+
+#[tokio::test]
+async fn test_short_ranged_read_from_the_remote_fails_the_read() {
+    let result = ranged_read_with(Answer::Short).await;
 
     assert!(matches!(result, Err(EngineError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn test_long_ranged_read_from_the_remote_fails_the_read() {
+    let result = ranged_read_with(Answer::Long).await;
+
+    assert!(matches!(result, Err(EngineError::Corrupt(_))));
+}
+
+#[tokio::test]
+async fn test_empty_objects_on_the_remote_fail_closed() {
+    let remote = Arc::new(MemoryRemote::default());
+    written(&remote).await;
+    for prefix in ["manifests/", "log/"] {
+        for key in keys(&remote, prefix).await {
+            remote.put(&key, Bytes::new()).await.unwrap();
+        }
+    }
+
+    let reader = proxy(&remote, 2).await;
+
+    assert_eq!(reader.engine.sync().await.unwrap().broken.len(), 1);
 }
 
 /// Every sealed kind on its way through the remote: chunks and footers, manifests, journal

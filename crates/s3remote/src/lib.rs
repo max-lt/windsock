@@ -73,7 +73,15 @@ struct Call<'a> {
     query: Vec<(&'a str, String)>,
     headers: Vec<(&'static str, String)>,
     body: Bytes,
+    /// The longest reply body that this call reads. The remote is not trusted.
+    max_reply: usize,
 }
+
+/// The reply limit of a call with no known size: an object or a listing page.
+const MAX_REPLY: usize = 1 << 30;
+
+/// Room for an XML error body after a ranged read.
+const ERROR_ROOM: usize = 64 * 1024;
 
 impl<'a> Call<'a> {
     fn new(method: Method, key: Option<&'a str>) -> Self {
@@ -83,6 +91,7 @@ impl<'a> Call<'a> {
             query: Vec::new(),
             headers: Vec::new(),
             body: Bytes::new(),
+            max_reply: MAX_REPLY,
         }
     }
 }
@@ -272,8 +281,7 @@ impl S3Remote {
                     .map_err(|e| RemoteError::Io(std::io::Error::other(e)))?;
                 let status = response.status();
                 let headers = response.headers().clone();
-                let body = response
-                    .into_body()
+                let body = http_body_util::Limited::new(response.into_body(), call.max_reply)
                     .collect()
                     .await
                     .map_err(|e| RemoteError::Io(std::io::Error::other(e)))?
@@ -387,8 +395,10 @@ impl Remote for S3Remote {
         let mut call = Call::new(Method::GET, Some(key));
         call.headers
             .push(("range", format!("bytes={}-{}", range.start, range.end - 1)));
+        let wanted = usize::try_from(range.end - range.start)
+            .map_err(|_| invalid("the range does not fit in memory"))?;
+        call.max_reply = wanted.saturating_add(ERROR_ROOM);
         let reply = self.send(call).await?;
-        let wanted = (range.end - range.start) as usize;
 
         match reply.status {
             StatusCode::NOT_FOUND => Ok(None),

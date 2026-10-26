@@ -336,7 +336,12 @@ async fn test_ranged_read_with_a_huge_answer_fails() {
 
     let error = remote.get_range("packs/p", 0..10).await.unwrap_err();
 
-    assert!(error.to_string().contains("length limit"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("packs/p"), "{message}");
+    assert!(
+        message.contains("larger than the limit of 65546 bytes"),
+        "{message}"
+    );
 }
 
 #[tokio::test]
@@ -365,4 +370,38 @@ async fn test_list_follows_continuation_tokens() {
         ["log/a", "log/b", "log/c"]
     );
     assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+/// A raw server: for each connection, reads a little of the request, writes `reply`, closes.
+async fn raw_server(reply: &'static [u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 256];
+            let _ = stream.read(&mut head).await;
+            let _ = stream.write_all(reply).await;
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn test_reply_shorter_than_its_content_length_fails() {
+    let endpoint = raw_server(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort").await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    assert!(remote.get("log/x").await.is_err());
+}
+
+#[tokio::test]
+async fn test_connection_closed_during_the_request_body_fails() {
+    let endpoint = raw_server(b"").await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let body = Bytes::from(vec![7u8; 4 << 20]);
+    assert!(remote.put("packs/p", body).await.is_err());
 }

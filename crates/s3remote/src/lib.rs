@@ -77,8 +77,8 @@ struct Call<'a> {
     max_reply: usize,
 }
 
-/// The reply limit of a call with no known size: an object or a listing page.
-const MAX_REPLY: usize = 1 << 30;
+/// The reply limit of a call with no known size: an object, a snapshot or a listing page.
+pub const MAX_REPLY: usize = 1 << 30;
 
 /// Room for an XML error body after a ranged read.
 const ERROR_ROOM: usize = 64 * 1024;
@@ -284,7 +284,16 @@ impl S3Remote {
                 let body = http_body_util::Limited::new(response.into_body(), call.max_reply)
                     .collect()
                     .await
-                    .map_err(|e| RemoteError::Io(std::io::Error::other(e)))?
+                    .map_err(|e| {
+                        if e.is::<http_body_util::LengthLimitError>() {
+                            let key = call.key.unwrap_or("the bucket");
+                            let limit = call.max_reply;
+                            return RemoteError::Io(std::io::Error::other(format!(
+                                "the reply for {key} is larger than the limit of {limit} bytes"
+                            )));
+                        }
+                        RemoteError::Io(std::io::Error::other(e))
+                    })?
                     .to_bytes();
                 let reply = Reply {
                     status,

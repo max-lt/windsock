@@ -61,7 +61,9 @@ impl<R: Remote + 'static> Engine<R> {
             let Some((time, hash)) = parse_key(key) else {
                 continue;
             };
-            let Some(sealed) = self.remote.get(key).await? else {
+            let read = self.remote.get(key).await;
+            let Some(sealed) = read.map_err(|e| EngineError::Corrupt(format!("{key}: {e}")))?
+            else {
                 continue;
             };
             if blake3::hash(&sealed).as_bytes() != &hash {

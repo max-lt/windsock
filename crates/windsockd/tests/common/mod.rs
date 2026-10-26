@@ -103,6 +103,11 @@ impl Daemon {
         }
     }
 
+    /// True when a log line read so far, the start included, contains `needle`.
+    pub fn logged(&self, needle: &str) -> bool {
+        self.seen.iter().any(|line| line.contains(needle))
+    }
+
     /// SIGTERM, then the exit status.
     pub fn stop(mut self) -> bool {
         let pid = self.child.id().to_string();

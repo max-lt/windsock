@@ -87,6 +87,10 @@ impl From<EngineError> for S3Error {
             EngineError::InvalidRange { .. } => ("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE),
             // The buffer drains when the remote comes back: clients back off and retry.
             EngineError::BufferFull { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
+            // A full local disk frees up when the flusher uploads: clients back off and retry.
+            EngineError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {
+                ("SlowDown", StatusCode::SERVICE_UNAVAILABLE)
+            }
             _ => {
                 warn!(%message, "internal error");
                 ("InternalError", StatusCode::INTERNAL_SERVER_ERROR)
@@ -110,5 +114,22 @@ impl IntoResponse for S3Error {
             .header("content-type", "application/xml")
             .body(Body::from(body))
             .expect("static headers are valid")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_full_local_disk_asks_the_client_to_slow_down() {
+        let full = EngineError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+
+        let error = S3Error::from(full);
+
+        assert_eq!(
+            (error.code, error.status),
+            ("SlowDown", StatusCode::SERVICE_UNAVAILABLE)
+        );
     }
 }

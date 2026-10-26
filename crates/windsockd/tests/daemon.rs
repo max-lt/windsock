@@ -375,6 +375,45 @@ fn test_bad_repository_key_file_names_the_path_and_not_the_content() {
     assert!(!stderr.contains("secret-but-not-hex"), "{stderr}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_restart_after_a_torn_buffer_record_keeps_whole_writes_and_logs_the_cut() {
+    let (dir, config, keys) = init();
+    let daemon = start(&config, "info");
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/whole", b"kept").await;
+    call(&daemon, &keys, "PUT", "/demo/torn", b"cut off").await;
+    daemon.crash();
+    let buffer = dir.path().join("data/engine/buffer");
+    let mut segments: Vec<_> = std::fs::read_dir(&buffer)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .filter(|p| std::fs::metadata(p).unwrap().len() > 0)
+        .collect();
+    segments.sort();
+    let last = segments.pop().expect("a segment holds the writes");
+    let len = std::fs::metadata(&last).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&last)
+        .unwrap()
+        .set_len(len - 2)
+        .unwrap();
+
+    let daemon = start(&config, "info");
+
+    assert!(daemon.logged("cut a torn record"));
+    assert_eq!(
+        call(&daemon, &keys, "GET", "/demo/whole", b"").await.text(),
+        "kept"
+    );
+    assert_eq!(
+        call(&daemon, &keys, "GET", "/demo/torn", b"").await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(daemon.stop());
+}
+
 #[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();

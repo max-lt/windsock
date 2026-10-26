@@ -199,6 +199,21 @@ async fn test_corrupt_cache_file_is_read_again_from_the_remote() {
 }
 
 #[tokio::test]
+async fn test_evicted_chunk_is_read_again_from_the_remote_and_matches() {
+    let remote = Arc::new(CountingRemote::default());
+    let a = proxy(&remote, 1, config(CacheMode::ReadWrite, 400 * 1024)).await;
+    for i in 0..4 {
+        write(&a, &format!("c/{i}"), &random_bytes(i, 300_000)).await;
+    }
+
+    assert!(
+        reads_for(&remote, &a, "c/0").await > 0,
+        "c/0 left the cache"
+    );
+    assert_eq!(read(&a, "c/0").await, random_bytes(0, 300_000));
+}
+
+#[tokio::test]
 async fn test_cache_stays_within_its_bound() {
     let remote = Arc::new(CountingRemote::default());
     let bound = 400 * 1024;

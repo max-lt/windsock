@@ -862,6 +862,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_flipped_byte_in_the_last_segment_keeps_the_records_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+            for key in ["a", "b", "c"] {
+                buffer.append(put(key, b"data"), b"data").await.unwrap();
+            }
+        }
+        let path = segment_path(dir.path(), 0);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let record = bytes.len() / 3;
+        // A byte in the data of the second record.
+        bytes[2 * record - 1] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+
+        let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+
+        assert!(buffer.object("b", "a").is_some());
+        assert!(buffer.object("b", "b").is_none());
+        assert!(buffer.object("b", "c").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_empty_segment_file_is_removed_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(segment_path(dir.path(), 4), b"").unwrap();
+
+        let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+
+        assert!(buffer.is_empty());
+        assert!(!segment_path(dir.path(), 4).exists());
+    }
+
+    #[tokio::test]
     async fn test_corrupt_sealed_segment_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         {

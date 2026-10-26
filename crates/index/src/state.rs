@@ -202,6 +202,13 @@ impl BucketState {
 
 #[cfg(test)]
 mod tests {
+    fn test_sealer() -> seal::Sealer {
+        seal::RepoKey::from_hex(&"07".repeat(32))
+            .unwrap()
+            .keys()
+            .sealer()
+            .clone()
+    }
     use ed25519_dalek::SigningKey;
     use journal::{Action, Link};
 
@@ -226,7 +233,15 @@ mod tests {
             manifest_id: manifest(seed),
             inline_manifest: None,
         };
-        Entry::sign(&key(seed), seq, [0u8; 32], hlc, seen, vec![action])
+        Entry::sign(
+            &key(seed),
+            seq,
+            [0u8; 32],
+            hlc,
+            seen,
+            vec![action],
+            &test_sealer(),
+        )
     }
 
     fn link(seed: u8, seq: u64) -> (NodeId, Link) {

@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use index::Snapshot;
-use journal::{Entry, Journal, entry_key};
+use journal::{Journal, entry_key};
 use remote::Remote;
 use tracing::{info, warn};
 
@@ -107,15 +107,12 @@ impl<R: Remote + 'static> Engine<R> {
                 let Some(bytes) = self.remote.get(&key).await? else {
                     continue;
                 };
-                let entry: Entry = postcard::from_bytes(&bytes)
-                    .map_err(|e| EngineError::Corrupt(format!("{key}: {e}")))?;
-
-                if entry.actions.is_none() {
+                let without_actions = journal::redact_wire(&bytes)
+                    .map_err(|e| EngineError::Corrupt(format!("{key}: {e:?}")))?;
+                let Some(bytes) = without_actions else {
                     continue;
-                }
+                };
 
-                let bytes =
-                    postcard::to_allocvec(&entry.redacted()).expect("an entry always serializes");
                 self.remote.put(&key, Bytes::from(bytes)).await?;
                 redacted += 1;
             }

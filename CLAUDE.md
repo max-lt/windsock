@@ -100,7 +100,9 @@ The daemon crate is `windsockd`.
   The version prune drops versions below (stable HLC - R), and refuses to run when the stable HLC
   is more than R ahead of the GC clock.
 - A journal entry is written create-only at `log/<node_id>/<seq>`. One entry per seq: no fork.
-- An entry signs `blake3(action)`, not the action: a purge can drop the action and keep the chain.
+- An entry seals its actions with the repository key and signs `blake3(sealed actions)`, not the
+  actions: a purge can drop them with no key and keep the chain. The entry header (node, seq,
+  prev, hlc, seen) stays in clear.
 - An entry lists in `seen` the last entry of every other chain its writer had applied (not read).
   The index applies an entry only after everything in its `seen`.
 - Index state is a function of the set of applied entries, never of their order. A conflict is

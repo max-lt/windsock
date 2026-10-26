@@ -113,7 +113,8 @@ async fn entries(remote: &TestRemote) -> Vec<Entry> {
     let mut out = Vec::new();
     for key in remote.inner.list(journal::LOG_PREFIX).await.unwrap() {
         let bytes = remote.inner.get(&key).await.unwrap().unwrap();
-        out.push(postcard::from_bytes(&bytes).unwrap());
+        let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+        out.push(Entry::from_wire(&bytes, keys.sealer()).unwrap());
     }
     out
 }

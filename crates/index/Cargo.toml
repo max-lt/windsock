@@ -17,6 +17,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+seal.workspace = true
 remote.workspace = true
 chunking.workspace = true
 ed25519-dalek.workspace = true

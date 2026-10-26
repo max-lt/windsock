@@ -95,6 +95,8 @@ pub enum ChainError {
     BadSignature { seq: u64 },
     #[error("entry {seq} carries actions that were not signed")]
     ActionsMismatch { seq: u64 },
+    #[error("the actions of entry {seq} do not open: another repository key, or changed bytes")]
+    Sealed { seq: u64 },
 }
 
 #[cfg(test)]
@@ -123,7 +125,15 @@ mod tests {
     }
 
     fn sign(seed: u8, seq: u64, prev: EntryHash, hlc: u64) -> Entry {
-        Entry::sign(&key(seed), seq, prev, hlc, Seen::new(), vec![put()])
+        Entry::sign(
+            &key(seed),
+            seq,
+            prev,
+            hlc,
+            Seen::new(),
+            vec![put()],
+            &crate::entry::test_sealer(),
+        )
     }
 
     #[test]
@@ -195,7 +205,15 @@ mod tests {
                 hash: [0u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(1), 0, [0u8; 32], 10, seen, vec![put()]);
+        let entry = Entry::sign(
+            &key(1),
+            0,
+            [0u8; 32],
+            10,
+            seen,
+            vec![put()],
+            &crate::entry::test_sealer(),
+        );
 
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),
@@ -216,11 +234,13 @@ mod tests {
 
     #[test]
     fn test_swapped_actions_are_rejected() {
-        let mut entry = sign(1, 0, [0u8; 32], 10);
-        entry.actions = Some(vec![Action::Delete {
-            bucket: "b".into(),
-            key: "k".into(),
-        }]);
+        let entry = sign(1, 0, [0u8; 32], 10).forged(
+            vec![Action::Delete {
+                bucket: "b".into(),
+                key: "k".into(),
+            }],
+            &crate::entry::test_sealer(),
+        );
 
         assert_eq!(
             Frontier::GENESIS.extend(node(1), &entry),

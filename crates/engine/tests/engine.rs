@@ -377,6 +377,40 @@ async fn test_large_manifest_goes_to_the_remote() {
 }
 
 #[tokio::test]
+async fn test_remote_holds_no_bucket_key_or_data_in_clear() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket("tenant-bucket", None).await.unwrap();
+    let data = b"clear text of the object ".repeat(1000);
+    a.engine
+        .put(
+            "tenant-bucket",
+            "secret-object-name",
+            bytes::Bytes::from(data.clone()),
+            Default::default(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+
+    for key in remote.list("").await.unwrap() {
+        let stored = remote.get(&key).await.unwrap().unwrap();
+        for needle in [
+            b"tenant-bucket".as_slice(),
+            b"secret-object-name",
+            &data[..24],
+        ] {
+            assert!(
+                !stored.windows(needle.len()).any(|w| w == needle),
+                "{key} holds {:?} in clear",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_manifest_on_the_remote_is_sealed() {
     let remote = Arc::new(MemoryRemote::default());
     let a = proxy(&remote, 1).await;

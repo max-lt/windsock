@@ -634,6 +634,13 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
+    fn test_sealer() -> seal::Sealer {
+        seal::RepoKey::from_hex(&"07".repeat(32))
+            .unwrap()
+            .keys()
+            .sealer()
+            .clone()
+    }
     use std::sync::Arc;
 
     use ed25519_dalek::SigningKey;
@@ -647,7 +654,7 @@ mod tests {
     }
 
     fn journal(remote: &Arc<MemoryRemote>, seed: u8) -> Journal<MemoryRemote> {
-        Journal::new(remote.clone(), key(seed), Frontiers::new())
+        Journal::new(remote.clone(), key(seed), test_sealer(), Frontiers::new())
     }
 
     fn manifest(n: u8) -> ObjectId {
@@ -802,7 +809,12 @@ mod tests {
 
         a.append(put("k", 2), Seen::new()).await.unwrap();
         let mut index = Index::open(dir.path()).unwrap();
-        let mut reader = Journal::new(remote.clone(), key(9), index.frontiers().unwrap());
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            test_sealer(),
+            index.frontiers().unwrap(),
+        );
         let entries = reader.sync_all().await.unwrap();
 
         assert_eq!(entries.len(), 1, "only the new entry is read");
@@ -842,7 +854,15 @@ mod tests {
                 hash: [9u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(2), 0, [0u8; 32], 99, forged_link, put("k", 2));
+        let entry = Entry::sign(
+            &key(2),
+            0,
+            [0u8; 32],
+            99,
+            forged_link,
+            put("k", 2),
+            &test_sealer(),
+        );
 
         assert!(matches!(
             index.apply(vec![entry]),
@@ -909,6 +929,7 @@ mod tests {
                     inline_manifest: None,
                 },
             ],
+            &test_sealer(),
         );
         let mut index = index;
         index.apply(vec![entry]).unwrap();
@@ -953,6 +974,7 @@ mod tests {
                 },
                 Action::DeleteBucket { bucket: "b".into() },
             ],
+            &test_sealer(),
         );
 
         index.apply(vec![entry]).unwrap();
@@ -990,7 +1012,15 @@ mod tests {
             packs: vec![PackId::from_bytes([pack; 32])],
             manifests: vec![manifest(pack)],
         };
-        Entry::sign(&key(seed), 0, [0u8; 32], hlc, Seen::new(), vec![action])
+        Entry::sign(
+            &key(seed),
+            0,
+            [0u8; 32],
+            hlc,
+            Seen::new(),
+            vec![action],
+            &test_sealer(),
+        )
     }
 
     #[test]
@@ -1048,8 +1078,16 @@ mod tests {
                 hash: [0u8; 32],
             },
         )]);
-        let pending = Entry::sign(&key(1), 0, [0u8; 32], 7, waits, put("k", 3));
-        let applied = Entry::sign(&key(2), 0, [0u8; 32], 20, Seen::new(), put("j", 4));
+        let pending = Entry::sign(&key(1), 0, [0u8; 32], 7, waits, put("k", 3), &test_sealer());
+        let applied = Entry::sign(
+            &key(2),
+            0,
+            [0u8; 32],
+            20,
+            Seen::new(),
+            put("j", 4),
+            &test_sealer(),
+        );
 
         index.apply(vec![pending, applied]).unwrap();
 
@@ -1068,8 +1106,24 @@ mod tests {
     #[test]
     fn test_stable_hlc_is_the_slowest_chain() {
         let mut index = Index::open_temporary().unwrap();
-        let slow = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), put("a", 1));
-        let fast = Entry::sign(&key(2), 0, [0u8; 32], 30, Seen::new(), put("b", 2));
+        let slow = Entry::sign(
+            &key(1),
+            0,
+            [0u8; 32],
+            10,
+            Seen::new(),
+            put("a", 1),
+            &test_sealer(),
+        );
+        let fast = Entry::sign(
+            &key(2),
+            0,
+            [0u8; 32],
+            30,
+            Seen::new(),
+            put("b", 2),
+            &test_sealer(),
+        );
 
         assert_eq!(index.stable_hlc().unwrap(), 0);
         index.apply(vec![slow, fast]).unwrap();
@@ -1088,8 +1142,24 @@ mod tests {
                 key: "gone".into(),
             },
         ];
-        let first = Entry::sign(&key(1), 0, [0u8; 32], 10, Seen::new(), actions);
-        let rewrite = Entry::sign(&key(1), 1, first.hash(), 20, Seen::new(), put("kept", 5));
+        let first = Entry::sign(
+            &key(1),
+            0,
+            [0u8; 32],
+            10,
+            Seen::new(),
+            actions,
+            &test_sealer(),
+        );
+        let rewrite = Entry::sign(
+            &key(1),
+            1,
+            first.hash(),
+            20,
+            Seen::new(),
+            put("kept", 5),
+            &test_sealer(),
+        );
         index.apply(vec![first, rewrite]).unwrap();
 
         assert_eq!(index.prune_versions(15).unwrap(), 2);
@@ -1175,7 +1245,15 @@ mod tests {
         let decoded = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes).unwrap();
 
         let mut target = Index::open_temporary().unwrap();
-        let stray = Entry::sign(&key(5), 3, [0u8; 32], 1, Seen::new(), put("z", 9));
+        let stray = Entry::sign(
+            &key(5),
+            3,
+            [0u8; 32],
+            1,
+            Seen::new(),
+            put("z", 9),
+            &test_sealer(),
+        );
         target.apply(vec![stray]).unwrap();
         target.load(&decoded).unwrap();
 
@@ -1219,8 +1297,24 @@ mod tests {
                 },
             )])
         };
-        let old_link = Entry::sign(&key(2), 0, [0u8; 32], 99, links(1), put("k", 3));
-        let last_link = Entry::sign(&key(3), 0, [0u8; 32], 99, links(4), put("j", 4));
+        let old_link = Entry::sign(
+            &key(2),
+            0,
+            [0u8; 32],
+            99,
+            links(1),
+            put("k", 3),
+            &test_sealer(),
+        );
+        let last_link = Entry::sign(
+            &key(3),
+            0,
+            [0u8; 32],
+            99,
+            links(4),
+            put("j", 4),
+            &test_sealer(),
+        );
 
         assert_eq!(target.apply(vec![old_link, last_link]).unwrap(), 2);
         assert_eq!(target.resolve("b", "k").unwrap(), Some(manifest(3)));
@@ -1239,7 +1333,15 @@ mod tests {
                 hash: [9u8; 32],
             },
         )]);
-        let entry = Entry::sign(&key(2), 0, [0u8; 32], 99, forged, put("k", 3));
+        let entry = Entry::sign(
+            &key(2),
+            0,
+            [0u8; 32],
+            99,
+            forged,
+            put("k", 3),
+            &test_sealer(),
+        );
 
         assert!(matches!(
             target.apply(vec![entry]),

@@ -92,6 +92,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   not enforce this rule. No lock stops a second GC runner. The GC protocol is model-checked with
   one GC runner and two writers only, so two GC runners on one remote are not verified.
 
+- All remote data is encrypted with `repo.key`: see `docs/encryption.md`. Without this file,
+  nobody can read the data.
 - The remote store must keep the storage contract in `docs/storage.md`. Backblaze B2 and
   Garage do not. Run `windsockd diagnose <config>` before you use a new store.
 - An `https` S3 remote needs the feature `tls`: `cargo build --release -p windsockd --features tls`.

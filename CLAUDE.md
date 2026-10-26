@@ -124,6 +124,11 @@ The daemon crate is `windsockd`.
 - One GC runner per remote (`gc.enabled` on one proxy). This is a configuration rule, not a code
   guarantee: no lock enforces it, and the model check has one GC runner. A lease on create-only
   keys cannot fence a GC that pauses past its lease, so it would not make the rule safe.
+- Everything that goes to the remote is sealed with the repository key (`docs/encryption.md`):
+  pack chunks and footers, manifests, journal actions, snapshots. The local disk stays in clear.
+  Chunk IDs are keyed. The chunk ID key can never change.
+- One remote, one repository key: `Engine::open` writes `repo/key-check` (create-only) or opens
+  it, and refuses another key (`WrongRepoKey`).
 - The journal core (`chain.rs`) does no I/O. Keep decision code out of the async shell.
 - `windsockd` accepts at most `max_connections` connections (default: soft fd limit - 256), so a
   flush always has descriptors.

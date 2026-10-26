@@ -69,6 +69,8 @@ The test writes and deletes small objects under `probe/`. If a delete fails, one
 stays under `probe/`. Windsock never reads it. Do not put other data under `probe/` in the
 key prefix of a Windsock remote.
 
+Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
+
 ## Versioned buckets
 
 A versioned bucket keeps a hidden version of each overwritten or deleted object. Then the GC

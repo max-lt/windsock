@@ -1410,6 +1410,7 @@ dependencies = [
  "engine",
  "form_urlencoded",
  "hex",
+ "http-body",
  "http-body-util",
  "postcard",
  "quick-xml",

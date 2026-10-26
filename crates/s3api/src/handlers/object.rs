@@ -47,7 +47,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
 
     let info = state
         .engine
-        .put(&bucket, &key, body, metadata(&headers), mode)
+        .put(&bucket, &key, body, metadata(&headers)?, mode)
         .await?;
     Ok(reply(StatusCode::OK)
         .header("etag", xml::quoted(&etag(&info)))
@@ -105,7 +105,7 @@ async fn copy_object<R: Remote + 'static>(
 
     let object = state.engine.get(source_bucket, source_key, None).await?;
     let metadata = if replace {
-        metadata(headers)
+        metadata(headers)?
     } else {
         object.info.metadata
     };
@@ -205,7 +205,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
         state.engine.bucket(&bucket).await?;
         let upload_id = state
             .uploads
-            .initiate(&bucket, &key, metadata(&headers))
+            .initiate(&bucket, &key, metadata(&headers)?)
             .await?;
         info!(bucket, key, upload_id, "initiate multipart upload");
         return xml_reply(xml::initiate(&bucket, &key, &upload_id));

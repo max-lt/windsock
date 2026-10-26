@@ -111,9 +111,12 @@ fn etag(info: &ObjectInfo) -> String {
     hex::encode(info.content_hash)
 }
 
+/// The S3 limit on user metadata: names and values of the `x-amz-meta-*` headers together.
+const MAX_USER_METADATA: usize = 2048;
+
 /// Stored headers, and `x-amz-meta-*` headers under their full names.
-fn metadata(headers: &HeaderMap) -> BTreeMap<String, String> {
-    headers
+fn metadata(headers: &HeaderMap) -> Result<BTreeMap<String, String>, S3Error> {
+    let stored: BTreeMap<String, String> = headers
         .iter()
         .filter(|(name, _)| {
             STORED_HEADERS.contains(&name.as_str()) || name.as_str().starts_with("x-amz-meta-")
@@ -121,7 +124,20 @@ fn metadata(headers: &HeaderMap) -> BTreeMap<String, String> {
         .filter_map(|(name, value)| {
             Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
         })
-        .collect()
+        .collect();
+
+    let user: usize = stored
+        .iter()
+        .filter_map(|(name, value)| Some(name.strip_prefix("x-amz-meta-")?.len() + value.len()))
+        .sum();
+    if user > MAX_USER_METADATA {
+        return Err(S3Error::new(
+            "MetadataTooLarge",
+            StatusCode::BAD_REQUEST,
+            format!("user metadata is {user} bytes, more than {MAX_USER_METADATA}"),
+        ));
+    }
+    Ok(stored)
 }
 
 /// ETag, Last-Modified, Content-Type and the stored metadata of an object.
@@ -170,7 +186,8 @@ mod tests {
             ("x-amz-meta-color", "blue"),
             ("authorization", "secret"),
             ("x-amz-date", "20260101T000000Z"),
-        ]));
+        ]))
+        .unwrap();
 
         assert_eq!(
             stored,

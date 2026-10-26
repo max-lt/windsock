@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
@@ -192,6 +192,9 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The longest XML request body: 10 000 parts or 1 000 keys fit in less.
+const MAX_XML_BODY: usize = 4 * 1024 * 1024;
+
 /// Middleware for every S3 route. The handlers get the checked, decoded body.
 pub(crate) async fn authenticate<R: Remote + 'static>(
     State(state): State<AppState<R>>,
@@ -202,15 +205,27 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
     let verified = verify_head(&parts, &state.keys, unix_now())?;
     parts.extensions.insert(Caller(verified.access_key.clone()));
 
-    let body = axum::body::to_bytes(body, state.max_body)
-        .await
-        .map_err(|_| {
-            S3Error::new(
-                "EntityTooLarge",
+    // A POST carries XML only. Its body must not take the memory of an object upload.
+    let (limit, too_large) = match parts.method {
+        Method::POST => (MAX_XML_BODY.min(state.max_body), "MaxMessageLengthExceeded"),
+        _ => (state.max_body, "EntityTooLarge"),
+    };
+    let body = axum::body::to_bytes(body, limit).await.map_err(|e| {
+        let over_limit = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+            .any(|e| e.is::<http_body_util::LengthLimitError>());
+        match over_limit {
+            true => S3Error::new(
+                too_large,
                 StatusCode::BAD_REQUEST,
-                "the body is larger than the limit or did not arrive whole",
-            )
-        })?;
+                format!("the body is larger than {limit} bytes"),
+            ),
+            false => S3Error::new(
+                "IncompleteBody",
+                StatusCode::BAD_REQUEST,
+                "the body did not arrive whole",
+            ),
+        }
+    })?;
     let body = payload(&parts.headers, verified, body)?;
     strip_aws_chunked(&mut parts.headers);
 

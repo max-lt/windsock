@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, Response, StatusCode};
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine};
@@ -1062,4 +1062,129 @@ async fn test_head_of_an_empty_object_and_of_a_missing_key() {
     assert_eq!(empty.header("content-length"), Some("0"));
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
     assert!(missing.body.is_empty());
+}
+
+#[tokio::test]
+async fn test_key_longer_than_1024_bytes_is_refused() {
+    let server = with_bucket().await;
+    let uri = format!("/bkt/{}", "k".repeat(1025));
+
+    let reply = run(&server, call("PUT", &uri).body("v")).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "KeyTooLongError");
+}
+
+#[tokio::test]
+async fn test_user_metadata_over_2_kib_is_refused() {
+    let server = with_bucket().await;
+    // The name after x-amz-meta- counts: "a" + value.
+    let fits = "v".repeat(2047);
+    let over = "v".repeat(2048);
+
+    let at_limit = run(
+        &server,
+        call("PUT", "/bkt/a").header("x-amz-meta-a", fits).body("v"),
+    )
+    .await;
+    let above = run(
+        &server,
+        call("PUT", "/bkt/b").header("x-amz-meta-a", over).body("v"),
+    )
+    .await;
+
+    assert_eq!(at_limit.status, StatusCode::OK);
+    assert_eq!(above.status, StatusCode::BAD_REQUEST);
+    assert_eq!(above.xml("Code").unwrap(), "MetadataTooLarge");
+    assert_eq!(
+        run(&server, call("GET", "/bkt/b")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn test_part_number_outside_1_to_10000_is_refused() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+
+    for number in [0, 10_001] {
+        let reply = upload_part(&server, &id, number, "a").await;
+
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "part {number}");
+        assert_eq!(reply.xml("Code").unwrap(), "InvalidArgument");
+    }
+}
+
+#[tokio::test]
+async fn test_xml_body_over_4_mib_is_refused() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let body = format!(
+        "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+        " ".repeat(5 << 20)
+    );
+
+    let reply = run(
+        &server,
+        call("POST", &format!("/bkt/big?uploadId={id}")).body(body),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "MaxMessageLengthExceeded");
+}
+
+#[tokio::test]
+async fn test_malformed_xml_body_gives_malformed_xml() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+
+    let complete = run(
+        &server,
+        call("POST", &format!("/bkt/big?uploadId={id}")).body("<Complete"),
+    )
+    .await;
+    let delete = run(&server, call("POST", "/bkt?delete").body("not xml")).await;
+
+    for reply in [complete, delete] {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.xml("Code").unwrap(), "MalformedXML");
+    }
+}
+
+/// A request body that gives five bytes, then fails as a cut connection does.
+struct StopsEarly(bool);
+
+impl http_body::Body for StopsEarly {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        if std::mem::replace(&mut self.0, true) {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other("the client stopped"))));
+        }
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(
+            b"01234",
+        )))))
+    }
+}
+
+#[tokio::test]
+async fn test_body_that_stops_early_is_refused_and_stores_nothing() {
+    let server = with_bucket().await;
+    let request = call("PUT", "/bkt/half").body("0123456789").request();
+    let (parts, _) = request.into_parts();
+    let body = Body::new(StopsEarly(false));
+
+    let reply = send(&server, Request::from_parts(parts, body)).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "IncompleteBody");
+    assert_eq!(
+        run(&server, call("GET", "/bkt/half")).await.status,
+        StatusCode::NOT_FOUND
+    );
 }

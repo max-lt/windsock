@@ -359,6 +359,23 @@ fn test_run_refuses_a_node_key_that_other_users_can_read() {
 }
 
 #[test]
+fn test_bad_repository_key_file_names_the_path_and_not_the_content() {
+    let (dir, config, _) = init();
+    let key = dir.path().join("repo.key");
+    std::fs::write(&key, "secret-but-not-hex").unwrap();
+
+    let output = Command::new(BIN).arg("run").arg(&config).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("repo.key is not a repository key"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-but-not-hex"), "{stderr}");
+}
+
+#[test]
 fn test_init_does_not_overwrite_a_configuration() {
     let (dir, _, _) = init();
 

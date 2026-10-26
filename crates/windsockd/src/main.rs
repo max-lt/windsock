@@ -23,6 +23,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use config::{Config, RemoteConfig};
 use listener::{
@@ -81,7 +82,10 @@ fn init(dir: &Path) -> Result<()> {
     info!(config = %path.display(), "wrote a configuration; the S3 access key and secret are in it");
 
     let key_path = dir.join(REPO_KEY_FILE);
-    write_secret(&key_path, RepoKey::generate()?.to_hex().as_bytes())?;
+    write_secret(
+        &key_path,
+        Zeroizing::new(RepoKey::generate()?.to_hex()).as_bytes(),
+    )?;
     warn!(
         repo_key = %key_path.display(),
         "wrote a new repository key. Keep a copy away from the remote: without it, nobody can \
@@ -93,13 +97,13 @@ fn init(dir: &Path) -> Result<()> {
 /// The secret of the remote. A missing file is an error: a new key could not read the data.
 fn repo_key(path: &Path) -> Result<RepoKey> {
     refuse_if_others_can_read(path)?;
-    let text = std::fs::read_to_string(path).with_context(|| {
+    let text = Zeroizing::new(std::fs::read_to_string(path).with_context(|| {
         format!(
             "cannot read the repository key {}. Copy it from another proxy of this remote: a new \
              key cannot read the data",
             path.display()
         )
-    })?;
+    })?);
     RepoKey::from_hex(&text).with_context(|| format!("{} is not a repository key", path.display()))
 }
 
@@ -124,14 +128,17 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
     let path = data_dir.join(NODE_KEY_FILE);
 
     if !path.exists() {
-        write_secret(&path, hex::encode(config::random_bytes::<32>()?).as_bytes())?;
+        write_secret(
+            &path,
+            Zeroizing::new(hex::encode(config::random_bytes::<32>()?)).as_bytes(),
+        )?;
         info!(path = %path.display(), "made a new node key");
     }
 
     refuse_if_others_can_read(&path)?;
-    let text = std::fs::read_to_string(&path)?;
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(text.trim(), &mut bytes)
+    let text = Zeroizing::new(std::fs::read_to_string(&path)?);
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(text.trim(), bytes.as_mut())
         .with_context(|| format!("{} is not a hex key", path.display()))?;
     Ok(SigningKey::from_bytes(&bytes))
 }
@@ -177,7 +184,7 @@ async fn run(config: &Config, mode: Mode) -> Result<()> {
                 prefix: prefix.clone(),
                 region: region.clone(),
                 access_key: access_key.clone(),
-                secret_key: secret_key.clone(),
+                secret_key: secret_key.expose().to_string(),
                 retry: Retry::default(),
                 ca_pem,
             })?;

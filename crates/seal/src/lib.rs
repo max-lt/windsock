@@ -7,6 +7,7 @@
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use model::ChunkId;
+use zeroize::Zeroize;
 
 /// Format of a sealed blob: `VERSION | key_id[4] | nonce[24] | ciphertext | tag[16]`.
 const VERSION: u8 = 1;
@@ -34,6 +35,12 @@ pub enum SealError {
 /// The secret of one remote. Its loss makes all data of the remote unreadable.
 pub struct RepoKey([u8; 32]);
 
+impl Drop for RepoKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl std::fmt::Debug for RepoKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RepoKey(..)")
@@ -53,18 +60,21 @@ impl RepoKey {
         Ok(Self(bytes))
     }
 
+    /// The key file content. Zeroize it after use.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
     pub fn keys(&self) -> Keys {
         let chunk_id = blake3::derive_key("windsock 2026-10-26 chunk id", &self.0);
-        let seal = blake3::derive_key("windsock 2026-10-26 seal", &self.0);
+        let mut seal = blake3::derive_key("windsock 2026-10-26 seal", &self.0);
         let id = blake3::derive_key("windsock 2026-10-26 seal key id", &seal);
+        let cipher = XChaCha20Poly1305::new(&seal.into());
+        seal.zeroize();
         Keys {
             chunk_id,
             sealer: Sealer {
-                cipher: XChaCha20Poly1305::new(&seal.into()),
+                cipher,
                 key_id: id[..KEY_ID_LEN]
                     .try_into()
                     .expect("a hash has more than 4 bytes"),
@@ -80,11 +90,23 @@ fn getrandom(bytes: &mut [u8]) -> Result<(), SealError> {
         .map_err(|e| SealError::Random(e.to_string()))
 }
 
-/// The keys that one repository secret gives.
+/// The keys that one repository secret gives. The cipher zeroizes its own key on drop.
 #[derive(Clone)]
 pub struct Keys {
     chunk_id: [u8; 32],
     sealer: Sealer,
+}
+
+impl Drop for Keys {
+    fn drop(&mut self) {
+        self.chunk_id.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keys(..)")
+    }
 }
 
 impl Keys {
@@ -95,8 +117,10 @@ impl Keys {
 
     /// A secret FastCDC seed, so chunk sizes do not show the structure of an object.
     pub fn cdc_seed(&self) -> u64 {
-        let seed = blake3::derive_key("windsock 2026-10-26 fastcdc seed", &self.chunk_id);
-        u64::from_le_bytes(seed[..8].try_into().expect("a hash has more than 8 bytes"))
+        let mut seed = blake3::derive_key("windsock 2026-10-26 fastcdc seed", &self.chunk_id);
+        let value = u64::from_le_bytes(seed[..8].try_into().expect("a hash has more than 8 bytes"));
+        seed.zeroize();
+        value
     }
 
     pub fn sealer(&self) -> &Sealer {
@@ -263,6 +287,7 @@ mod tests {
         );
         assert!(RepoKey::from_hex("not hex").is_err());
         assert_eq!(format!("{key:?}"), "RepoKey(..)");
+        assert_eq!(format!("{:?}", key.keys()), "Keys(..)");
     }
 
     #[test]

@@ -8,6 +8,23 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// A secret string from the configuration. Its `Debug` form hides it, so no log shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -53,7 +70,7 @@ pub enum RemoteConfig {
         #[serde(default = "default_region")]
         region: String,
         access_key: String,
-        secret_key: String,
+        secret_key: Secret,
         /// PEM file of a private CA to trust, for https. Relative to the file.
         #[serde(default)]
         ca_file: Option<PathBuf>,
@@ -64,7 +81,7 @@ pub enum RemoteConfig {
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
     pub access_key: String,
-    pub secret_key: String,
+    pub secret_key: Secret,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +183,7 @@ impl Config {
     pub fn keys(&self) -> HashMap<String, String> {
         self.keys
             .iter()
-            .map(|k| (k.access_key.clone(), k.secret_key.clone()))
+            .map(|k| (k.access_key.clone(), k.secret_key.expose().to_string()))
             .collect()
     }
 
@@ -195,7 +212,7 @@ impl Config {
                     "WS{}",
                     random_chars(18, b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")?
                 ),
-                secret_key: hex::encode(random_bytes::<20>()?),
+                secret_key: Secret(hex::encode(random_bytes::<20>()?)),
             }],
             sync_interval_secs: default_sync_interval(),
             max_connections: None,
@@ -234,7 +251,8 @@ mod tests {
 
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
         assert!(text.contains("type = \"dir\""));
-        assert_eq!(config.keys[0].secret_key.len(), 40);
+        assert_eq!(config.keys[0].secret_key.expose().len(), 40);
+        assert!(!format!("{config:?}").contains(config.keys[0].secret_key.expose()));
         assert_ne!(Config::local().unwrap().keys, config.keys);
     }
 

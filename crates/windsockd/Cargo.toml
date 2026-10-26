@@ -18,6 +18,7 @@ rustix.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml.workspace = true
+zeroize.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

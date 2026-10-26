@@ -33,6 +33,7 @@ use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
+use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -275,7 +276,7 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         };
         match sealer.open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored) {
-            Ok(plain) if plain == KEY_CHECK.as_bytes() => Ok(()),
+            Ok(plain) if bool::from(plain.as_slice().ct_eq(KEY_CHECK.as_bytes())) => Ok(()),
             Ok(_) => Err(EngineError::WrongRepoKey(format!(
                 "{KEY_CHECK_KEY} is changed"
             ))),

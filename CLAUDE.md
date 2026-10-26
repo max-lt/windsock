@@ -172,6 +172,7 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | Hex encoding                 | `hex`                                                                                 |
 | Serialization                | `serde`, `postcard`                                                                   |
 | Errors                       | `thiserror`                                                                           |
+| Secret wipe                  | `zeroize` (already a dependency of `chacha20poly1305`)                                |
 | Signatures                   | `ed25519-dalek` v2                                                                    |
 | Encryption                   | `chacha20poly1305` 0.10 (XChaCha20-Poly1305, RustCrypto)                              |
 | Logging                      | `tracing`                                                                             |

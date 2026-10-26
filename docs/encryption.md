@@ -62,6 +62,9 @@ longer than its content.
 | `repo/key-check`       | A known value                                             | Nothing else                                                      |
 | `nodes/<node>`         | Empty marker                                              | The node ID                                                       |
 
+A pack upload whose answer is lost is sent again with a new nonce. The first pack then has no
+manifest, and the GC condemns it.
+
 No read and no GC path reads the pack footer. The integrity of a pack rests on the seal of each
 chunk.
 

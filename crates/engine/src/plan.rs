@@ -138,7 +138,7 @@ impl Planner {
                 self.pack_ids.push(None);
                 OpenPack {
                     number: self.pack_ids.len() - 1,
-                    builder: PackBuilder::new(self.nonces.next()),
+                    builder: PackBuilder::new(self.nonces.next(), &self.keys),
                 }
             });
             let slot = Slot::Building {

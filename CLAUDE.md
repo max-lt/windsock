@@ -30,7 +30,7 @@ The daemon crate is `windsockd`.
 - `seal`: the repository secret (`repo.key`), its two subkeys, keyed chunk IDs, the FastCDC seed,
   and the seal of each object that goes to the remote (XChaCha20-Poly1305).
 - `chunking`: FastCDC chunk boundaries, chunk IDs, per-chunk zstd compression.
-- `pack`: pack format v2 (header with a nonce, chunks, postcard footer, trailer), builder, parser,
+- `pack`: pack format v3 (header with a nonce, sealed chunks, sealed postcard footer, trailer), builder, parser,
   one-chunk read.
 - `remote`: `Remote` trait (put, create, get, get_range, list, no delete), `Sweep` trait (delete,
   GC only), memory and local directory backends, the contract checks (`contract`, feature `contract`)

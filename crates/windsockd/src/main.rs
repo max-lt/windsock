@@ -92,6 +92,18 @@ fn init(dir: &Path) -> Result<()> {
 
 /// The secret of the remote. A missing file is an error: a new key could not read the data.
 fn repo_key(path: &Path) -> Result<RepoKey> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The key reads all data of the remote: refuse it when other users can read it, as ssh does.
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!(
+            "{} can be read by other users. Run: chmod 600 {}",
+            path.display(),
+            path.display()
+        );
+    }
     let text = std::fs::read_to_string(path).with_context(|| {
         format!(
             "cannot read the repository key {}. Copy it from another proxy of this remote: a new \

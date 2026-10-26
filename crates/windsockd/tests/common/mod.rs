@@ -316,7 +316,9 @@ flush_delay_ms = {flush_delay_ms}
     let path = dir.join("windsock.toml");
     std::fs::write(&path, text).unwrap();
     // The proxies of one remote share one repository key.
-    std::fs::write(dir.join("repo.key"), "07".repeat(32)).unwrap();
+    let key = dir.join("repo.key");
+    std::fs::write(&key, "07".repeat(32)).unwrap();
+    std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     path
 }
 

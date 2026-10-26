@@ -34,12 +34,15 @@ impl<R: Remote + 'static> Engine<R> {
         let mut buffer = self.buffer.lock().await;
         self.require_bucket(&buffer, name)?;
 
-        let has_objects = self
-            .keys_in(&buffer, name, "")?
-            .into_iter()
-            .any(|(_, current)| current.exists());
+        let first = ListQuery {
+            prefix: "",
+            delimiter: None,
+            after: None,
+            max_keys: 1,
+        };
+        let (found, _) = self.scan_page(&buffer, name, &first)?;
 
-        if has_objects {
+        if !found.is_empty() {
             return Err(EngineError::BucketNotEmpty(name.to_string()));
         }
 

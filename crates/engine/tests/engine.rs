@@ -120,11 +120,28 @@ async fn get<R: Remote + 'static>(engine: &Engine<R>, key: &str) -> Result<Vec<u
     Ok(engine.get(BUCKET, key, None).await?.data.to_vec())
 }
 
+/// Every object of the bucket: the tests keep fewer than 1000.
+async fn objects<R: Remote + 'static>(engine: &Engine<R>) -> Vec<engine::ObjectInfo> {
+    let all = engine::ListQuery {
+        prefix: "",
+        delimiter: None,
+        after: None,
+        max_keys: 1000,
+    };
+    let page = engine.list_page(BUCKET, &all).await.unwrap();
+    assert!(!page.truncated);
+    page.entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            engine::ListEntry::Object(info) => Some(info),
+            engine::ListEntry::CommonPrefix(_) => None,
+        })
+        .collect()
+}
+
 async fn keys<R: Remote + 'static>(engine: &Engine<R>) -> Vec<String> {
-    engine
-        .list(BUCKET, "")
+    objects(engine)
         .await
-        .unwrap()
         .into_iter()
         .map(|info| info.key)
         .collect()

@@ -587,18 +587,6 @@ impl Buffer {
         self.objects.get(&(bucket.to_string(), key.to_string()))
     }
 
-    /// Buffered writes to the keys of `bucket` under `prefix`, in key order.
-    pub fn objects<'a>(
-        &'a self,
-        bucket: &'a str,
-        prefix: &'a str,
-    ) -> impl Iterator<Item = (&'a str, &'a BufferedObject)> {
-        self.objects
-            .range((bucket.to_string(), prefix.to_string())..)
-            .take_while(move |((b, k), _)| b == bucket && k.starts_with(prefix))
-            .map(|((_, k), object)| (k.as_str(), object))
-    }
-
     /// The first buffered object of `bucket` under `prefix` whose key is `from` or after it.
     pub fn first_object_from<'a>(
         &'a self,
@@ -1092,9 +1080,11 @@ mod tests {
             buffer.append(put(key, b"d"), b"d").await.unwrap();
         }
 
-        let keys: Vec<_> = buffer.objects("b", "x/").map(|(k, _)| k).collect();
+        let first = |bucket, from| buffer.first_object_from(bucket, "x/", from).map(|(k, _)| k);
 
-        assert_eq!(keys, ["x/1", "x/2"]);
-        assert_eq!(buffer.objects("ba", "").count(), 0);
+        assert_eq!(first("b", ""), Some("x/1"));
+        assert_eq!(first("b", "x/1\0"), Some("x/2"));
+        assert_eq!(first("b", "x/2\0"), None, "y is outside the prefix");
+        assert_eq!(first("ba", ""), None, "another bucket");
     }
 }

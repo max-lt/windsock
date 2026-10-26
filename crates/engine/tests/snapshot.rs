@@ -103,9 +103,31 @@ async fn get(engine: &Engine<TestRemote>, key: &str) -> String {
     String::from_utf8(object.data.to_vec()).unwrap()
 }
 
+/// Every object of the bucket: the tests keep fewer than 1000.
+async fn objects<R: Remote + 'static>(engine: &Engine<R>) -> Vec<engine::ObjectInfo> {
+    let all = engine::ListQuery {
+        prefix: "",
+        delimiter: None,
+        after: None,
+        max_keys: 1000,
+    };
+    let page = engine.list_page(BUCKET, &all).await.unwrap();
+    assert!(!page.truncated);
+    page.entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            engine::ListEntry::Object(info) => Some(info),
+            engine::ListEntry::CommonPrefix(_) => None,
+        })
+        .collect()
+}
+
 async fn keys(engine: &Engine<TestRemote>) -> Vec<String> {
-    let listed = engine.list(BUCKET, "").await.unwrap();
-    listed.into_iter().map(|info| info.key).collect()
+    objects(engine)
+        .await
+        .into_iter()
+        .map(|info| info.key)
+        .collect()
 }
 
 /// Entries in the remote, read raw.

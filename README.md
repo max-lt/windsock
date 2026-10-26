@@ -129,6 +129,17 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
 - A multipart upload must complete on the proxy that started it.
 
+## Scale
+
+Measured with 200,000 small objects in one bucket:
+
+- The index takes about 510 bytes of memory (RSS) per key.
+- A snapshot takes about 231 bytes per key. On an S3 remote, a proxy reads at most 1 GiB in one
+  answer. Above about 4,600,000 keys, a new proxy cannot load the snapshot, and it cannot start.
+  Keep a remote under that number of keys.
+- A ListObjects page costs the same for any number of keys in the bucket: 1000 keys in about
+  20 ms.
+
 ## Development
 
 See `CLAUDE.md` for the build, test and code rules, and `../windsock-todo.md` for the design.

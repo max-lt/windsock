@@ -140,9 +140,31 @@ async fn get(engine: &Engine<TestRemote>, key: &str) -> Result<Vec<u8>, EngineEr
     Ok(engine.get(BUCKET, key, None).await?.data.to_vec())
 }
 
+/// Every object of the bucket: the tests keep fewer than 1000.
+async fn objects<R: Remote + 'static>(engine: &Engine<R>) -> Vec<engine::ObjectInfo> {
+    let all = engine::ListQuery {
+        prefix: "",
+        delimiter: None,
+        after: None,
+        max_keys: 1000,
+    };
+    let page = engine.list_page(BUCKET, &all).await.unwrap();
+    assert!(!page.truncated);
+    page.entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            engine::ListEntry::Object(info) => Some(info),
+            engine::ListEntry::CommonPrefix(_) => None,
+        })
+        .collect()
+}
+
 async fn keys(engine: &Engine<TestRemote>) -> Vec<String> {
-    let listed = engine.list(BUCKET, "").await.unwrap();
-    listed.into_iter().map(|info| info.key).collect()
+    objects(engine)
+        .await
+        .into_iter()
+        .map(|info| info.key)
+        .collect()
 }
 
 async fn count(remote: &TestRemote, prefix: &str) -> usize {
@@ -561,8 +583,8 @@ async fn test_snapshot_bootstrap_and_full_replay_give_the_same_index() {
     let mut views = Vec::new();
     for engine in [&replayed.engine, &bootstrapped.engine] {
         engine.sync().await.unwrap();
-        let listed = engine.list(BUCKET, "").await.unwrap();
-        let view: Vec<_> = listed
+        let view: Vec<_> = objects(engine)
+            .await
             .into_iter()
             .map(|info| (info.key, info.size, info.content_hash))
             .collect();

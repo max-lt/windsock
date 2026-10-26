@@ -42,27 +42,6 @@ impl<R: Remote + 'static> Engine<R> {
         }
     }
 
-    /// Every key of `bucket` under `prefix` that exists, in key order.
-    pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
-        self.retry_after_sync(|| async move {
-            let keys = self
-                .read_settled(|buffer| {
-                    self.require_bucket(buffer, bucket)?;
-                    self.keys_in(buffer, bucket, prefix)
-                })
-                .await?;
-
-            let mut out = Vec::with_capacity(keys.len());
-            for (key, current) in keys {
-                if current.exists() {
-                    out.push(self.info(bucket, &key, current).await?);
-                }
-            }
-            Ok(out)
-        })
-        .await
-    }
-
     /// Every journaled version of a key. Buffered writes are not versions yet.
     pub fn versions(&self, bucket: &str, key: &str) -> Result<Option<ObjectState>> {
         Ok(self.index().object(bucket, key)?)
@@ -122,31 +101,6 @@ impl<R: Remote + 'static> Engine<R> {
 
         let state = self.index().object(bucket, key)?;
         Ok(state.map_or(Current::Absent, |state| stored(&state)))
-    }
-
-    /// The current state of every key of `bucket` under `prefix`, deleted ones included.
-    pub(crate) fn keys_in(
-        &self,
-        buffer: &Buffer,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<Vec<(String, Current)>> {
-        let mut keys: BTreeMap<String, Current> = self
-            .index()
-            .list(bucket, prefix)?
-            .into_iter()
-            .map(|(key, state)| (key, stored(&state)))
-            .collect();
-
-        for (key, object) in buffer.objects(bucket, prefix) {
-            let current = match object {
-                BufferedObject::Put(put) => Current::Buffered(put.clone()),
-                BufferedObject::Delete { .. } => Current::Absent,
-            };
-            keys.insert(key.to_string(), current);
-        }
-
-        Ok(keys.into_iter().collect())
     }
 
     pub(crate) async fn info(

@@ -36,7 +36,7 @@ pub struct ListPage {
 }
 
 /// A page entry before its object info is read.
-enum Found {
+pub(crate) enum Found {
     Object(String, Current),
     CommonPrefix(String),
 }
@@ -66,7 +66,7 @@ impl<R: Remote + 'static> Engine<R> {
         .await
     }
 
-    fn scan_page(
+    pub(crate) fn scan_page(
         &self,
         buffer: &Buffer,
         bucket: &str,

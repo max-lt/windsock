@@ -422,3 +422,172 @@ async fn test_empty_put_sends_a_content_length() {
 
     remote.put("nodes/a", Bytes::new()).await.unwrap();
 }
+
+/// A server that answers every request with `status` and an S3 error `code`.
+async fn always(status: StatusCode, code: &'static str) -> (String, Arc<AtomicU32>) {
+    let count = Arc::new(AtomicU32::new(0));
+    let app = Router::new()
+        .fallback(move |State(count): State<Arc<AtomicU32>>| async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            respond(
+                status,
+                &format!("<Error><Code>{code}</Code><Message>m</Message></Error>"),
+            )
+        })
+        .with_state(count.clone());
+    (serve(app).await, count)
+}
+
+#[tokio::test]
+async fn test_server_errors_retry_to_the_limit_and_client_errors_do_not() {
+    let cases = [
+        (StatusCode::INTERNAL_SERVER_ERROR, "InternalError", 3),
+        (StatusCode::BAD_GATEWAY, "BadGateway", 3),
+        (StatusCode::SERVICE_UNAVAILABLE, "SlowDown", 3),
+        (StatusCode::TOO_MANY_REQUESTS, "TooManyRequests", 3),
+        (StatusCode::BAD_REQUEST, "InvalidRequest", 1),
+        (StatusCode::FORBIDDEN, "AccessDenied", 1),
+        (StatusCode::NOT_FOUND, "NoSuchBucket", 1),
+    ];
+
+    for (status, code, attempts) in cases {
+        let (endpoint, count) = always(status, code).await;
+        let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+        let result = remote.put("packs/a", Bytes::from("x")).await;
+
+        assert!(
+            matches!(result, Err(RemoteError::Service { status: s, code: ref c, .. })
+                if s == status.as_u16() && c == code),
+            "{status}: {result:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), attempts, "{status}");
+    }
+}
+
+/// A connection the server closes at once is retried, then fails as I/O.
+#[tokio::test]
+async fn test_dropped_connections_retry_to_the_limit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicU32::new(0));
+    let accepted = count.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let result = remote.get("packs/a").await;
+
+    assert!(matches!(result, Err(RemoteError::Io(_))), "{result:?}");
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+}
+
+/// The operator must see a clock problem by its S3 code.
+#[tokio::test]
+async fn test_clock_skew_error_names_its_code_and_is_not_retried() {
+    let (endpoint, count) = always(StatusCode::FORBIDDEN, "RequestTimeTooSkewed").await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let error = remote.get("packs/a").await.unwrap_err();
+
+    assert!(
+        error.to_string().contains("RequestTimeTooSkewed"),
+        "{error}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+/// A redirect would send the signed request to another host: the client does not follow it.
+#[tokio::test]
+async fn test_redirect_is_an_error_and_is_not_followed() {
+    let (elsewhere, reached) = always(StatusCode::OK, "").await;
+    let location = format!("{elsewhere}/bkt/packs/a");
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::TEMPORARY_REDIRECT,
+    ] {
+        let target = location.clone();
+        let app = Router::new().fallback(move || {
+            let target = target.clone();
+            async move {
+                Response::builder()
+                    .status(status)
+                    .header("location", target)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        });
+        let remote = S3Remote::new(config(&serve(app).await, "")).unwrap();
+
+        let get = remote.get("packs/a").await;
+        let put = remote.put("packs/a", Bytes::from("x")).await;
+
+        assert!(
+            matches!(get, Err(RemoteError::Service { status: s, .. }) if s == status.as_u16()),
+            "{get:?}"
+        );
+        assert!(put.is_err(), "{put:?}");
+    }
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "no request reaches the other host"
+    );
+}
+
+/// Keys that need URI encoding: the signature matches, and the key comes back the same.
+/// A key with an empty segment, as one that ends with `/`, never leaves the client.
+#[tokio::test]
+async fn test_keys_that_need_encoding_round_trip() {
+    let server = server().await;
+    let remote = S3Remote::new(config(&server.endpoint, "p re+fix/")).unwrap();
+    let keys = [
+        "packs/with space",
+        "packs/plus+sign",
+        "packs/per%cent",
+        "packs/%2F not a slash",
+        "packs/\u{e9}t\u{e9}/\u{1f600}",
+        "packs/a~b*c'd(e)!",
+    ];
+
+    for key in keys {
+        remote.put(key, Bytes::from(key.to_string())).await.unwrap();
+    }
+
+    for key in keys {
+        assert_eq!(
+            remote.get(key).await.unwrap().unwrap(),
+            key.as_bytes(),
+            "{key}"
+        );
+    }
+    let mut listed = remote.list("packs/").await.unwrap();
+    listed.sort();
+    let mut expected: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    expected.sort();
+    assert_eq!(listed, expected);
+    assert!(matches!(
+        remote.put("packs/ends/", Bytes::new()).await,
+        Err(RemoteError::InvalidKey(_))
+    ));
+}
+
+/// The client reads no ETag and no request ID on a put: odd values change nothing.
+#[tokio::test]
+async fn test_odd_etag_and_request_id_on_a_put_change_nothing() {
+    let app = Router::new().fallback(|| async {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", "\"not-the-md5\"")
+            .header("x-amz-request-id", "not <an> id")
+            .body(Body::empty())
+            .unwrap()
+    });
+    let remote = S3Remote::new(config(&serve(app).await, "")).unwrap();
+
+    remote.put("packs/a", Bytes::from("x")).await.unwrap();
+}

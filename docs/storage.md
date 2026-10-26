@@ -72,6 +72,19 @@ key prefix of a Windsock remote.
 
 Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 
+## The S3 client
+
+- At most 64 calls to the remote run at one time. The client keeps at most 64 idle connections.
+  More calls wait for a slot.
+- A call has at most 6 attempts. The pause between attempts starts at 100 ms and doubles up to
+  5 s. One attempt stops after 60 s, and all attempts of one call stop after 120 s.
+- Statuses 408, 429, 500, 502, 503 and 504 cause a new attempt, and so does a lost connection.
+  Other statuses, such as 403 `RequestTimeTooSkewed`, fail at once with their S3 code in the log.
+- The client does not follow a redirect.
+- The client always verifies the TLS certificate and its host name. No setting turns the check
+  off. For a private CA, set `ca_file`.
+- An empty access key or secret key stops the start.
+
 ## Cloudflare R2
 
 Test on 2026-10-26 with a release build, feature `tls`, from a Mac on a home link.

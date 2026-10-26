@@ -72,6 +72,8 @@ pub struct Config {
     pub retention: Duration,
     /// The GC writes a snapshot when the latest one is this old, then prunes the journal under it.
     pub snapshot_interval: Duration,
+    /// A snapshot loads in ranged reads of this size, so it can be larger than one remote reply.
+    pub snapshot_part: u64,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -88,6 +90,7 @@ impl Default for Config {
             gc_horizon: Duration::from_secs(24 * 3600),
             retention: Duration::from_secs(24 * 3600),
             snapshot_interval: Duration::from_secs(24 * 3600),
+            snapshot_part: 64 * 1024 * 1024,
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

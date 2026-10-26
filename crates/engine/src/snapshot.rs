@@ -10,13 +10,16 @@
 use bytes::Bytes;
 use index::Snapshot;
 use journal::{Journal, entry_key};
-use remote::Remote;
+use remote::{Remote, RemoteError};
 use tracing::{info, warn};
 
 use crate::{Engine, EngineError, Manifest, Result, buffer};
 
 /// Prefix of all snapshot keys: `snapshots/<unix nanos, 20 digits>-<blake3>`, so list order is time order.
 pub const SNAPSHOTS_PREFIX: &str = "snapshots/";
+
+/// The largest snapshot a proxy loads. The remote is not trusted with the size of the buffer.
+pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 
 /// The write time and the hash in a snapshot key.
 fn parse_key(key: &str) -> Option<(u64, [u8; 32])> {
@@ -61,9 +64,7 @@ impl<R: Remote + 'static> Engine<R> {
             let Some((time, hash)) = parse_key(key) else {
                 continue;
             };
-            let read = self.remote.get(key).await;
-            let Some(sealed) = read.map_err(|e| EngineError::Corrupt(format!("{key}: {e}")))?
-            else {
+            let Some(sealed) = self.read_snapshot(key).await? else {
                 continue;
             };
             if blake3::hash(&sealed).as_bytes() != &hash {
@@ -90,6 +91,48 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         Ok(None)
+    }
+
+    /// The whole snapshot at `key`, read in ranges of `snapshot_part`. `None` if it is gone.
+    async fn read_snapshot(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let failed = |e: RemoteError| EngineError::Corrupt(format!("{key}: {e}"));
+        // A range past any object fails with the object size.
+        let len = match self.remote.get_range(key, u64::MAX - 1..u64::MAX).await {
+            Err(RemoteError::InvalidRange { len, .. }) => len,
+            Ok(None) => return Ok(None),
+            Ok(Some(_)) => return Err(EngineError::Corrupt(format!("{key}: no size"))),
+            Err(e) => return Err(failed(e)),
+        };
+        if len > MAX_SNAPSHOT {
+            return Err(EngineError::Corrupt(format!(
+                "{key}: the snapshot has {len} bytes, over the cap of {MAX_SNAPSHOT} bytes"
+            )));
+        }
+
+        let part = self.config.snapshot_part.max(1);
+        let mut sealed = Vec::with_capacity(len as usize);
+        while (sealed.len() as u64) < len {
+            let start = sealed.len() as u64;
+            let end = (start + part).min(len);
+            let Some(bytes) = self
+                .remote
+                .get_range(key, start..end)
+                .await
+                .map_err(failed)?
+            else {
+                return Ok(None);
+            };
+            if bytes.len() as u64 != end - start {
+                return Err(EngineError::Corrupt(format!(
+                    "{key}: a ranged read gave {} bytes, not {}",
+                    bytes.len(),
+                    end - start
+                )));
+            }
+            sealed.extend_from_slice(&bytes);
+        }
+
+        Ok(Some(sealed))
     }
 
     /// Replaces the index with the latest snapshot. Returns `false` when there is none.

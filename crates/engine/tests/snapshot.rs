@@ -21,6 +21,12 @@ struct TestRemote {
     inner: MemoryRemote,
     log_gets: AtomicUsize,
     ambiguous_create: AtomicBool,
+    /// Ranged reads of snapshots.
+    snapshot_ranges: AtomicUsize,
+    /// A whole get of a snapshot fails, as a reply over the S3 client cap does.
+    refuse_snapshot_get: AtomicBool,
+    /// The size a snapshot reports, when set.
+    snapshot_len: std::sync::Mutex<Option<u64>>,
 }
 
 #[async_trait::async_trait]
@@ -40,6 +46,13 @@ impl Remote for TestRemote {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        if key.starts_with(engine::SNAPSHOTS_PREFIX)
+            && self.refuse_snapshot_get.load(Ordering::SeqCst)
+        {
+            return Err(RemoteError::Io(std::io::Error::other(
+                "the reply is larger than the limit",
+            )));
+        }
         if key.starts_with(journal::LOG_PREFIX) {
             self.log_gets.fetch_add(1, Ordering::SeqCst);
         }
@@ -47,6 +60,17 @@ impl Remote for TestRemote {
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        if key.starts_with(engine::SNAPSHOTS_PREFIX) {
+            self.snapshot_ranges.fetch_add(1, Ordering::SeqCst);
+            if let Some(len) = *self.snapshot_len.lock().unwrap() {
+                return Err(RemoteError::InvalidRange {
+                    key: key.to_string(),
+                    start: range.start,
+                    end: range.end,
+                    len,
+                });
+            }
+        }
         self.inner.get_range(key, range).await
     }
 
@@ -328,4 +352,57 @@ async fn test_restart_keeps_reading_after_the_prune() {
     assert_eq!(keys(&a.engine).await, ["x", "y"]);
     a.engine.sync().await.unwrap();
     drop(a.dir);
+}
+
+/// A snapshot larger than one remote reply loads in ranged reads, and gives the same index.
+#[tokio::test]
+async fn test_snapshot_loads_in_ranged_parts() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history(&remote).await;
+    let key = remote
+        .list(engine::SNAPSHOTS_PREFIX)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let len = remote.inner.get(&key).await.unwrap().unwrap().len() as u64;
+    remote.refuse_snapshot_get.store(true, Ordering::SeqCst);
+    remote.snapshot_ranges.store(0, Ordering::SeqCst);
+    let config = Config {
+        snapshot_part: len.div_ceil(5),
+        ..Config::default()
+    };
+    let key = SigningKey::from_bytes(&[2; 32]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let b = Engine::open(
+        dir.path(),
+        remote.clone(),
+        key,
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        remote.snapshot_ranges.load(Ordering::SeqCst),
+        1 + 5,
+        "one size probe, five parts"
+    );
+    assert_eq!(keys(&b).await, keys(&a.engine).await);
+    assert_eq!(get(&b, "y").await, "two");
+}
+
+/// The remote is not trusted with the size of the buffer a snapshot needs.
+#[tokio::test]
+async fn test_snapshot_over_the_cap_fails_with_its_key_and_the_cap() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history(&remote).await;
+    *remote.snapshot_len.lock().unwrap() = Some(engine::MAX_SNAPSHOT + 1);
+
+    let error = a.engine.gc().await.unwrap_err().to_string();
+
+    assert!(error.contains("snapshots/"), "{error}");
+    assert!(error.contains(&engine::MAX_SNAPSHOT.to_string()), "{error}");
 }

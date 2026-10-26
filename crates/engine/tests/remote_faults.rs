@@ -87,6 +87,10 @@ impl Remote for FaultRemote {
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        let failing = *self.failing_reads.lock().unwrap();
+        if failing.is_some_and(|prefix| key.starts_with(prefix)) {
+            return Err(unavailable());
+        }
         self.inner.get_range(key, range).await
     }
 

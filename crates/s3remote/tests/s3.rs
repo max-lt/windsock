@@ -790,3 +790,30 @@ async fn test_slow_remote_with_a_full_cap_still_acknowledges_puts() {
         s3remote::MAX_IN_FLIGHT
     );
 }
+
+/// A range past the end reports the object size: the snapshot load uses it as a size probe.
+#[tokio::test]
+async fn test_range_past_any_object_reports_its_size() {
+    let server = server().await;
+    let remote = S3Remote::new(config(&server.endpoint, "")).unwrap();
+    remote
+        .put("snapshots/a", Bytes::from(vec![7; 1234]))
+        .await
+        .unwrap();
+
+    let result = remote
+        .get_range("snapshots/a", u64::MAX - 1..u64::MAX)
+        .await;
+
+    assert!(
+        matches!(result, Err(RemoteError::InvalidRange { len: 1234, .. })),
+        "{result:?}"
+    );
+    assert!(
+        remote
+            .get_range("snapshots/none", u64::MAX - 1..u64::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

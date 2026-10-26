@@ -134,9 +134,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 Measured with 200,000 small objects in one bucket:
 
 - The index takes about 510 bytes of memory (RSS) per key.
-- A snapshot takes about 231 bytes per key. On an S3 remote, a proxy reads at most 1 GiB in one
-  answer. Above about 4,600,000 keys, a new proxy cannot load the snapshot, and it cannot start.
-  Keep a remote under that number of keys.
+- A snapshot takes about 231 bytes per key. A new proxy loads it in reads of 64 MiB, and loads
+  at most 16 GiB: about 74,000,000 keys. Above that, a new proxy cannot start, and the error names
+  the snapshot and the cap.
 - A ListObjects page costs the same for any number of keys in the bucket: 1000 keys in about
   20 ms.
 

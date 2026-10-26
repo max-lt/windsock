@@ -1188,3 +1188,141 @@ async fn test_body_that_stops_early_is_refused_and_stores_nothing() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Two clients put one key at the same time, many times: a GET returns one whole version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_puts_on_one_key_leave_one_whole_version() {
+    let server = Arc::new(with_bucket().await);
+    let a = "a".repeat(300 * 1024);
+    let b = "b".repeat(300 * 1024);
+
+    for round in 0..20 {
+        let tasks = [a.clone(), b.clone()].map(|body| {
+            let server = server.clone();
+            tokio::spawn(async move { put(&server, "k", &body).await.status })
+        });
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+        if round % 5 == 0 {
+            server.engine.flush().await.unwrap();
+        }
+
+        let read = run(&server, call("GET", "/bkt/k")).await.text();
+        assert!(read == a || read == b, "round {round}: a mixed object");
+    }
+}
+
+/// A delete during a GET of a large object: the GET gives the whole object, or 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_delete_during_a_get_gives_whole_object_or_not_found() {
+    let server = Arc::new(with_bucket().await);
+    let data = "d".repeat(9 << 20);
+
+    for flushed in [false, true] {
+        put(&server, "big", &data).await;
+        if flushed {
+            server.engine.flush().await.unwrap();
+        }
+        let reader = server.clone();
+        let read = tokio::spawn(async move { run(&reader, call("GET", "/bkt/big")).await });
+        let deleted = run(&server, call("DELETE", "/bkt/big")).await;
+        let read = read.await.unwrap();
+
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+        match read.status {
+            StatusCode::OK => assert_eq!(read.body.len(), data.len(), "a partial body"),
+            status => assert_eq!(status, StatusCode::NOT_FOUND),
+        }
+    }
+}
+
+/// Keys that exist for the whole listing appear once, while other keys come and go.
+#[tokio::test]
+async fn test_listing_pages_while_keys_change_skip_and_repeat_nothing() {
+    let server = with_bucket().await;
+    let stable: Vec<String> = (0..40).map(|i| format!("k{i:03}")).collect();
+    for key in &stable {
+        put(&server, key, "v").await;
+    }
+    for i in 0..40 {
+        put(&server, &format!("k{i:03}-gone"), "v").await;
+    }
+
+    let mut seen = Vec::new();
+    let mut token: Option<String> = None;
+    let mut page = 0;
+    loop {
+        let uri = match &token {
+            Some(token) => format!("/bkt?list-type=2&max-keys=7&continuation-token={token}"),
+            None => "/bkt?list-type=2&max-keys=7".to_string(),
+        };
+        let reply = run(&server, call("GET", &uri)).await;
+        seen.extend(reply.xml_all("Key"));
+        // Between pages: delete a key behind and ahead of the cursor, add new ones on both sides.
+        put(&server, &format!("a-new-{page}"), "v").await;
+        put(&server, &format!("k{:03}-new", page * 5), "v").await;
+        run(
+            &server,
+            call("DELETE", &format!("/bkt/k{:03}-gone", page * 3)),
+        )
+        .await;
+        page += 1;
+        token = reply.xml("NextContinuationToken");
+        if token.is_none() {
+            break;
+        }
+    }
+
+    let unique: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(unique.len(), seen.len(), "a key came twice");
+    for key in &stable {
+        assert!(seen.contains(key), "{key} was skipped");
+    }
+}
+
+async fn upload_whole(server: &Server, id: &str, data: &str) -> String {
+    let etag = upload_part(server, id, 1, data)
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    complete(server, id, &[(1, etag.as_str())])
+        .await
+        .status
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_two_uploads_on_one_key_each_complete_and_the_last_wins() {
+    let server = with_bucket().await;
+    let first = start_upload(&server).await;
+    let second = start_upload(&server).await;
+    let a = "a".repeat(100);
+    let b = "b".repeat(100);
+
+    assert_eq!(upload_whole(&server, &second, &b).await, "200 OK");
+    assert_eq!(upload_whole(&server, &first, &a).await, "200 OK");
+
+    assert_eq!(run(&server, call("GET", "/bkt/big")).await.text(), a);
+}
+
+#[tokio::test]
+async fn test_complete_after_a_plain_put_on_the_same_key_wins() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let etag = upload_part(&server, &id, 1, "from the upload")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    put(&server, "big", "from a plain put").await;
+
+    let completed = complete(&server, &id, &[(1, etag.as_str())]).await;
+
+    assert_eq!(completed.status, StatusCode::OK);
+    assert_eq!(
+        run(&server, call("GET", "/bkt/big")).await.text(),
+        "from the upload"
+    );
+}

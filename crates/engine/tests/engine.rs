@@ -377,6 +377,27 @@ async fn test_large_manifest_goes_to_the_remote() {
 }
 
 #[tokio::test]
+async fn test_manifest_on_the_remote_is_sealed() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "big", &random_bytes(1, 8 * 1024 * 1024)).await;
+    a.engine.flush().await.unwrap();
+
+    let key = remote.list("manifests/").await.unwrap().remove(0);
+    let id: model::ObjectId = key.trim_start_matches("manifests/").parse().unwrap();
+    let stored = remote.get(&key).await.unwrap().unwrap();
+    let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+
+    assert!(engine::Manifest::decode(id, &stored).is_err());
+    let plain = keys
+        .sealer()
+        .open(seal::Kind::Manifest, id.as_bytes(), &stored)
+        .unwrap();
+    assert!(engine::Manifest::decode(id, &plain).is_ok());
+}
+
+#[tokio::test]
 async fn test_rewrite_of_the_same_data_gets_a_new_manifest_key() {
     let remote = Arc::new(MemoryRemote::default());
     let a = proxy(&remote, 1).await;

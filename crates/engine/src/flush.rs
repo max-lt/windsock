@@ -202,8 +202,12 @@ impl<R: Remote + 'static> Engine<R> {
         let inline_manifest = if bytes.len() <= INLINE_MAX {
             Some(bytes)
         } else {
+            let sealed =
+                self.keys
+                    .sealer()
+                    .seal(seal::Kind::Manifest, manifest_id.as_bytes(), &bytes);
             self.remote
-                .put(&manifest_key(manifest_id), Bytes::from(bytes.clone()))
+                .put(&manifest_key(manifest_id), Bytes::from(sealed))
                 .await?;
             self.index().put_manifest(manifest_id, &bytes)?;
             None

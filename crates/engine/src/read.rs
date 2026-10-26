@@ -175,10 +175,15 @@ impl<R: Remote + 'static> Engine<R> {
             return Manifest::decode(id, &bytes);
         }
 
-        let Some(bytes) = self.remote.get(&manifest_key(id)).await? else {
+        let Some(sealed) = self.remote.get(&manifest_key(id)).await? else {
             return Err(EngineError::Corrupt(format!("manifest {id} is missing")));
         };
 
+        let bytes = self
+            .keys
+            .sealer()
+            .open(seal::Kind::Manifest, id.as_bytes(), &sealed)
+            .map_err(|e| EngineError::Corrupt(format!("manifest {id}: {e}")))?;
         let manifest = Manifest::decode(id, &bytes)?;
         self.index().put_manifest(id, &bytes)?;
         Ok(manifest)

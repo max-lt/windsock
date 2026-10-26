@@ -66,6 +66,16 @@ Windsock encrypts all data that it writes to the remote with the key in `repo.ke
 file: without it, nobody can read the data. `docs/encryption.md` tells how to keep the key, how to
 share it between the daemons of a cluster, and what each error means.
 
+## When the write buffer does not open
+
+The write buffer is `data/engine/buffer/<20 digits>.log`. A crash can cut only the last segment:
+at start, the proxy drops its torn tail and logs `cut a torn record`. Damage in an older segment
+stops the start with an error that names the segment file and the record offset. That segment
+holds acknowledged writes that are not in the remote yet. If you move the file out of the buffer
+directory, the proxy starts, and the writes in that file are lost. A `.log` file whose name is not
+20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
+because the proxy deletes empty segments.
+
 ## Configuration
 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to

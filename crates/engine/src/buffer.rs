@@ -32,6 +32,9 @@ const PREFIX_LEN: usize = 4 + 8 + 32;
 /// Larger heads are garbage: keys, bucket names and metadata are small.
 const MAX_HEAD_LEN: u32 = 64 * 1024;
 
+/// Larger data is garbage: an S3 PUT holds 5 GiB at most.
+const MAX_DATA_LEN: u64 = 5 << 30;
+
 const SEGMENT_SUFFIX: &str = ".log";
 const INTENT_FILE: &str = "intent";
 const INTENT_TEMP: &str = ".intent.tmp";
@@ -147,8 +150,12 @@ impl SegmentReader {
         let data_len = u64::from_le_bytes(prefix[4..12].try_into().expect("8 bytes"));
         let head_hash = &prefix[12..];
         let remaining = self.len - start - PREFIX_LEN as u64;
+        let fits = u64::from(head_len)
+            .checked_add(data_len)
+            .is_some_and(|len| len <= remaining);
 
-        if head_len > MAX_HEAD_LEN || u64::from(head_len) + data_len > remaining {
+        // A length from a file that a crash cut is not trusted: check it before any allocation.
+        if head_len > MAX_HEAD_LEN || data_len > MAX_DATA_LEN || !fits {
             return Ok(Read::Invalid(start));
         }
 
@@ -387,7 +394,9 @@ impl Buffer {
                 }
                 Read::Invalid(at) => {
                     return Err(EngineError::Corrupt(format!(
-                        "{}: invalid record at offset {at}",
+                        "{}: invalid record at offset {at}. The segment holds acknowledged writes \
+                         that are not in the remote. Moving it out of the buffer directory lets \
+                         the proxy start, and loses those writes",
                         path.display()
                     )));
                 }
@@ -704,14 +713,20 @@ async fn list_segments(dir: &Path) -> Result<Vec<u64>, EngineError> {
 
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
-        let seq = name
-            .to_str()
-            .and_then(|n| n.strip_suffix(SEGMENT_SUFFIX))
-            .and_then(|n| n.parse::<u64>().ok());
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(SEGMENT_SUFFIX)) else {
+            continue;
+        };
 
-        if let Some(seq) = seq {
-            seqs.push(seq);
-        }
+        // A segment that does not have its exact name could hold acknowledged writes: stop.
+        let seq = stem.parse::<u64>().ok().filter(|_| stem.len() == 20);
+        let Some(seq) = seq else {
+            return Err(EngineError::Corrupt(format!(
+                "{}: a segment file name must be 20 digits and {SEGMENT_SUFFIX}. Rename or move \
+                 the file",
+                entry.path().display()
+            )));
+        };
+        seqs.push(seq);
     }
 
     seqs.sort_unstable();
@@ -893,6 +908,81 @@ mod tests {
 
         assert!(buffer.is_empty());
         assert!(!segment_path(dir.path(), 4).exists());
+    }
+
+    /// A segment with one whole record, then a record prefix with a huge data length.
+    async fn segment_with_a_huge_length(dir: &Path, seq: u64) {
+        let path = segment_path(dir, seq);
+        let mut bytes = encode_record(&put("a", b"one"), b"one");
+        let mut prefix = vec![0u8; PREFIX_LEN];
+        prefix[..4].copy_from_slice(&8u32.to_le_bytes());
+        prefix[4..12].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
+        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(&[0u8; 64]);
+        tokio::fs::write(&path, bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_huge_record_length_in_the_last_segment_is_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        segment_with_a_huge_length(dir.path(), 0).await;
+
+        let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+
+        assert!(buffer.object("b", "a").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_huge_record_length_in_an_older_segment_names_the_file_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        segment_with_a_huge_length(dir.path(), 0).await;
+        tokio::fs::write(
+            segment_path(dir.path(), 1),
+            encode_record(&put("b", b"two"), b"two"),
+        )
+        .await
+        .unwrap();
+
+        let Err(EngineError::Corrupt(message)) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("an older damaged segment opens");
+        };
+
+        assert!(message.contains("00000000000000000000.log"), "{message}");
+        assert!(message.contains("at offset"), "{message}");
+        assert!(message.contains("loses those writes"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_segment_file_with_another_name_stops_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("3.log"),
+            encode_record(&put("a", b"one"), b"one"),
+        )
+        .await
+        .unwrap();
+
+        let Err(EngineError::Corrupt(message)) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("a misnamed segment opens");
+        };
+
+        assert!(message.contains("3.log"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_gap_in_segment_numbers_replays_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        for (seq, key) in [(0, "a"), (2, "b")] {
+            let record = encode_record(&put(key, b"v"), b"v");
+            tokio::fs::write(segment_path(dir.path(), seq), record)
+                .await
+                .unwrap();
+        }
+
+        let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+
+        assert!(buffer.object("b", "a").is_some());
+        assert!(buffer.object("b", "b").is_some());
     }
 
     #[tokio::test]

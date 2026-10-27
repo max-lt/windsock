@@ -150,7 +150,8 @@ def setup(work):
         text = re.sub(r'(?m)^enabled = .*$', f"enabled = {'true' if p.n == 0 else 'false'}", text)
         text = re.sub(r'(?m)^interval_secs = .*$', "interval_secs = 5", text)
         text = re.sub(r'(?m)^horizon_secs = .*$', f"horizon_secs = {HORIZON}", text)
-        text = re.sub(r'(?m)^retention_secs = .*$', "retention_secs = 5", text)
+        text = re.sub(r'(?m)^retention_secs = .*$', "retention_secs = 40", text)
+        text = re.sub(r'(?m)^late_margin_secs = .*$', "late_margin_secs = 10", text)
         text = re.sub(r'(?m)^snapshot_interval_secs = .*$', "snapshot_interval_secs = 15", text)
         open(p.config, "w").write(text)
         p.client = boto3.client(

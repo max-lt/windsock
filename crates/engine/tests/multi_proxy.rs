@@ -124,10 +124,12 @@ async fn entries(remote: &MemoryRemote) -> Vec<Entry> {
     out
 }
 
-fn delete(key: &str) -> Action {
+/// A delete acked at `hlc`.
+fn delete(key: &str, hlc: u64) -> Action {
     Action::Delete {
         bucket: BUCKET.into(),
         key: key.into(),
+        hlc,
     }
 }
 
@@ -150,7 +152,7 @@ async fn test_proxy_clock_ahead_by_more_than_h_does_not_block_later_writes() {
     a.engine.flush().await.unwrap();
     let ahead = now_nanos() + 2 * HORIZON.as_nanos() as u64;
 
-    forged_entry(&remote, 9, ahead, vec![delete("k")]).await;
+    forged_entry(&remote, 9, ahead, vec![delete("k", ahead)]).await;
 
     assert_all_see(&[&a, &b], &["k"], &[None]).await;
     put(&a.engine, "k", "two").await;
@@ -168,7 +170,7 @@ async fn test_proxy_clock_behind_by_more_than_h_loses_to_newer_writes_everywhere
     a.engine.flush().await.unwrap();
     let behind = now_nanos() - 2 * HORIZON.as_nanos() as u64;
 
-    forged_entry(&remote, 9, behind, vec![delete("k")]).await;
+    forged_entry(&remote, 9, behind, vec![delete("k", behind)]).await;
 
     let c = proxy(&remote, 3).await;
     assert_all_see(&[&a, &b, &c], &["k"], &[Some("one")]).await;
@@ -227,7 +229,11 @@ async fn test_two_puts_of_one_key_with_the_same_hlc_converge() {
     else {
         panic!("no put of other");
     };
+    let Some([Action::Put { hlc: ack, .. }]) = put_k.actions.as_deref() else {
+        panic!("the put of k is one action");
+    };
     let same_hlc = Action::Put {
+        hlc: *ack,
         bucket: BUCKET.into(),
         key: "k".into(),
         manifest_id: *manifest_id,
@@ -400,7 +406,7 @@ async fn test_changed_copy_of_a_read_entry_is_found_at_the_gc() {
         read.prev,
         read.hlc,
         read.seen.clone(),
-        vec![delete("k0")],
+        vec![delete("k0", read.hlc)],
         keys().sealer(),
     );
     remote
@@ -447,18 +453,27 @@ async fn test_node_with_no_marker_is_found_through_a_seen_link() {
     let (a, b) = with_bucket(&remote).await;
     put(&a.engine, "k", "one").await;
     a.engine.flush().await.unwrap();
-    let hidden = entry_at(&remote, 9, 0, [0u8; 32], BTreeMap::new(), vec![delete("x")]).await;
+    let hidden = entry_at(
+        &remote,
+        9,
+        0,
+        [0u8; 32],
+        BTreeMap::new(),
+        vec![delete("x", now_nanos())],
+    )
+    .await;
     let link = journal::Link {
         seq: 0,
         hash: hidden.hash(),
     };
+    let now = now_nanos();
     let entry = Entry::sign(
         &SigningKey::from_bytes(&[8; 32]),
         0,
         [0u8; 32],
-        now_nanos(),
+        now,
         BTreeMap::from([(hidden.node, link)]),
-        vec![delete("k")],
+        vec![delete("k", now)],
         keys().sealer(),
     );
     remote

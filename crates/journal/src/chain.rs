@@ -3,7 +3,7 @@
 use model::NodeId;
 use serde::{Deserialize, Serialize};
 
-use crate::entry::{Entry, EntryHash};
+use crate::entry::{Action, Entry, EntryHash};
 
 /// Position of a reader in one node chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,12 @@ impl Frontier {
             return Err(ChainError::ActionsMismatch { seq: entry.seq });
         }
 
+        // An ack comes before the commit of its entry on one clock.
+        let mut acks = entry.actions.iter().flatten().filter_map(Action::hlc);
+        if acks.any(|hlc| hlc > entry.hlc) {
+            return Err(ChainError::ActionAfterEntry { seq: entry.seq });
+        }
+
         Ok(Frontier {
             next_seq: entry.seq + 1,
             last_hash: entry.hash(),
@@ -99,6 +105,8 @@ pub enum ChainError {
     Sealed { seq: u64 },
     #[error("entry {seq} is missing and a later entry exists")]
     Gap { seq: u64 },
+    #[error("entry {seq} has an action with an HLC above the entry HLC")]
+    ActionAfterEntry { seq: u64 },
     #[error("entry {seq} differs from the copy that this proxy read before, or is gone")]
     Changed { seq: u64 },
 }
@@ -125,6 +133,7 @@ mod tests {
             key: "k".into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
             inline_manifest: None,
+            hlc: 1,
         }
     }
 
@@ -226,6 +235,29 @@ mod tests {
     }
 
     #[test]
+    fn test_action_hlc_above_the_entry_hlc_is_rejected() {
+        let late = Action::Delete {
+            bucket: "b".into(),
+            key: "k".into(),
+            hlc: 11,
+        };
+        let entry = Entry::sign(
+            &key(1),
+            0,
+            [0u8; 32],
+            10,
+            Seen::new(),
+            vec![late],
+            &crate::entry::test_sealer(),
+        );
+
+        assert_eq!(
+            Frontier::GENESIS.extend(node(1), &entry),
+            Err(ChainError::ActionAfterEntry { seq: 0 })
+        );
+    }
+
+    #[test]
     fn test_forged_signature_is_rejected() {
         let mut entry = sign(1, 0, [0u8; 32], 10);
         entry.hlc = 11;
@@ -242,6 +274,7 @@ mod tests {
             vec![Action::Delete {
                 bucket: "b".into(),
                 key: "k".into(),
+                hlc: 1,
             }],
             &crate::entry::test_sealer(),
         );

@@ -22,6 +22,7 @@ enum Planned {
         bucket: String,
         key: String,
         object: usize,
+        hlc: u64,
     },
     Other(Action),
 }
@@ -156,9 +157,14 @@ impl<R: Remote + 'static> Engine<R> {
                             bucket,
                             key,
                             object: objects - 1,
+                            hlc: record.head.time,
                         }
                     }
-                    Op::Delete { bucket, key } => Planned::Other(Action::Delete { bucket, key }),
+                    Op::Delete { bucket, key } => Planned::Other(Action::Delete {
+                        bucket,
+                        key,
+                        hlc: record.head.time,
+                    }),
                     Op::CreateBucket { bucket, owner } => {
                         Planned::Other(Action::CreateBucket { bucket, owner })
                     }
@@ -178,8 +184,9 @@ impl<R: Remote + 'static> Engine<R> {
                     bucket,
                     key,
                     object,
+                    hlc,
                 } => {
-                    self.manifest_action(bucket, key, &manifests[object])
+                    self.manifest_action(bucket, key, &manifests[object], hlc)
                         .await?
                 }
                 Planned::Other(action) => action,
@@ -235,6 +242,7 @@ impl<R: Remote + 'static> Engine<R> {
         bucket: String,
         key: String,
         manifest: &Manifest,
+        hlc: u64,
     ) -> Result<Action> {
         let bytes = manifest.encode();
         let manifest_id = manifest_id(&bytes);
@@ -258,6 +266,7 @@ impl<R: Remote + 'static> Engine<R> {
             key,
             manifest_id,
             inline_manifest,
+            hlc,
         })
     }
 

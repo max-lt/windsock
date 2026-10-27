@@ -352,6 +352,7 @@ async fn test_apply_error_does_not_read_the_chains_again_at_each_sync() {
         vec![journal::Action::Delete {
             bucket: BUCKET.into(),
             key: "k0".into(),
+            hlc: 1,
         }],
         RepoKey::from_hex(&"07".repeat(32)).unwrap().keys().sealer(),
     );

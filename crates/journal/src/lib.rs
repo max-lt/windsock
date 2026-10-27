@@ -432,6 +432,7 @@ mod tests {
             key: key.into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
             inline_manifest: None,
+            hlc: 1,
         }
     }
 

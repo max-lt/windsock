@@ -273,7 +273,7 @@ impl Index {
                     manifest_id,
                     ..
                 } => self.record_version(&mut batch, entry, bucket, key, Some(*manifest_id))?,
-                Action::Delete { bucket, key } => {
+                Action::Delete { bucket, key, .. } => {
                     self.record_version(&mut batch, entry, bucket, key, None)?
                 }
                 Action::CreateBucket { bucket, owner } => {
@@ -684,12 +684,26 @@ mod tests {
         ObjectId::from_bytes([n; 32])
     }
 
+    /// A rising ack HLC, one second behind the wall clock: under the HLC of the entry.
+    fn ack() -> u64 {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            - 1_000_000_000;
+        let next = wall.max(LAST.load(std::sync::atomic::Ordering::SeqCst) + 1);
+        LAST.store(next, std::sync::atomic::Ordering::SeqCst);
+        next
+    }
+
     fn put(key: &str, n: u8) -> Vec<Action> {
         vec![Action::Put {
             bucket: "b".into(),
             key: key.into(),
             manifest_id: manifest(n),
             inline_manifest: None,
+            hlc: ack(),
         }]
     }
 
@@ -903,6 +917,7 @@ mod tests {
             vec![Action::Delete {
                 bucket: "b".into(),
                 key: "k".into(),
+                hlc: 1,
             }],
             Seen::new(),
         )
@@ -932,24 +947,28 @@ mod tests {
                     key: "a/1".into(),
                     manifest_id: manifest(1),
                     inline_manifest: None,
+                    hlc: 1,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "a/2".into(),
                     manifest_id: manifest(2),
                     inline_manifest: None,
+                    hlc: 1,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "c".into(),
                     manifest_id: manifest(3),
                     inline_manifest: None,
+                    hlc: 1,
                 },
                 Action::Put {
                     bucket: "ba".into(),
                     key: "a/3".into(),
                     manifest_id: manifest(4),
                     inline_manifest: None,
+                    hlc: 1,
                 },
             ],
             &test_sealer(),
@@ -988,12 +1007,14 @@ mod tests {
                     key: "k".into(),
                     manifest_id: manifest(1),
                     inline_manifest: None,
+                    hlc: 1,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "k".into(),
                     manifest_id: manifest(2),
                     inline_manifest: None,
+                    hlc: 1,
                 },
                 Action::DeleteBucket { bucket: "b".into() },
             ],
@@ -1163,6 +1184,7 @@ mod tests {
             Action::Delete {
                 bucket: "b".into(),
                 key: "gone".into(),
+                hlc: 1,
             },
         ];
         let first = Entry::sign(
@@ -1222,6 +1244,7 @@ mod tests {
         let delete = vec![Action::Delete {
             bucket: "b".into(),
             key: "x".into(),
+            hlc: 1,
         }];
         entries.push(a.append(delete, Seen::new()).await.unwrap());
         let condemn = vec![Action::Condemn {

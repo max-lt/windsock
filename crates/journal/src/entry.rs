@@ -25,10 +25,14 @@ pub enum Action {
         manifest_id: ObjectId,
         /// The manifest itself, when it is small enough to skip `manifests/<id>`.
         inline_manifest: Option<Vec<u8>>,
+        /// HLC of the ack: the order of the versions of one key. At most the entry HLC.
+        hlc: u64,
     },
     Delete {
         bucket: String,
         key: String,
+        /// HLC of the ack: the order of the versions of one key. At most the entry HLC.
+        hlc: u64,
     },
     CreateBucket {
         bucket: String,
@@ -42,6 +46,16 @@ pub enum Action {
         packs: Vec<PackId>,
         manifests: Vec<ObjectId>,
     },
+}
+
+impl Action {
+    /// The ack HLC of a put or a delete.
+    pub fn hlc(&self) -> Option<u64> {
+        match self {
+            Action::Put { hlc, .. } | Action::Delete { hlc, .. } => Some(*hlc),
+            _ => None,
+        }
+    }
 }
 
 /// Last entry of another node that a writer had integrated.
@@ -331,6 +345,7 @@ mod tests {
             key: "k".into(),
             manifest_id: ObjectId::from_bytes([1u8; 32]),
             inline_manifest: None,
+            hlc: 1,
         }
     }
 
@@ -376,6 +391,7 @@ mod tests {
             vec![Action::Delete {
                 bucket: "b".into(),
                 key: "k".into(),
+                hlc: 1,
             }],
             &test_sealer(),
         );
@@ -390,6 +406,7 @@ mod tests {
         entry.actions = Some(vec![Action::Delete {
             bucket: "b".into(),
             key: "k".into(),
+            hlc: 1,
         }]);
 
         let read = Entry::from_wire(&entry.to_wire(), &test_sealer()).unwrap();

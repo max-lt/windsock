@@ -226,6 +226,7 @@ mod tests {
             key: "k".into(),
             manifest_id: manifest(seed),
             inline_manifest: None,
+            hlc,
         };
         Entry::sign(
             &key(seed),

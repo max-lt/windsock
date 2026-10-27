@@ -81,7 +81,7 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
 because the proxy deletes empty segments.
 
-If a buffered write is older than max(`gc.retention_secs`, `gc.horizon_secs`) when it reaches the
+If a buffered write is older than `gc.retention_secs - gc.late_margin_secs` when it reaches the
 remote, the proxy does not commit it: a newer delete of the key can be gone. At the next start
 the buffer moves to `data/engine/quarantine` and the start fails. Move that directory away to
 drop those writes. `docs/storage.md` (Order of writes) gives the details.
@@ -94,25 +94,26 @@ the remote` once, and `cache writes work again` when a write works. Reads go on 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to
 the configuration file.
 
-| Setting                     | Default                                    | Meaning                                                                                                                                       |
-| --------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `data_dir`                  | `data`                                     | Engine state, write buffer, chunk cache, multipart parts, node key                                                                            |
-| `repo_key`                  | `repo.key`                                 | The secret of the remote: it keys the chunk IDs and encrypts all remote objects. Every proxy of one remote needs the same file                |
-| `listen`                    | `127.0.0.1:9000`                           | S3 address                                                                                                                                    |
-| `max_connections`           | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors                         |
-| `idle_timeout_secs`         | `60`                                       | A connection with no request in progress closes after this time                                                                               |
-| `request_timeout_secs`      | `300`                                      | A body upload that receives no byte for this time is cut. Each byte received starts the time again                                            |
-| `remote.type`               | `dir`                                      | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA)       |
-| `[[keys]]`                  | one new pair                               | Key pairs that S3 clients sign with. Every key reaches every bucket                                                                           |
-| `sync_interval_secs`        | `10`                                       | How often the proxy reads the writes of other proxies                                                                                         |
-| `engine.cache_bytes`        | 16 GiB                                     | Chunk cache size. `0` turns the cache off                                                                                                     |
-| `engine.flush_delay_ms`     | `1000`                                     | Longest time a write waits in the buffer before it goes to the remote                                                                         |
-| `engine.buffer_limit_bytes` | 8 GiB                                      | Writes fail with `503 SlowDown` above this                                                                                                    |
-| `gc.enabled`                | `false`                                    | Set to `true` on one proxy per remote. Windsock does not enforce this: see Limits                                                             |
-| `gc.interval_secs`          | `3600`                                     | How often the GC runs                                                                                                                         |
-| `gc.horizon_secs`           | `86400`                                    | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning |
-| `gc.retention_secs`         | `86400`                                    | Old versions stay readable for this time                                                                                                      |
-| `gc.snapshot_interval_secs` | `86400`                                    | The GC writes a snapshot when the latest one is this old                                                                                      |
+| Setting                     | Default                                    | Meaning                                                                                                                                                                      |
+| --------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data_dir`                  | `data`                                     | Engine state, write buffer, chunk cache, multipart parts, node key                                                                                                           |
+| `repo_key`                  | `repo.key`                                 | The secret of the remote: it keys the chunk IDs and encrypts all remote objects. Every proxy of one remote needs the same file                                               |
+| `listen`                    | `127.0.0.1:9000`                           | S3 address                                                                                                                                                                   |
+| `max_connections`           | soft fd limit - 256 (half of it under 512) | Open S3 connections at most. Above it, new clients wait in the kernel backlog. The engine keeps the other descriptors                                                        |
+| `idle_timeout_secs`         | `60`                                       | A connection with no request in progress closes after this time                                                                                                              |
+| `request_timeout_secs`      | `300`                                      | A body upload that receives no byte for this time is cut. Each byte received starts the time again                                                                           |
+| `remote.type`               | `dir`                                      | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA)                                      |
+| `[[keys]]`                  | one new pair                               | Key pairs that S3 clients sign with. Every key reaches every bucket                                                                                                          |
+| `sync_interval_secs`        | `10`                                       | How often the proxy reads the writes of other proxies                                                                                                                        |
+| `engine.cache_bytes`        | 16 GiB                                     | Chunk cache size. `0` turns the cache off                                                                                                                                    |
+| `engine.flush_delay_ms`     | `1000`                                     | Longest time a write waits in the buffer before it goes to the remote                                                                                                        |
+| `engine.buffer_limit_bytes` | 8 GiB                                      | Writes fail with `503 SlowDown` above this                                                                                                                                   |
+| `gc.enabled`                | `false`                                    | Set to `true` on one proxy per remote. Windsock does not enforce this: see Limits                                                                                            |
+| `gc.interval_secs`          | `3600`                                     | How often the GC runs                                                                                                                                                        |
+| `gc.horizon_secs`           | `86400`                                    | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning                                |
+| `gc.retention_secs`         | `86400`                                    | Old versions stay readable for this time                                                                                                                                     |
+| `gc.late_margin_secs`       | `3600`                                     | Clock skew that the late write rule allows. A buffered write older than `retention_secs - late_margin_secs` at its commit goes to quarantine. Must be under `retention_secs` |
+| `gc.snapshot_interval_secs` | `86400`                                    | The GC writes a snapshot when the latest one is this old                                                                                                                     |
 
 The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 

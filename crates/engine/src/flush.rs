@@ -91,6 +91,10 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         let mut journal = self.journal.lock().await;
+        // The entry was prepared before a crash: its acks are older now than at the prepare.
+        if !journal.is_written(&intent.entry).await? {
+            self.refuse_late(&entry, buffer::unix_nanos().max(entry.hlc))?;
+        }
         let written = if self.plan_is_stale(intent.planned_at) {
             journal.is_written(&intent.entry).await?
         } else {
@@ -287,6 +291,37 @@ impl<R: Remote + 'static> Engine<R> {
         })
     }
 
+    /// Refuses to commit `entry` at HLC `at` when an ack in it is older than the late limit.
+    /// A prune can have removed a newer delete of its key, and the commit would bring it back.
+    fn refuse_late(&self, entry: &Entry, at: u64) -> Result<()> {
+        let oldest = at.saturating_sub(self.config.late_limit().as_nanos() as u64);
+        let late: Vec<String> = entry
+            .actions
+            .iter()
+            .flatten()
+            .filter(|action| action.hlc().is_some_and(|hlc| hlc < oldest))
+            .map(|action| match action {
+                Action::Put { bucket, key, .. } | Action::Delete { bucket, key, .. } => {
+                    format!("{bucket}/{key}")
+                }
+                _ => String::new(),
+            })
+            .collect();
+        if late.is_empty() {
+            return Ok(());
+        }
+        self.quarantined.store(true, Ordering::SeqCst);
+        let keys = late.join(", ");
+        error!(
+            keys,
+            seq = entry.seq,
+            "buffered writes older than the late limit: no commit"
+        );
+        Err(EngineError::Quarantined(format!(
+            "{keys}. Restart the proxy to move them to quarantine"
+        )))
+    }
+
     /// Writes the intent, then the entry. A crash in between leaves the intent for `recover`.
     pub(crate) async fn commit(
         &self,
@@ -307,6 +342,7 @@ impl<R: Remote + 'static> Engine<R> {
                 segments: segments.to_vec(),
                 planned_at,
             };
+            self.refuse_late(&intent.entry, intent.entry.hlc)?;
             buffer::write_intent(&self.buffer_dir, &intent).await?;
 
             match journal.commit(&intent.entry).await? {

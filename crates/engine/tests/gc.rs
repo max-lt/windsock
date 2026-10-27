@@ -87,10 +87,14 @@ struct Proxy {
     engine: Engine<TestRemote>,
 }
 
+/// The shortest retention of the tests. A write must reach the journal within it.
+const SHORT_RETENTION: Duration = Duration::from_secs(1);
+
 fn config(retention: Duration) -> Config {
     Config {
         gc_horizon: HORIZON,
-        retention,
+        retention: retention.max(SHORT_RETENTION),
+        late_margin: Duration::ZERO,
         ..Config::default()
     }
 }
@@ -178,6 +182,12 @@ async fn dead_object(engine: &Engine<TestRemote>, data: &[u8]) {
     engine.flush().await.unwrap();
     engine.delete(BUCKET, "dead").await.unwrap();
     engine.flush().await.unwrap();
+    past_retention().await;
+}
+
+/// Past the short retention: a GC can prune the versions written before.
+async fn past_retention() {
+    tokio::time::sleep(SHORT_RETENTION + Duration::from_millis(20)).await;
 }
 
 async fn past_horizon() {
@@ -238,6 +248,7 @@ async fn test_retention_keeps_an_overwritten_version() {
         a.engine.flush().await.unwrap();
         put(&a.engine, "k", &random_bytes(2, 100_000)).await;
         a.engine.flush().await.unwrap();
+        past_retention().await;
 
         let report = a.engine.gc().await.unwrap();
 
@@ -283,6 +294,7 @@ async fn test_dead_external_manifest_is_deleted() {
     a.engine.delete(BUCKET, "dead").await.unwrap();
     a.engine.flush().await.unwrap();
     assert_eq!(count(&remote, "manifests/").await, 1);
+    past_retention().await;
 
     assert_eq!(a.engine.gc().await.unwrap().condemned_manifests, 1);
     past_horizon().await;
@@ -305,6 +317,7 @@ async fn test_writer_with_an_old_sync_does_not_dedup_against_a_condemned_pack() 
     b.engine.sync().await.unwrap();
     a.engine.delete(BUCKET, "x").await.unwrap();
     a.engine.flush().await.unwrap();
+    past_retention().await;
     a.engine.gc().await.unwrap();
 
     past_half_horizon().await;
@@ -329,9 +342,11 @@ async fn test_put_that_did_not_know_the_condemn_keeps_the_pack() {
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     put(&a.engine, "x", &data).await;
     a.engine.flush().await.unwrap();
-    b.engine.sync().await.unwrap();
     a.engine.delete(BUCKET, "x").await.unwrap();
     a.engine.flush().await.unwrap();
+    past_retention().await;
+    // A sync before the condemn: b dedups with no new sync.
+    b.engine.sync().await.unwrap();
     assert_eq!(a.engine.gc().await.unwrap().condemned_packs, 1);
 
     put(&b.engine, "y", &data).await;
@@ -353,7 +368,8 @@ async fn test_put_that_did_not_know_the_condemn_keeps_the_pack() {
 #[tokio::test]
 async fn test_old_intent_that_was_never_written_is_planned_again() {
     let remote = Arc::new(TestRemote::new());
-    let a = proxy(&remote, 1).await;
+    // The write waits past H/2 in the buffer: a retention of 2 H keeps it young.
+    let a = proxy_with(&remote, 1, config(2 * HORIZON)).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     put(&a.engine, "k", b"data").await;
     remote.next_create.store(CREATE_LOST, Ordering::SeqCst);
@@ -375,7 +391,8 @@ async fn test_old_intent_that_was_never_written_is_planned_again() {
 #[tokio::test]
 async fn test_old_intent_that_was_written_is_not_written_again() {
     let remote = Arc::new(TestRemote::new());
-    let a = proxy(&remote, 1).await;
+    // The write waits past H/2 in the buffer: a retention of 2 H keeps it young.
+    let a = proxy_with(&remote, 1, config(2 * HORIZON)).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     put(&a.engine, "k", b"data").await;
     remote.next_create.store(CREATE_AMBIGUOUS, Ordering::SeqCst);
@@ -609,6 +626,7 @@ async fn test_gc_that_dies_mid_sweep_is_finished_by_the_next_run() {
         a.engine.delete(BUCKET, &format!("dead{i}")).await.unwrap();
     }
     a.engine.flush().await.unwrap();
+    past_retention().await;
     a.engine.gc().await.unwrap();
     past_horizon().await;
     let before = count(&remote, "packs/").await;
@@ -652,6 +670,7 @@ async fn test_large_condemn_is_split_over_entries() {
     }
     a.engine.flush().await.unwrap();
 
+    past_retention().await;
     let before = count(&remote, journal::LOG_PREFIX).await;
 
     let report = a.engine.gc().await.unwrap();
@@ -683,6 +702,7 @@ async fn test_condemn_of_another_node_names_a_second_gc_runner() {
     a.engine.flush().await.unwrap();
     a.engine.delete(BUCKET, "dead").await.unwrap();
     a.engine.flush().await.unwrap();
+    past_retention().await;
     let report = a.engine.gc().await.unwrap();
     assert!(report.condemned_packs > 0 && !report.snapshot_written);
     assert_eq!(a.engine.other_gc_node(), None);

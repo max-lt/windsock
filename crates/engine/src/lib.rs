@@ -91,6 +91,8 @@ pub enum EngineError {
     Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error("configuration: {0}")]
+    Config(String),
     #[error("buffered writes older than the late limit are in quarantine: {0}")]
     Quarantined(String),
     #[error("the object has {size} bytes, over the limit of {limit} bytes")]
@@ -230,7 +232,7 @@ pub struct Engine<R> {
 }
 
 /// Refuses to open with a quarantine, and puts there a buffer with a write older than the
-/// late limit, max(R, H).
+/// late limit, R - M.
 /// A commit of such a write could rank under a delete that a prune already removed, and bring
 /// the key back: the operator decides what to do with it.
 async fn quarantine_at_open(
@@ -276,6 +278,12 @@ impl<R: Remote + 'static> Engine<R> {
         keys: Keys,
         config: Config,
     ) -> Result<Self> {
+        if config.retention <= config.late_margin {
+            return Err(EngineError::Config(format!(
+                "the retention ({:?}) must be above the late margin ({:?})",
+                config.retention, config.late_margin
+            )));
+        }
         let dir = dir.as_ref();
         let index = Index::open(dir.join(INDEX_DIR))?;
         let journal = Journal::new(

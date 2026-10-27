@@ -113,6 +113,8 @@ pub struct GcConfig {
     /// H of the GC rules. Every proxy of a remote must use the same value: writers use it too.
     pub horizon_secs: u64,
     pub retention_secs: u64,
+    /// The clock skew that the late write rule allows. Must be under `retention_secs`.
+    pub late_margin_secs: u64,
     /// The GC writes a snapshot when the latest one is this old.
     pub snapshot_interval_secs: u64,
 }
@@ -124,6 +126,7 @@ impl Default for GcConfig {
             interval_secs: 3600,
             horizon_secs: 24 * 3600,
             retention_secs: 24 * 3600,
+            late_margin_secs: 3600,
             snapshot_interval_secs: 24 * 3600,
         }
     }
@@ -197,6 +200,7 @@ impl Config {
             buffer_limit: self.engine.buffer_limit_bytes,
             gc_horizon: Duration::from_secs(self.gc.horizon_secs),
             retention: Duration::from_secs(self.gc.retention_secs),
+            late_margin: Duration::from_secs(self.gc.late_margin_secs),
             snapshot_interval: Duration::from_secs(self.gc.snapshot_interval_secs),
             ..engine::Config::default()
         }

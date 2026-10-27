@@ -105,7 +105,9 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 Late writes. A buffered write can reach the journal long after its ack, for example after a
 restart or a long remote outage. A prune can then have removed a newer delete of its key, and a
 commit would bring the key back. The rule: a proxy never commits a write whose ack HLC is older
-than the late limit, max(R, H) (24 h by default).
+than the late limit, R - M at the commit: R is `gc.retention_secs` (24 h by default), M is
+`gc.late_margin_secs` (1 h), the clock skew that the rule allows. The check uses the HLC of the
+entry that the proxy commits, also when it commits an intent after a restart.
 
 - At a flush, such a write stops the flush. The proxy logs `ERROR buffered writes older than the
 late limit` with each key, and refuses writes until a restart.

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -416,4 +417,47 @@ async fn test_own_write_stays_visible_when_the_commit_reads_a_bad_manifest() {
 
     let object = second.engine.get(BUCKET, "own", None).await.unwrap();
     assert_eq!(&object.data[..], b"mine");
+}
+
+/// A flush writes its intent, then the journal refuses the entry. The intent waits past the late
+/// limit. The recover must not commit it then: the check runs at the commit, not at the plan.
+#[tokio::test]
+async fn test_recover_refuses_an_intent_older_than_the_late_limit() {
+    let remote = Arc::new(FaultRemote::default());
+    let config = Config {
+        retention: Duration::from_millis(300),
+        late_margin: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = engine.put(
+        BUCKET,
+        "k",
+        Bytes::from_static(b"v"),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::Refuse);
+    assert!(engine.flush().await.is_err());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let result = engine.flush().await;
+
+    assert!(
+        matches!(result, Err(engine::EngineError::Quarantined(_))),
+        "{result:?}"
+    );
+    assert_eq!(chains(&remote).await.values().next().unwrap().len(), 1);
 }

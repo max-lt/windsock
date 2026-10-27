@@ -30,7 +30,8 @@ impl Cluster {
     /// The configuration of proxy `name`, with a 3 s GC horizon.
     fn config(&self, name: &str, flush_delay_ms: u64, gc_enabled: bool) -> PathBuf {
         let gc = format!(
-            "enabled = {gc_enabled}\ninterval_secs = 1\nhorizon_secs = 3\nretention_secs = 0"
+            "enabled = {gc_enabled}\ninterval_secs = 1\nhorizon_secs = 3\nretention_secs = 3\n\
+             late_margin_secs = 1"
         );
         self.config_with(name, flush_delay_ms, &gc)
     }
@@ -465,7 +466,7 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
     let cluster = Cluster::new();
     let data = random_bytes(7, 200_000);
     // The outage lasts longer than 3 s: a shorter horizon would quarantine the buffered write.
-    let gc = "enabled = false\nhorizon_secs = 120\nretention_secs = 0";
+    let gc = "enabled = false\nhorizon_secs = 120\nretention_secs = 120\nlate_margin_secs = 1";
     let mut a = start(&cluster.config_with("a", 600_000, gc), "info");
     assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
     assert_eq!(put(&a, "/shared/kept", &data).await.status, StatusCode::OK);

@@ -70,6 +70,9 @@ pub struct Config {
     pub gc_horizon: Duration,
     /// A version stays readable for this long after a newer write or a delete.
     pub retention: Duration,
+    /// The clock skew that the late write rule allows between this proxy and the GC runner.
+    /// A buffered write older than `retention - late_margin` at its commit is not committed.
+    pub late_margin: Duration,
     /// The GC writes a snapshot when the latest one is this old, then prunes the journal under it.
     pub snapshot_interval: Duration,
     /// A snapshot loads in ranged reads of this size, so it can be larger than one remote reply.
@@ -93,6 +96,7 @@ impl Default for Config {
             cache_bytes: 16 * 1024 * 1024 * 1024,
             gc_horizon: Duration::from_secs(24 * 3600),
             retention: Duration::from_secs(24 * 3600),
+            late_margin: Duration::from_secs(3600),
             snapshot_interval: Duration::from_secs(24 * 3600),
             snapshot_part: 64 * 1024 * 1024,
             snapshot_object: 1024 * 1024 * 1024,
@@ -106,10 +110,10 @@ impl Default for Config {
 
 impl Config {
     /// A buffered write older than this at flush is not committed: a prune may have removed a
-    /// newer delete of its key. A prune keeps every version younger than R, and a GC never acts
-    /// on what is younger than H, so the limit is the larger of the two.
+    /// newer delete of its key. A prune keeps every version younger than R on the clock of the
+    /// GC runner, so the limit is R less the clock skew that `late_margin` allows.
     pub fn late_limit(&self) -> Duration {
-        self.retention.max(self.gc_horizon)
+        self.retention.saturating_sub(self.late_margin)
     }
 
     pub fn policy(&self, bucket: &str, key: &str) -> Policy {

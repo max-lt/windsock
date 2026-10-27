@@ -659,9 +659,11 @@ async fn open_config(remote: &Arc<MemoryRemote>, seed: u8, dir: TempDir, config:
 async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
     let remote = Arc::new(MemoryRemote::default());
     let retention = Duration::from_millis(300);
+    // H far above R: the late limit is R - M, not a value that grows with H.
     let config = Config {
-        gc_horizon: retention,
+        gc_horizon: HORIZON,
         retention,
+        late_margin: Duration::from_millis(50),
         ..Config::default()
     };
     let (a, _b) = with_bucket(&remote).await;

@@ -670,8 +670,10 @@ impl Index {
         Ok(live)
     }
 
-    /// No entry still to apply has a lower HLC: the lowest last HLC over the
-    /// applied chains, and the lowest HLC of a pending entry.
+    /// The lowest last HLC over the applied chains, and the lowest entry or ack HLC of a pending
+    /// entry. A future entry can still carry an ack under it: a buffered write of a proxy with no
+    /// chain yet, or a write late by up to `retention - late_margin`. The late write rule of the
+    /// engine covers that gap.
     pub fn stable_hlc(&self) -> Result<u64> {
         let frontiers = self.frontiers()?;
         let applied = frontiers.values().map(|f| f.last_hlc);

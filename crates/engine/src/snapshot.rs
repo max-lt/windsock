@@ -134,7 +134,8 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         let part = self.config.snapshot_part.max(1);
-        let mut sealed = Vec::with_capacity(len as usize);
+        // The size comes from the remote: memory grows with the bytes that arrive.
+        let mut sealed = Vec::new();
         while (sealed.len() as u64) < len {
             let start = sealed.len() as u64;
             let end = (start + part).min(len);

@@ -634,3 +634,33 @@ async fn test_gc_that_dies_mid_sweep_is_finished_by_the_next_run() {
     assert_eq!(get(&fresh.engine, "live").await.unwrap(), b"kept");
     assert_eq!(keys(&fresh.engine).await, ["live"]);
 }
+
+/// Many dead objects make a condemn larger than one entry may be: it goes in several entries.
+#[tokio::test]
+async fn test_large_condemn_is_split_over_entries() {
+    let remote = Arc::new(TestRemote::new());
+    let config = Config {
+        max_entry_actions: 100,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    for i in 0..6u8 {
+        put(&a.engine, &format!("dead{i}"), &random_bytes(i, 20_000)).await;
+        a.engine.flush().await.unwrap();
+        a.engine.delete(BUCKET, &format!("dead{i}")).await.unwrap();
+    }
+    a.engine.flush().await.unwrap();
+
+    let before = count(&remote, journal::LOG_PREFIX).await;
+
+    let report = a.engine.gc().await.unwrap();
+
+    // The prune redacts the condemn entries at once, so count them by their keys.
+    assert_eq!(report.condemned_packs, 6);
+    let condemns = count(&remote, journal::LOG_PREFIX).await - before;
+    assert!(
+        condemns >= 3,
+        "{condemns} condemn entries for 6 packs, 2 IDs each"
+    );
+}

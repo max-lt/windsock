@@ -182,14 +182,33 @@ impl<R: Sweep + 'static> Engine<R> {
         Ok(dead)
     }
 
+    /// Writes the condemn in entries of at most `max_entry_actions` bytes: one large entry
+    /// would be over the reply limit of a reader.
     async fn condemn(&self, packs: Vec<PackId>, manifests: Vec<ObjectId>) -> Result<()> {
-        let action = Action::Condemn { packs, manifests };
-        let mut journal = self.journal.lock().await;
-        let seen = self.index().seen(self.node)?;
-        let entry = journal
-            .append(vec![action], seen)
-            .await
-            .map_err(EngineError::from)?;
-        self.apply_own(&mut journal, entry).await
+        // An ID takes 32 bytes; the action, its tags and the list lengths take less than 16.
+        let per_entry = (self.config.max_entry_actions.saturating_sub(16) / 32).max(1) as usize;
+        let mut packs = packs.as_slice();
+        let mut manifests = manifests.as_slice();
+
+        while !packs.is_empty() || !manifests.is_empty() {
+            let (these_packs, rest) = packs.split_at(packs.len().min(per_entry));
+            packs = rest;
+            let room = per_entry - these_packs.len();
+            let (these_manifests, rest) = manifests.split_at(manifests.len().min(room));
+            manifests = rest;
+
+            let action = Action::Condemn {
+                packs: these_packs.to_vec(),
+                manifests: these_manifests.to_vec(),
+            };
+            let mut journal = self.journal.lock().await;
+            let seen = self.index().seen(self.node)?;
+            let entry = journal
+                .append(vec![action], seen)
+                .await
+                .map_err(EngineError::from)?;
+            self.apply_own(&mut journal, entry).await?;
+        }
+        Ok(())
     }
 }

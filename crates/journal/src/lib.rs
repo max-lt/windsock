@@ -347,8 +347,10 @@ impl<R: Remote> Journal<R> {
 
         let mut entries = self.take_stashed();
         let audit = std::mem::take(&mut self.audit);
+        let mut queue: Vec<NodeId> = nodes.iter().copied().collect();
+        let mut known = nodes;
 
-        for node in nodes {
+        while let Some(node) = queue.pop() {
             // The listing comes first: each entry in it exists before the reads below.
             let highest = match audit {
                 true => self.audit_chain(node).await,
@@ -360,6 +362,12 @@ impl<R: Remote> Journal<R> {
             };
             match result {
                 Ok((highest, read)) => {
+                    // A node that lost its marker is still named in the seen of other entries.
+                    for seen in read.iter().flat_map(|entry| entry.seen.keys()) {
+                        if known.insert(*seen) {
+                            queue.push(*seen);
+                        }
+                    }
                     entries.extend(read);
                     let next = self.frontier(node).next_seq;
                     match highest {

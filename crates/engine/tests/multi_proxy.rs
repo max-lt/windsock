@@ -412,3 +412,65 @@ async fn test_changed_copy_of_a_read_entry_is_found_at_the_gc() {
 
     assert!(matches!(error, EngineError::BrokenChains(ref nodes) if nodes == &[a.engine.node()]));
 }
+
+/// Writes an entry of node `seed` at `seq`, with `prev`, and no node marker.
+async fn entry_at(
+    remote: &MemoryRemote,
+    seed: u8,
+    seq: u64,
+    prev: journal::EntryHash,
+    seen: journal::Seen,
+    actions: Vec<Action>,
+) -> Entry {
+    let entry = Entry::sign(
+        &SigningKey::from_bytes(&[seed; 32]),
+        seq,
+        prev,
+        now_nanos(),
+        seen,
+        actions,
+        keys().sealer(),
+    );
+    remote
+        .put(&entry.remote_key(), Bytes::from(entry.to_wire()))
+        .await
+        .unwrap();
+    entry
+}
+
+/// Node 9 wrote an entry and no marker. Node 8 has a marker, and its delete names node 9 in
+/// `seen`, so it applies only after the entry of node 9. The readers must find node 9 through
+/// that link, or the acknowledged delete of node 8 never applies.
+#[tokio::test]
+async fn test_node_with_no_marker_is_found_through_a_seen_link() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    put(&a.engine, "k", "one").await;
+    a.engine.flush().await.unwrap();
+    let hidden = entry_at(&remote, 9, 0, [0u8; 32], BTreeMap::new(), vec![delete("x")]).await;
+    let link = journal::Link {
+        seq: 0,
+        hash: hidden.hash(),
+    };
+    let entry = Entry::sign(
+        &SigningKey::from_bytes(&[8; 32]),
+        0,
+        [0u8; 32],
+        now_nanos(),
+        BTreeMap::from([(hidden.node, link)]),
+        vec![delete("k")],
+        keys().sealer(),
+    );
+    remote
+        .create(&entry.remote_key(), Bytes::from(entry.to_wire()))
+        .await
+        .unwrap();
+    remote
+        .put(&journal::node_key(entry.node), Bytes::new())
+        .await
+        .unwrap();
+
+    let c = proxy(&remote, 3).await;
+
+    assert_all_see(&[&a, &b, &c], &["k"], &[None]).await;
+}

@@ -268,6 +268,39 @@ async fn quarantine_at_open(
     )))
 }
 
+/// The rules that every proxy of one remote must share, kept in the key check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RepoRules {
+    retention_ns: u64,
+    late_margin_ns: u64,
+}
+
+impl RepoRules {
+    fn text(&self) -> String {
+        format!(
+            "retention_ns {}\nlate_margin_ns {}",
+            self.retention_ns, self.late_margin_ns
+        )
+    }
+
+    fn parse<'a>(mut lines: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut value = |name: &str| {
+            lines
+                .next()?
+                .strip_prefix(name)?
+                .strip_prefix(' ')?
+                .parse()
+                .ok()
+        };
+        let retention_ns = value("retention_ns")?;
+        let late_margin_ns = value("late_margin_ns")?;
+        Some(Self {
+            retention_ns,
+            late_margin_ns,
+        })
+    }
+}
+
 impl<R: Remote + 'static> Engine<R> {
     /// Opens the engine state in `dir` and replays the writes a previous process
     /// buffered. The node identity is the public key of `signing_key`.
@@ -354,7 +387,11 @@ impl<R: Remote + 'static> Engine<R> {
     /// another key would write a chain that the other proxies cannot read.
     async fn check_repo_key(&self) -> Result<()> {
         let sealer = self.keys.sealer();
-        let text = format!("{KEY_CHECK}\nformat {REMOTE_FORMAT}");
+        let ours = RepoRules {
+            retention_ns: self.config.retention.as_nanos() as u64,
+            late_margin_ns: self.config.late_margin.as_nanos() as u64,
+        };
+        let text = format!("{KEY_CHECK}\nformat {REMOTE_FORMAT}\n{}", ours.text());
         let check = sealer.seal(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), text.as_bytes());
 
         // A journal with no key check is not encrypted, or another tool wrote it.
@@ -367,6 +404,7 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
 
+        // Create-only: of two first opens, one writes its rules and the other compares to them.
         match self.remote.create(KEY_CHECK_KEY, Bytes::from(check)).await {
             Ok(()) => return Ok(()),
             Err(RemoteError::AlreadyExists(_)) => {}
@@ -378,23 +416,35 @@ impl<R: Remote + 'static> Engine<R> {
                 "{KEY_CHECK_KEY} is gone"
             )));
         };
-        // The AEAD tag proves the key. The text gives the format.
+        // The AEAD tag proves the key. The text gives the format and the rules.
         let plain = sealer
             .open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored)
             .map_err(|e| EngineError::WrongRepoKey(e.to_string()))?;
-        let found = match std::str::from_utf8(&plain) {
-            Ok(KEY_CHECK) => 1,
-            Ok(text) => text
-                .strip_prefix(KEY_CHECK)
-                .and_then(|rest| rest.strip_prefix("\nformat "))
+        let text = std::str::from_utf8(&plain).unwrap_or("");
+        let mut lines = text.lines();
+        let found = match (lines.next(), lines.next()) {
+            (Some(KEY_CHECK), None) => 1,
+            (Some(KEY_CHECK), Some(line)) => line
+                .strip_prefix("format ")
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0),
-            Err(_) => 0,
+            _ => 0,
         };
         if found != REMOTE_FORMAT {
             return Err(EngineError::Corrupt(format!(
                 "{KEY_CHECK_KEY}: the remote has format {found}, this build reads format \
                  {REMOTE_FORMAT}"
+            )));
+        }
+
+        let theirs = RepoRules::parse(lines);
+        if theirs != Some(ours) {
+            let held = theirs.map_or("no rules".to_string(), |rules| rules.text());
+            return Err(EngineError::Config(format!(
+                "the remote holds {}; this proxy has {}. Every proxy of a remote needs the \
+                 same gc.retention_secs and gc.late_margin_secs",
+                held.replace('\n', ", "),
+                ours.text().replace('\n', ", ")
             )));
         }
         Ok(())

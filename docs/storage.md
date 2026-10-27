@@ -102,6 +102,11 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
   writes and reads format 2 only. An older format stops the open with an error that names both
   formats.
 
+R and M are rules of the remote. The first proxy that opens a remote writes them into
+`repo/key-check` (create-only), with the format. A proxy with other values refuses to open, and
+the error gives the values of the remote and of the proxy. Known limit: R and M are fixed for
+the life of a remote. To change them, start a new remote and copy the objects through the S3 API.
+
 Late writes. A buffered write can reach the journal long after its ack, for example after a
 restart or a long remote outage. A prune can then have removed a newer delete of its key, and a
 commit would bring the key back. The rule: a proxy never commits a write whose ack HLC is older

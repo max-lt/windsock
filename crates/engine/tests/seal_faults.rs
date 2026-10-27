@@ -447,3 +447,49 @@ async fn test_remote_of_another_format_is_refused_at_open() {
     assert!(error.contains("remote has format 1"), "{error}");
     assert!(error.contains("reads format 2"), "{error}");
 }
+
+/// R and M are rules of the remote: the first proxy writes them, and a proxy with others refuses
+/// to open. A proxy with the same values opens.
+#[tokio::test]
+async fn test_proxy_with_another_retention_refuses_to_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    let keys = || RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    let open = |seed: u8, retention: u64| {
+        let remote = remote.clone();
+        async move {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                retention: std::time::Duration::from_secs(retention),
+                ..Config::default()
+            };
+            let result = Engine::open(
+                dir.path(),
+                remote,
+                SigningKey::from_bytes(&[seed; 32]),
+                keys(),
+                config,
+            )
+            .await;
+            (dir, result)
+        }
+    };
+    let (_a, first) = open(1, 7200).await;
+    first.unwrap();
+
+    let (_b, same) = open(2, 7200).await;
+    let (_c, other) = open(3, 9000).await;
+
+    same.unwrap();
+    let Err(error) = other else {
+        panic!("a proxy with another retention opens");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("remote holds retention_ns 7200000000000"),
+        "{error}"
+    );
+    assert!(
+        error.contains("this proxy has retention_ns 9000000000000"),
+        "{error}"
+    );
+}

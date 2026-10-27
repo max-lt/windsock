@@ -666,7 +666,9 @@ async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
         late_margin: Duration::from_millis(50),
         ..Config::default()
     };
-    let (a, _b) = with_bucket(&remote).await;
+    let a = open_config(&remote, 1, tempfile::tempdir().unwrap(), config.clone()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
     let late = open_config(&remote, 5, tempfile::tempdir().unwrap(), config.clone()).await;
     put(&late.engine, "k", "late").await;
     let gc = open_config(&remote, 6, tempfile::tempdir().unwrap(), config.clone()).await;

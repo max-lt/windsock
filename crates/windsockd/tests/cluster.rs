@@ -502,7 +502,7 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
             .is_some()
     );
     assert_eq!(a.wait_exit(Duration::from_secs(10)), Some(true));
-    let b = start(&cluster.config("b", 100, false), "info");
+    let b = start(&cluster.config_with("b", 100, gc), "info");
     eventually(&b, "/shared/kept", &data, Duration::from_secs(30)).await;
     assert!(b.stop());
 }

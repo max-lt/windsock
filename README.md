@@ -134,9 +134,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 Measured with 200,000 small objects in one bucket:
 
 - The index takes about 510 bytes of memory (RSS) per key.
-- A snapshot takes about 231 bytes per key. A new proxy loads it in reads of 64 MiB, and loads
-  at most 16 GiB: about 74,000,000 keys. Above that, a new proxy cannot start, and the error names
-  the snapshot and the cap.
+- A snapshot takes about 231 bytes per key. The GC writes it in one PUT, and S3, R2 and B2 accept
+  at most 5 GiB in one PUT: about 23,000,000 keys. Above that, the GC fails and the journal is
+  not pruned.
 - A ListObjects page costs the same for any number of keys in the bucket: 1000 keys in about
   20 ms.
 

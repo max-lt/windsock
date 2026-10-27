@@ -84,6 +84,9 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - The client always verifies the TLS certificate and its host name. No setting turns the check
   off. For a private CA, set `ca_file`.
 - An empty access key or secret key stops the start.
+- A wait for a slot does not count in the time of an attempt.
+- One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in one PUT, so a
+  snapshot holds at most about 23,000,000 keys (231 bytes per key).
 
 ## Cloudflare R2
 

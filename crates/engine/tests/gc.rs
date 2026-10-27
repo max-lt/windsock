@@ -47,6 +47,10 @@ impl Remote for TestRemote {
 
     async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         let timeout = || RemoteError::Io(std::io::Error::other("timeout"));
+        // The fault is for a journal entry, not for the node marker that comes before it.
+        if !key.starts_with(journal::LOG_PREFIX) {
+            return self.inner.create(key, data).await;
+        }
 
         match self.next_create.swap(CREATE_OK, Ordering::SeqCst) {
             CREATE_LOST => Err(timeout()),

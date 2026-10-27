@@ -87,6 +87,8 @@ pub enum EngineError {
     Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error("the object has {size} bytes, over the limit of {limit} bytes")]
+    ObjectTooLarge { size: u64, limit: u64 },
     #[error("the buffer fsync failed, so the write is not stored")]
     WriteLost,
     #[error("the buffer did not recover from a failed fsync. Restart the proxy")]

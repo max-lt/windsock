@@ -675,6 +675,30 @@ async fn test_full_buffer_rejects_puts() {
 }
 
 #[tokio::test]
+async fn test_object_larger_than_the_buffer_is_refused_for_good() {
+    let remote = Arc::new(MemoryRemote::default());
+    let config = Config {
+        buffer_limit: 64 * 1024,
+        ..Config::default()
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let big = Bytes::from(vec![0u8; 64 * 1024 + 1]);
+
+    let result = a
+        .engine
+        .put(BUCKET, "k", big, BTreeMap::new(), WriteMode::Overwrite)
+        .await;
+
+    assert!(
+        matches!(result, Err(EngineError::ObjectTooLarge { size, limit }) if size == 64 * 1024 + 1 && limit == 64 * 1024),
+        "{result:?}"
+    );
+    assert_eq!(a.engine.buffered_bytes().await, 0);
+}
+
+#[tokio::test]
 async fn test_bucket_rules() {
     let remote = Arc::new(MemoryRemote::default());
     let a = proxy(&remote, 1).await;

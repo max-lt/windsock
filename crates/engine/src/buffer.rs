@@ -33,7 +33,7 @@ const PREFIX_LEN: usize = 4 + 8 + 32;
 const MAX_HEAD_LEN: u32 = 64 * 1024;
 
 /// Larger data is garbage: an S3 PUT holds 5 GiB at most.
-const MAX_DATA_LEN: u64 = 5 << 30;
+pub(crate) const MAX_DATA_LEN: u64 = 5 << 30;
 
 const SEGMENT_SUFFIX: &str = ".log";
 const INTENT_FILE: &str = "intent";

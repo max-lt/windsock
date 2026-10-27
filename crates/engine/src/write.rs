@@ -130,6 +130,15 @@ impl<R: Remote + 'static> Engine<R> {
 
         let limit = self.config.buffer_limit;
 
+        // A record that the buffer cannot hold or read back would block the flush for ever.
+        let largest = limit.min(buffer::MAX_DATA_LEN);
+        if data.len() as u64 > largest {
+            return Err(EngineError::ObjectTooLarge {
+                size: data.len() as u64,
+                limit: largest,
+            });
+        }
+
         if buffer.bytes() + data.len() as u64 > limit {
             return Err(EngineError::BufferFull { limit });
         }

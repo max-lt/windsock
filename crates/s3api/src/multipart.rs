@@ -170,12 +170,14 @@ impl Uploads {
     }
 
     /// Joins the requested parts, in ascending order, each with the ETag it was given.
+    /// Refuses before any read when the parts hold more than `limit` bytes together.
     pub async fn assemble(
         &self,
         upload_id: &str,
         bucket: &str,
         key: &str,
         requested: &[(u16, String)],
+        limit: u64,
     ) -> Result<Assembled, S3Error> {
         let meta = self.meta(upload_id, bucket, key).await?;
 
@@ -191,21 +193,35 @@ impl Uploads {
         }
 
         let dir = self.upload_dir(upload_id)?;
-        let stored: BTreeMap<u16, String> = part_files(&dir)
+        let stored: BTreeMap<u16, (String, u64)> = part_files(&dir)
             .await?
             .into_iter()
-            .map(|((number, etag), _)| (number, etag))
+            .map(|((number, etag), (len, _))| (number, (etag, len)))
             .collect();
-        let mut data = Vec::new();
 
+        let mut size = 0u64;
         for (number, etag) in requested {
-            if stored.get(number) != Some(etag) {
-                return Err(S3Error::new(
-                    "InvalidPart",
-                    StatusCode::BAD_REQUEST,
-                    format!("part {number} is missing or has another ETag"),
-                ));
+            match stored.get(number) {
+                Some((stored_etag, len)) if stored_etag == etag => size += len,
+                _ => {
+                    return Err(S3Error::new(
+                        "InvalidPart",
+                        StatusCode::BAD_REQUEST,
+                        format!("part {number} is missing or has another ETag"),
+                    ));
+                }
             }
+        }
+        if size > limit {
+            return Err(S3Error::new(
+                "EntityTooLarge",
+                StatusCode::BAD_REQUEST,
+                format!("the parts hold {size} bytes, over the limit of {limit} bytes"),
+            ));
+        }
+
+        let mut data = Vec::new();
+        for (number, etag) in requested {
             let part = tokio::fs::read(dir.join(part_name(*number, etag)))
                 .await
                 .map_err(io)?;
@@ -318,6 +334,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parts_over_the_limit_are_refused_before_a_read() {
+        let (_dir, uploads) = uploads().await;
+        let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
+        let first = uploads
+            .put_part(&id, "b", "k", "1", b"hello ")
+            .await
+            .unwrap();
+        let second = uploads
+            .put_part(&id, "b", "k", "2", b"world")
+            .await
+            .unwrap();
+
+        let result = uploads
+            .assemble(&id, "b", "k", &[(1, first), (2, second)], 10)
+            .await;
+
+        let Err(error) = result else {
+            panic!("11 bytes over a limit of 10 are joined");
+        };
+        assert_eq!(error.code, "EntityTooLarge");
+        assert_eq!(uploads.parts(&id, "b", "k").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_parts_join_in_the_requested_order() {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
@@ -331,7 +371,7 @@ mod tests {
             .unwrap();
 
         let assembled = uploads
-            .assemble(&id, "b", "k", &[(1, first), (2, second)])
+            .assemble(&id, "b", "k", &[(1, first), (2, second)], u64::MAX)
             .await
             .unwrap();
 
@@ -347,7 +387,7 @@ mod tests {
         let new = uploads.put_part(&id, "b", "k", "1", b"new").await.unwrap();
 
         let parts = uploads.parts(&id, "b", "k").await.unwrap();
-        let stale = uploads.assemble(&id, "b", "k", &[(1, old)]).await;
+        let stale = uploads.assemble(&id, "b", "k", &[(1, old)], u64::MAX).await;
 
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].2, new);
@@ -364,13 +404,23 @@ mod tests {
         assert_eq!(
             code(
                 uploads
-                    .assemble(&id, "b", "k", &[(2, etag.clone()), (1, etag.clone())])
+                    .assemble(
+                        &id,
+                        "b",
+                        "k",
+                        &[(2, etag.clone()), (1, etag.clone())],
+                        u64::MAX
+                    )
                     .await
             ),
             "InvalidPartOrder"
         );
         assert_eq!(
-            code(uploads.assemble(&id, "b", "other", &[(1, etag)]).await),
+            code(
+                uploads
+                    .assemble(&id, "b", "other", &[(1, etag)], u64::MAX)
+                    .await
+            ),
             "NoSuchUpload"
         );
         assert_eq!(

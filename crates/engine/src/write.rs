@@ -14,6 +14,14 @@ impl<R: Remote + 'static> Engine<R> {
         mode: WriteMode,
     ) -> Result<ObjectInfo> {
         check_key(key)?;
+        // Before the hash: an object that the buffer refuses costs no work.
+        let limit = self.max_object_size();
+        if data.len() as u64 > limit {
+            return Err(EngineError::ObjectTooLarge {
+                size: data.len() as u64,
+                limit,
+            });
+        }
         let policy = self.config.policy(bucket, key);
         let create_only = mode == WriteMode::CreateOnly || policy.create_only;
         let content_hash = *blake3::hash(&data).as_bytes();
@@ -107,6 +115,11 @@ impl<R: Remote + 'static> Engine<R> {
         self.draining.store(true, Ordering::SeqCst);
     }
 
+    /// The largest object that a put takes: the buffer limit, or 5 GiB.
+    pub fn max_object_size(&self) -> u64 {
+        self.config.buffer_limit.min(buffer::MAX_DATA_LEN)
+    }
+
     /// Bytes in the buffer that are not in the remote yet.
     pub async fn buffered_bytes(&self) -> u64 {
         self.buffer.lock().await.bytes()
@@ -131,7 +144,7 @@ impl<R: Remote + 'static> Engine<R> {
         let limit = self.config.buffer_limit;
 
         // A record that the buffer cannot hold or read back would block the flush for ever.
-        let largest = limit.min(buffer::MAX_DATA_LEN);
+        let largest = self.max_object_size();
         if data.len() as u64 > largest {
             return Err(EngineError::ObjectTooLarge {
                 size: data.len() as u64,

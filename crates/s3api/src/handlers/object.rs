@@ -220,7 +220,13 @@ pub(crate) async fn object_post<R: Remote + 'static>(
     let requested = xml::parse_complete(&body)?;
     let assembled = state
         .uploads
-        .assemble(upload_id, &bucket, &key, &requested)
+        .assemble(
+            upload_id,
+            &bucket,
+            &key,
+            &requested,
+            state.engine.max_object_size(),
+        )
         .await?;
     let info = state
         .engine

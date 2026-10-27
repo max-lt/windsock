@@ -9,6 +9,11 @@ fn wall_clock_nanos() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
+/// The highest HLC that a reader takes now, `ahead` past its wall clock.
+pub fn limit(ahead: u64) -> u64 {
+    wall_clock_nanos().saturating_add(ahead)
+}
+
 #[derive(Debug)]
 pub struct HybridClock {
     last: AtomicU64,
@@ -43,6 +48,12 @@ impl HybridClock {
     /// Moves the clock past a timestamp seen from another node.
     pub fn witness(&self, remote_hlc: u64) {
         self.last.fetch_max(remote_hlc, Ordering::SeqCst);
+    }
+
+    /// Like [`HybridClock::witness`], but never past `ahead` from the wall clock: a bad clock
+    /// or a forged value must not move every later ack far into the future.
+    pub fn witness_at_most(&self, remote_hlc: u64, ahead: u64) {
+        self.witness(remote_hlc.min(limit(ahead)));
     }
 }
 

@@ -466,10 +466,11 @@ async fn test_broken_chain_fails_alone_and_recovers() {
     assert_eq!(keys(&reader.engine).await, ["copy", "k0", "k1", "k2"]);
 }
 
-/// A chain whose HLC runs far ahead of the GC clock raises the stable HLC past real
-/// time: a proxy with a correct clock could then write under the prune bound.
+/// An entry far ahead of every clock would raise the stable HLC past real time, and a proxy with
+/// a correct clock could then write under the prune bound. The chain is broken: the GC does not
+/// run.
 #[tokio::test]
-async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
+async fn test_gc_refuses_to_run_with_an_entry_far_ahead_of_the_clocks() {
     let remote = Arc::new(TestRemote::new());
     // The first proxy writes the key check of the remote before any entry.
     drop(proxy(&remote, 1).await);
@@ -498,9 +499,12 @@ async fn test_version_prune_refuses_to_run_when_clocks_run_far_ahead() {
         .unwrap();
     let a = proxy(&remote, 1).await;
 
-    let report = a.engine.gc().await.unwrap();
+    let result = a.engine.gc().await;
 
-    assert!(report.prune_refused);
+    assert!(
+        matches!(result, Err(EngineError::BrokenChains(ref nodes)) if nodes == &[node]),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

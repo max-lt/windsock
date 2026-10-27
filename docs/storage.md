@@ -94,6 +94,12 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - The ack HLC is max(wall clock, last HLC that the proxy issued or saw) + 1. It never goes down
   on one proxy, also across a restart: at open, the clock passes the last HLC of every chain
   and the latest buffered ack.
+- No HLC moves the clock of a proxy more than R past its wall clock. A reader treats an entry
+  with an HLC more than R ahead of its own clock as a broken chain (`FutureHlc`). It logs one
+  `ERROR entry HLC more than R ahead of this clock` with the node and the seq, the GC refuses to
+  run, and the chain reads again once the clock of the reader passes that HLC less R. To find
+  the node with a bad clock, read the node in that ERROR, then check the clock of the host that
+  runs that node key.
 - An entry HLC is at or above every ack HLC in the entry. A reader refuses an entry that breaks
   this rule, and names the node and the seq.
 - Last-Modified is the ack HLC. It does not change at the flush.

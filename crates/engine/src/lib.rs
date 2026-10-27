@@ -328,11 +328,15 @@ impl<R: Remote + 'static> Engine<R> {
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
         // The wall clock can step back across a restart: an ack never goes under an earlier one.
+        // No value moves the clock more than R ahead of the wall clock.
+        let mut journal = journal;
+        journal.set_max_ahead(config.retention);
         let clock = journal.clock();
+        let ahead = config.retention.as_nanos() as u64;
         for frontier in index.frontiers()?.values() {
-            clock.witness(frontier.last_hlc);
+            clock.witness_at_most(frontier.last_hlc, ahead);
         }
-        clock.witness(buffer.latest_time());
+        clock.witness_at_most(buffer.latest_time(), ahead);
         let cache = match config.cache_bytes {
             0 => None,
             bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),

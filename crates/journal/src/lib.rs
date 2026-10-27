@@ -22,7 +22,7 @@ use ed25519_dalek::SigningKey;
 use model::NodeId;
 use remote::{Remote, RemoteError};
 use seal::Sealer;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 pub use chain::{ChainError, Frontier};
 pub use entry::{
@@ -34,6 +34,9 @@ pub use clock::HybridClock;
 
 /// Appends that lose the seq to another process before `append` gives up.
 const MAX_ATTEMPTS: u32 = 8;
+
+/// R by default: 24 h in nanoseconds.
+const DEFAULT_MAX_AHEAD: u64 = 24 * 3600 * 1_000_000_000;
 
 /// Frontier of every chain a journal has read.
 pub type Frontiers = BTreeMap<NodeId, Frontier>;
@@ -88,6 +91,10 @@ pub struct Journal<R> {
     registered: bool,
     /// The next sync lists each chain and reads its last entry again.
     audit: bool,
+    /// Nanoseconds that an entry HLC may be ahead of the wall clock of this reader: R.
+    max_ahead: u64,
+    /// Entries already logged as too far ahead: one ERROR each.
+    reported_ahead: BTreeSet<(NodeId, u64)>,
 }
 
 impl<R: Remote> Journal<R> {
@@ -114,6 +121,8 @@ impl<R: Remote> Journal<R> {
             broken: BTreeMap::new(),
             registered: false,
             audit: true,
+            max_ahead: DEFAULT_MAX_AHEAD,
+            reported_ahead: BTreeSet::new(),
         }
     }
 
@@ -278,6 +287,16 @@ impl<R: Remote> Journal<R> {
             frontier = frontier
                 .extend(node, &entry)
                 .map_err(|source| JournalError::Chain { node, source })?;
+            // The chain reads again once this clock passes the HLC less R.
+            if entry.hlc > clock::limit(self.max_ahead) {
+                if self.reported_ahead.insert((node, seq)) {
+                    error!(%node, seq, hlc = entry.hlc, "entry HLC more than R ahead of this clock");
+                }
+                return Err(JournalError::Chain {
+                    node,
+                    source: ChainError::FutureHlc { seq },
+                });
+            }
             self.clock.witness(entry.hlc);
             entries.push(entry);
         }
@@ -293,6 +312,11 @@ impl<R: Remote> Journal<R> {
     /// Chains that the last `sync_all` could not read past their frontier, and why.
     pub fn broken(&self) -> &BTreeMap<NodeId, ChainError> {
         &self.broken
+    }
+
+    /// Sets how far an entry HLC may be ahead of the wall clock of this reader. Pass R.
+    pub fn set_max_ahead(&mut self, max_ahead: std::time::Duration) {
+        self.max_ahead = max_ahead.as_nanos() as u64;
     }
 
     /// Makes the next sync check each chain against a listing. It finds a gap of any length and
@@ -427,6 +451,10 @@ mod tests {
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn node_of(seed: u8) -> NodeId {
+        NodeId::from_bytes(key(seed).verifying_key().to_bytes())
     }
 
     fn journal(remote: &Arc<MemoryRemote>, seed: u8) -> Journal<MemoryRemote> {
@@ -800,12 +828,67 @@ mod tests {
         assert_eq!(b.frontier(a.node()), Frontier::GENESIS);
     }
 
+    fn wall() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    async fn entry_at(remote: &MemoryRemote, seed: u8, hlc: u64) {
+        let entry = Entry::sign(
+            &key(seed),
+            0,
+            [0u8; 32],
+            hlc,
+            Seen::new(),
+            vec![put("k")],
+            &entry::test_sealer(),
+        );
+        overwrite(remote, &entry).await;
+    }
+
+    /// R = 2 s: an entry at most R ahead reads, one more ahead is a broken chain until the clock
+    /// of the reader passes it, and the clock never takes it.
+    #[tokio::test]
+    async fn test_entry_more_than_r_ahead_breaks_the_chain_until_the_clock_passes_it() {
+        let remote = Arc::new(MemoryRemote::default());
+        let r = std::time::Duration::from_secs(2);
+        let near = wall() + r.as_nanos() as u64 - 200_000_000;
+        entry_at(&remote, 1, near).await;
+        let far = wall() + r.as_nanos() as u64 + 1_000_000_000;
+        entry_at(&remote, 2, far).await;
+        let mut reader = journal(&remote, 9);
+        reader.set_max_ahead(r);
+
+        assert_eq!(reader.sync_node(node_of(1)).await.unwrap().len(), 1);
+        let result = reader.sync_node(node_of(2)).await;
+        assert!(
+            matches!(
+                result,
+                Err(JournalError::Chain {
+                    source: ChainError::FutureHlc { seq: 0 },
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            reader.clock.tick().unwrap() < far,
+            "the clock does not take it"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        assert_eq!(reader.sync_node(node_of(2)).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_reader_clock_passes_the_writer_clock() {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
         let mut b = journal(&remote, 2);
-        a.clock.witness(u64::MAX / 2);
+        a.clock.witness(wall() + 3_600_000_000_000);
         let from_a = a.append(vec![put("x")], Seen::new()).await.unwrap();
 
         b.sync_all().await.unwrap();

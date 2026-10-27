@@ -416,8 +416,9 @@ impl<R: Remote + 'static> Engine<R> {
         self.index().persist()?;
         // The snapshot can come from a time when this node acked at a higher HLC than its wall
         // clock gives now: a later ack must rank above those writes.
+        let ahead = self.config.retention.as_nanos() as u64;
         for frontier in snapshot.frontiers.values() {
-            self.clock.witness(frontier.last_hlc);
+            self.clock.witness_at_most(frontier.last_hlc, ahead);
         }
         journal.reset(self.index().frontiers()?);
         info!(chains = snapshot.frontiers.len(), "loaded a snapshot");

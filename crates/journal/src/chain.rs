@@ -107,6 +107,8 @@ pub enum ChainError {
     Gap { seq: u64 },
     #[error("entry {seq} has an action with an HLC above the entry HLC")]
     ActionAfterEntry { seq: u64 },
+    #[error("entry {seq} has an HLC more than the retention ahead of this clock")]
+    FutureHlc { seq: u64 },
     #[error("entry {seq} differs from the copy that this proxy read before, or is gone")]
     Changed { seq: u64 },
 }

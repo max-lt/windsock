@@ -108,6 +108,9 @@ One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts:
   prune uses the newest snapshot that loads.
 - The GC deletes a snapshot when a newer snapshot is older than the GC horizon. It deletes the
   head first, then the parts.
+- Parts with no head come from a write that stopped before its head, or from a delete that
+  stopped after it. A load ignores them. The GC deletes them when their write time is older than
+  the GC horizon (24 h).
 - A snapshot in one object, `snapshots/<time>-<h>`, still loads.
 
 ## Cloudflare R2

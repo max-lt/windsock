@@ -448,6 +448,44 @@ impl<R: Sweep + 'static> Engine<R> {
             deleted += 1;
         }
 
+        deleted += self.delete_parts_with_no_head(&keys, now, horizon).await?;
         Ok(deleted)
+    }
+
+    /// Deletes the parts of a snapshot with no head once its write time is older than H:
+    /// a write that crashed before its head, or a delete that stopped after it.
+    async fn delete_parts_with_no_head(
+        &self,
+        keys: &[String],
+        now: u64,
+        horizon: u64,
+    ) -> Result<usize> {
+        let heads: std::collections::BTreeSet<&str> = keys
+            .iter()
+            .filter_map(|key| key.strip_suffix(HEAD))
+            .collect();
+        let mut orphans = std::collections::BTreeSet::new();
+        for key in keys {
+            let Some((base, _)) = key.rsplit_once('/') else {
+                continue;
+            };
+            let Some((time, _)) = parse_key(base) else {
+                continue;
+            };
+            if !heads.contains(base) && now >= time.saturating_add(horizon) {
+                orphans.insert(base);
+            }
+        }
+
+        for base in &orphans {
+            for key in keys
+                .iter()
+                .filter(|key| key.starts_with(&format!("{base}/")))
+            {
+                self.remote.delete(key).await?;
+            }
+            info!(base, "deleted the parts of a snapshot with no head");
+        }
+        Ok(orphans.len())
     }
 }

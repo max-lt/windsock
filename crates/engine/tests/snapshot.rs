@@ -871,3 +871,79 @@ async fn test_gc_deletes_an_old_snapshot_with_all_its_parts() {
     assert!(old.iter().all(|key| !left.contains(key)), "{left:?}");
     assert_eq!(get(&proxy(&remote, 2).await.engine, "x").await, "one");
 }
+
+fn gc_config() -> Config {
+    Config {
+        snapshot_object: 100,
+        snapshot_interval: Duration::from_secs(3600),
+        gc_horizon: Duration::from_secs(3600),
+        ..Config::default()
+    }
+}
+
+/// Copies the parts of the newest snapshot to a new base with no head, as a crash before the
+/// head leaves them. Returns the new part keys.
+async fn parts_with_no_head(remote: &TestRemote, time: u64) -> Vec<String> {
+    let keys = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    let head = keys.iter().rfind(|key| key.ends_with("/head")).unwrap();
+    let base = head.strip_suffix("/head").unwrap();
+    let orphan = format!("{}{time:020}-{}", engine::SNAPSHOTS_PREFIX, "ab".repeat(32));
+    let mut out = Vec::new();
+    for key in keys
+        .iter()
+        .filter(|key| key.starts_with(&format!("{base}/0")))
+    {
+        let part = key.rsplit_once('/').unwrap().1;
+        let bytes = remote.inner.get(key).await.unwrap().unwrap();
+        let copy = format!("{orphan}/{part}");
+        remote.inner.put(&copy, bytes).await.unwrap();
+        out.push(copy);
+    }
+    out
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+/// A crash before the head leaves parts with no head. A load ignores them, and the GC keeps
+/// them for H: their writer can still be at work.
+#[tokio::test]
+async fn test_parts_with_no_head_are_ignored_and_kept_inside_the_horizon() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    let orphans = parts_with_no_head(&remote, now_nanos()).await;
+    assert!(!orphans.is_empty());
+
+    let b = proxy(&remote, 2).await;
+    a.engine.gc().await.unwrap();
+
+    assert_eq!(get(&b.engine, "x").await, "one", "a load ignores the parts");
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(orphans.iter().all(|key| left.contains(key)), "{left:?}");
+}
+
+/// A GC that dies after it deleted a head, or a crash before the head, leaves parts. The
+/// first GC run after H deletes them.
+#[tokio::test]
+async fn test_parts_left_by_a_gc_that_died_are_deleted_by_the_next_run() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    let old = parts_with_no_head(&remote, now_nanos() - 3_600_000_000_000).await;
+
+    a.engine.gc().await.unwrap();
+
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(old.iter().all(|key| !left.contains(key)), "{left:?}");
+}

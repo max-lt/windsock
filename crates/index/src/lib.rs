@@ -115,13 +115,19 @@ fn object_key(bucket: &str, key: &str) -> Vec<u8> {
     out
 }
 
+/// The most table files that the index keeps open. The fjall default is 900 on Linux, more than
+/// the 256 descriptors that windsockd keeps out of the S3 connection limit.
+pub const MAX_OPEN_FILES: usize = 128;
+
 /// The state format of this build: versions ordered by their ack HLC.
 const FORMAT: u32 = 2;
 const FORMAT_KEY: &str = "format";
 
 impl Index {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::builder(path).open()?;
+        let db = Database::builder(path)
+            .max_cached_files(Some(MAX_OPEN_FILES))
+            .open()?;
         Self::with_database(db, None)
     }
 

@@ -313,6 +313,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_descriptor_reserve_covers_the_engine() {
+        // Index files, remote connections, and room for buffer, cache and listener files.
+        let engine = engine::INDEX_MAX_OPEN_FILES + s3remote::MAX_IN_FLIGHT + 32;
+
+        assert!(engine as u64 <= FD_RESERVE, "{engine} > {FD_RESERVE}");
+    }
+
+    #[test]
     fn test_connection_limit_keeps_a_reserve_for_the_engine() {
         assert_eq!(connection_limit(Some(1024)), 768);
         assert_eq!(connection_limit(Some(128)), 64);

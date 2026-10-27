@@ -196,6 +196,8 @@ impl Sweep for ProxyRemote {
 /// What one seed exercised.
 #[derive(Default)]
 struct Stats {
+    /// blake3 of the step log: two runs of one seed must give the same.
+    log_hash: [u8; 32],
     quarantine: bool,
     /// A start failed again with the quarantine still held.
     held_restart: bool,
@@ -691,6 +693,8 @@ impl Sim {
 
 async fn run(seed: u64) -> Result<Stats, String> {
     CURRENT_SEED.with(|current| current.set(seed));
+    // A seed must not see the clocks of the seed before it on this thread.
+    journal::reset_manual_clock();
     let mut now = START;
     journal::set_manual_wall(Some(now));
     let remote = Arc::new(SimRemote::default());
@@ -736,6 +740,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
     }
     sim.settle().await?;
     sim.check().await?;
+    sim.stats.log_hash = *blake3::hash(sim.log.join("\n").as_bytes()).as_bytes();
     Ok(sim.stats)
 }
 
@@ -870,4 +875,29 @@ fn test_simulation_regression_seeds() {
     for &seed in REGRESSION_SEEDS {
         run_seeds(seed..seed + 1);
     }
+}
+
+/// One seed gives the same run alone and after other seeds on the same thread.
+#[test]
+fn test_seed_alone_and_after_other_seeds_gives_the_same_run() {
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let after = std::thread::spawn(move || {
+        let runtime = runtime();
+        for seed in 0..3 {
+            runtime.block_on(run(seed)).unwrap();
+        }
+        runtime.block_on(run(3)).unwrap().log_hash
+    })
+    .join()
+    .unwrap();
+    let alone = std::thread::spawn(move || runtime().block_on(run(3)).unwrap().log_hash)
+        .join()
+        .unwrap();
+
+    assert_eq!(alone, after);
 }

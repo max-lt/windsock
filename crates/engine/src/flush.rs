@@ -75,6 +75,19 @@ impl<R: Remote + 'static> Engine<R> {
         let Some(intent) = buffer::read_intent(&self.buffer_dir).await? else {
             return Ok(());
         };
+        // The signature covers the sealed actions only: apply what they hold, not the clear copy.
+        let entry = Entry::from_wire(&intent.entry.to_wire(), self.keys.sealer()).map_err(|e| {
+            EngineError::Corrupt(format!(
+                "{}: the entry does not open: {e:?}",
+                self.buffer_dir.join("intent").display()
+            ))
+        })?;
+        if entry.actions != intent.entry.actions {
+            warn!(
+                seq = entry.seq,
+                "the clear actions of the intent differ: applied the sealed ones"
+            );
+        }
 
         let mut journal = self.journal.lock().await;
         let written = if self.plan_is_stale(intent.planned_at) {
@@ -84,8 +97,8 @@ impl<R: Remote + 'static> Engine<R> {
         };
 
         if written {
-            info!(seq = intent.entry.seq, "recovered an interrupted flush");
-            self.apply_own(&mut journal, intent.entry).await?;
+            info!(seq = entry.seq, "recovered an interrupted flush");
+            self.apply_own(&mut journal, entry).await?;
             self.buffer.lock().await.release(&intent.segments).await?;
         } else {
             warn!(

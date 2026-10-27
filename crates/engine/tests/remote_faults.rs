@@ -277,3 +277,37 @@ async fn test_sync_that_fails_on_one_chain_reads_the_other_chains_again() {
         assert_eq!(&object.data[..], b"v");
     }
 }
+
+/// Recover applies the actions that the remote holds, not the clear copy in the intent file.
+#[tokio::test]
+async fn test_recover_ignores_changed_clear_actions_in_the_intent() {
+    let remote = Arc::new(FaultRemote::default());
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    let put = writer.engine.put(
+        BUCKET,
+        "key-AAAA",
+        Bytes::from_static(b"v"),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::LoseAnswer);
+    assert!(writer.engine.flush().await.is_err());
+    let intent = writer._dir.path().join("buffer").join("intent");
+    let bytes = std::fs::read(&intent).unwrap();
+    let at = bytes
+        .windows(8)
+        .position(|w| w == b"key-AAAA")
+        .expect("the intent holds the clear key");
+    let mut changed = bytes.clone();
+    changed[at..at + 8].copy_from_slice(b"key-BBBB");
+    std::fs::write(&intent, changed).unwrap();
+
+    writer.engine.flush().await.unwrap();
+
+    assert!(writer.engine.get(BUCKET, "key-BBBB", None).await.is_err());
+    let object = writer.engine.get(BUCKET, "key-AAAA", None).await.unwrap();
+    assert_eq!(&object.data[..], b"v");
+}

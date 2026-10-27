@@ -385,6 +385,19 @@ mod tests {
     }
 
     #[test]
+    fn test_changed_clear_actions_do_not_survive_the_wire_form() {
+        let mut entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()], &test_sealer());
+        entry.actions = Some(vec![Action::Delete {
+            bucket: "b".into(),
+            key: "k".into(),
+        }]);
+
+        let read = Entry::from_wire(&entry.to_wire(), &test_sealer()).unwrap();
+
+        assert_eq!(read.actions, Some(vec![put()]));
+    }
+
+    #[test]
     fn test_redacted_entry_keeps_hash_and_signature() {
         let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()], &test_sealer());
         let redacted = entry.redacted();

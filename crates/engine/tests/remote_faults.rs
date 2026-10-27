@@ -375,3 +375,44 @@ async fn test_apply_error_does_not_read_the_chains_again_at_each_sync() {
     // Two chains, and for each one the read of the next seq and the gap probe.
     assert_eq!(read, 4, "entry reads at one sync; {second:?}");
 }
+
+/// Two processes share one identity. The second one commits after the first, so its commit reads
+/// the first one's entry. When the manifest of that entry does not read, the own write of the
+/// second process must still become visible at the next sync.
+#[tokio::test]
+async fn test_own_write_stays_visible_when_the_commit_reads_a_bad_manifest() {
+    let remote = Arc::new(FaultRemote::default());
+    let first = proxy(&remote, 1).await;
+    let second = proxy(&remote, 1).await;
+    first.engine.create_bucket(BUCKET, None).await.unwrap();
+    first.engine.flush().await.unwrap();
+    second.engine.sync().await.unwrap();
+    let big = BTreeMap::from([("x-amz-meta-a".to_string(), "m".repeat(6000))]);
+    let put = first.engine.put(
+        BUCKET,
+        "big",
+        Bytes::from_static(b"v"),
+        big,
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    first.engine.flush().await.unwrap();
+    assert!(!remote.inner.list("manifests/").await.unwrap().is_empty());
+
+    let put = second.engine.put(
+        BUCKET,
+        "own",
+        Bytes::from_static(b"mine"),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    *remote.failing_reads.lock().unwrap() = Some("manifests/");
+    let _ = second.engine.flush().await;
+    *remote.failing_reads.lock().unwrap() = None;
+    let _ = second.engine.flush().await;
+    second.engine.sync().await.unwrap();
+
+    let object = second.engine.get(BUCKET, "own", None).await.unwrap();
+    assert_eq!(&object.data[..], b"mine");
+}

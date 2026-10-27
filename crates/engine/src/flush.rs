@@ -301,7 +301,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         // Another process with this identity wrote entries that a prune redacted.
         if entries.iter().any(|stashed| stashed.actions.is_none()) {
-            if let Err(none) = self.bootstrap(journal).await? {
+            let loaded = self.bootstrap(journal).await;
+            if !matches!(loaded, Ok(Ok(()))) {
+                self.reset_journal(journal);
+            }
+            if let Err(none) = loaded? {
                 return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
             }
             entries.clear();
@@ -309,7 +313,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         entries.push(entry);
 
-        self.ingest(&entries).await?;
+        if let Err(e) = self.ingest(&entries).await {
+            // The journal is past these entries and the index never got them: read them again.
+            self.reset_journal(journal);
+            return Err(e);
+        }
         let mut index = self.index();
         index.apply(entries)?;
         index.persist()?;

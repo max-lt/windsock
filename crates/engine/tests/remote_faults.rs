@@ -27,6 +27,8 @@ struct FaultRemote {
     inner: MemoryRemote,
     next: Mutex<Option<(&'static str, Fault)>>,
     failing_reads: Mutex<Option<&'static str>>,
+    /// Reads of journal entries.
+    log_gets: std::sync::atomic::AtomicUsize,
 }
 
 impl FaultRemote {
@@ -79,6 +81,10 @@ impl Remote for FaultRemote {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        if key.starts_with("log/") {
+            self.log_gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let failing = *self.failing_reads.lock().unwrap();
         if failing.is_some_and(|prefix| key.starts_with(prefix)) {
             return Err(unavailable());
@@ -310,4 +316,62 @@ async fn test_recover_ignores_changed_clear_actions_in_the_intent() {
     assert!(writer.engine.get(BUCKET, "key-BBBB", None).await.is_err());
     let object = writer.engine.get(BUCKET, "key-AAAA", None).await.unwrap();
     assert_eq!(&object.data[..], b"v");
+}
+
+/// An entry whose seen link names another hash fails the apply at every sync. The sync must not
+/// read every chain again each time: the entries are already in the index, waiting.
+#[tokio::test]
+async fn test_apply_error_does_not_read_the_chains_again_at_each_sync() {
+    let remote = Arc::new(FaultRemote::default());
+    let reader = proxy(&remote, 2).await;
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    for n in 0..5 {
+        let key = format!("k{n}");
+        let put = writer.engine.put(
+            BUCKET,
+            &key,
+            Bytes::from_static(b"v"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        );
+        put.await.unwrap();
+        writer.engine.flush().await.unwrap();
+    }
+    let bad_link = journal::Link {
+        seq: 0,
+        hash: [9u8; 32],
+    };
+    let forged = journal::Entry::sign(
+        &SigningKey::from_bytes(&[9; 32]),
+        0,
+        [0u8; 32],
+        1,
+        BTreeMap::from([(writer.engine.node(), bad_link)]),
+        vec![journal::Action::Delete {
+            bucket: BUCKET.into(),
+            key: "k0".into(),
+        }],
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys().sealer(),
+    );
+    remote
+        .inner
+        .create(&forged.remote_key(), Bytes::from(forged.to_wire()))
+        .await
+        .unwrap();
+    remote
+        .inner
+        .put(&journal::node_key(forged.node), Bytes::new())
+        .await
+        .unwrap();
+    let _ = reader.engine.sync().await;
+    let gets = || remote.log_gets.load(std::sync::atomic::Ordering::SeqCst);
+
+    let before = gets();
+    let second = reader.engine.sync().await;
+    let read = gets() - before;
+
+    // Two chains, and for each one the read of the next seq and the gap probe.
+    assert_eq!(read, 4, "entry reads at one sync; {second:?}");
 }

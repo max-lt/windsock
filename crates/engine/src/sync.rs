@@ -13,38 +13,28 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     pub(crate) async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
-        let result = self.sync_entries(journal).await;
-        if result.is_err() {
-            // The journal is past entries that the index did not apply: read them again.
-            journal.reset(self.index().frontiers()?);
-        }
-        result
-    }
-
-    async fn sync_entries(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
         let started = Instant::now();
         *self
             .last_sync
             .lock()
             .expect("no panic while the lock is held") = Some(started);
 
-        let mut entries = journal.sync_all().await?;
-
-        // Entries under the latest snapshot can be redacted: read from the snapshot instead.
-        if entries.iter().any(|entry| entry.actions.is_none()) {
-            if let Err(none) = self.bootstrap(journal).await? {
-                return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
+        let entries = match self.read_entries(journal).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                // The journal is past entries that the index never got: read them again.
+                self.reset_journal(journal);
+                return Err(e);
             }
-            entries = journal.sync_all().await?;
-        }
+        };
 
         let mut report = SyncReport {
             broken: journal.broken().keys().copied().collect(),
             ..SyncReport::default()
         };
 
+        // The index keeps the entries it cannot apply yet: a reset would add them twice.
         if !entries.is_empty() {
-            self.ingest(&entries).await?;
             report.applied = self.index().apply(entries)?;
             debug!(applied = report.applied, "synced");
         }
@@ -58,6 +48,32 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         Ok(report)
+    }
+
+    /// Moves the journal back to the frontiers that the index applied.
+    pub(crate) fn reset_journal(&self, journal: &mut Journal<R>) {
+        match self.index().frontiers() {
+            Ok(frontiers) => journal.reset(frontiers),
+            Err(e) => warn!(%e, "the journal stays past entries that the index did not get"),
+        }
+    }
+
+    /// The new entries of every chain, with their manifests and chunk locations recorded.
+    async fn read_entries(&self, journal: &mut Journal<R>) -> Result<Vec<Entry>> {
+        let mut entries = journal.sync_all().await?;
+
+        // Entries under the latest snapshot can be redacted: read from the snapshot instead.
+        if entries.iter().any(|entry| entry.actions.is_none()) {
+            if let Err(none) = self.bootstrap(journal).await? {
+                return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
+            }
+            entries = journal.sync_all().await?;
+        }
+
+        if !entries.is_empty() {
+            self.ingest(&entries).await?;
+        }
+        Ok(entries)
     }
 
     /// GC rule 1: dedup only against what a complete sync younger than H/2 found.

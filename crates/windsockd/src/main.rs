@@ -310,6 +310,11 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
             interval_secs = config.gc.interval_secs,
             "this proxy runs the GC"
         );
+        if engine.sync().await.is_ok()
+            && let Some(node) = engine.other_gc_node()
+        {
+            warn!(%node, "another node ran the GC in the last horizon: run the GC on one node only");
+        }
         let collector = engine.clone();
         background.push(every(
             Duration::from_secs(config.gc.interval_secs),

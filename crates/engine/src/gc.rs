@@ -46,6 +46,9 @@ impl<R: Sweep + 'static> Engine<R> {
         // A broken chain can hold puts of packs that look dead, and it pins the stable HLC.
         self.journal.lock().await.audit_next_sync();
         let sync = self.sync().await?;
+        if let Some(node) = self.other_gc_node() {
+            warn!(%node, "another node ran the GC in the last horizon: run the GC on one node only");
+        }
         if !sync.broken.is_empty() {
             warn!(broken = ?sync.broken, "gc refused: a chain is broken");
             return Err(EngineError::BrokenChains(sync.broken));

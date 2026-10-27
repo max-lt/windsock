@@ -112,9 +112,11 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 
 ## Limits
 
-- Run the GC on one proxy per remote: set `gc.enabled = true` on that proxy only. Windsock does
+- Run the GC in one process per remote: set `gc.enabled = true` on that proxy only. Windsock does
   not enforce this rule. No lock stops a second GC runner. The GC protocol is model-checked with
-  one GC runner and two writers only, so two GC runners on one remote are not verified.
+  one GC runner and two writers only, so two GC runners on one remote are not verified. A proxy
+  with `gc.enabled` logs `WARN another node ran the GC in the last horizon` at start and at each
+  GC run when it reads a condemn of another node from the last horizon.
 
 - All remote data is encrypted with `repo.key`: see `docs/encryption.md`. Without this file,
   nobody can read the data.

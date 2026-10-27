@@ -213,6 +213,8 @@ pub struct Engine<R> {
     /// (unix nanos of this node). Kept in `orphans_file`, so a restart keeps the count.
     orphans_seen: Mutex<BTreeMap<String, u64>>,
     orphans_file: PathBuf,
+    /// Another node that wrote a condemn in the last H: a second GC runner.
+    other_gc_node: Mutex<Option<NodeId>>,
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -262,6 +264,7 @@ impl<R: Remote + 'static> Engine<R> {
             draining: AtomicBool::new(false),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),
+            other_gc_node: Mutex::new(None),
         };
 
         engine.check_repo_key().await?;

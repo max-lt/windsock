@@ -140,6 +140,7 @@ impl<R: Remote + 'static> Engine<R> {
     /// Stores the manifests that entries carry or name, and the chunk locations they give.
     /// The data is in the remote before the entry, so this can run before the entries apply.
     pub(crate) async fn ingest(&self, entries: &[Entry]) -> Result<()> {
+        self.note_other_gc(entries);
         for action in entries.iter().flat_map(|e| e.actions.iter().flatten()) {
             let Action::Put {
                 manifest_id,
@@ -167,6 +168,35 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         Ok(())
+    }
+
+    /// Notes another node that wrote a condemn in the last H: it runs a GC too.
+    fn note_other_gc(&self, entries: &[Entry]) {
+        let horizon = self.config.gc_horizon.as_nanos() as u64;
+        let now = buffer::unix_nanos();
+        let other = entries.iter().rfind(|entry| {
+            entry.node != self.node
+                && now.saturating_sub(entry.hlc) < horizon
+                && entry
+                    .actions
+                    .iter()
+                    .flatten()
+                    .any(|action| matches!(action, Action::Condemn { .. }))
+        });
+        if let Some(entry) = other {
+            *self
+                .other_gc_node
+                .lock()
+                .expect("no panic while the lock is held") = Some(entry.node);
+        }
+    }
+
+    /// Another node that wrote a condemn in the last H, as far as the syncs of this process saw.
+    pub fn other_gc_node(&self) -> Option<NodeId> {
+        *self
+            .other_gc_node
+            .lock()
+            .expect("no panic while the lock is held")
     }
 
     /// Records the chunk locations of a manifest, for dedup.

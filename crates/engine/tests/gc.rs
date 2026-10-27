@@ -664,3 +664,30 @@ async fn test_large_condemn_is_split_over_entries() {
         "{condemns} condemn entries for 6 packs, 2 IDs each"
     );
 }
+
+/// A second GC runner shows: the condemn of another node in the last H names that node. The
+/// condemn comes after the snapshot of the day, so the prune keeps it whole.
+#[tokio::test]
+async fn test_condemn_of_another_node_names_a_second_gc_runner() {
+    let remote = Arc::new(TestRemote::new());
+    let config = Config {
+        snapshot_interval: Duration::from_secs(3600),
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    let b = proxy(&remote, 2).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+    put(&a.engine, "dead", &random_bytes(1, 20_000)).await;
+    a.engine.flush().await.unwrap();
+    a.engine.delete(BUCKET, "dead").await.unwrap();
+    a.engine.flush().await.unwrap();
+    let report = a.engine.gc().await.unwrap();
+    assert!(report.condemned_packs > 0 && !report.snapshot_written);
+    assert_eq!(a.engine.other_gc_node(), None);
+
+    b.engine.sync().await.unwrap();
+
+    assert_eq!(b.engine.other_gc_node(), Some(a.engine.node()));
+}

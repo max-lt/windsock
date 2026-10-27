@@ -87,6 +87,13 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - A wait for a slot does not count in the time of an attempt, but it ends at the time limit of
   the call (120 s). A call frees its slot during the pause between attempts.
 
+## One GC runner
+
+One process per remote runs the GC (`gc.enabled = true`). No lock enforces this, and the model
+check covers one runner. A proxy with `gc.enabled` logs `WARN another node ran the GC in the last
+horizon` when it reads a condemn entry of another node from the last horizon (24 h). The check
+sees only condemn entries that no prune has redacted yet: a second runner can stay unseen.
+
 ## Snapshots
 
 One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts.

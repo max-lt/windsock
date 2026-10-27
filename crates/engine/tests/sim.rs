@@ -544,3 +544,13 @@ fn test_simulation_of_three_proxies() {
 fn test_simulation_of_three_proxies_20000_seeds() {
     run_seeds(1000..21_000);
 }
+
+/// Seeds that found a fault, run in every test run.
+#[test]
+fn test_simulation_regression_seeds() {
+    // 522: an entry in the intent reached the remote with a lost answer, the clock stepped back,
+    // and after a reopen the next own entry had a lower HLC.
+    for seed in [522] {
+        run_seeds(seed..seed + 1);
+    }
+}

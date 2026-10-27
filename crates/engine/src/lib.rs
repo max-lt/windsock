@@ -336,6 +336,10 @@ impl<R: Remote + 'static> Engine<R> {
             clock.witness_at_most(frontier.last_hlc, ahead);
         }
         clock.witness_at_most(buffer.latest_time(), ahead);
+        // An entry in the intent can be in the remote with no apply: the next one must rise.
+        if let Some(intent) = buffer::read_intent(&buffer_dir).await? {
+            clock.witness_at_most(intent.entry.hlc, ahead);
+        }
         let cache = match config.cache_bytes {
             0 => None,
             bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),

@@ -909,3 +909,27 @@ async fn test_forged_own_entry_at_a_far_seq_fails_the_open_with_its_key() {
     assert!(error.contains(&format!("{node}")), "{error}");
     assert!(error.contains("00000000000999999999"), "{error}");
 }
+
+/// A proxy with no GC run has no audit from the GC. Once the remote is fixed, its next syncs must
+/// still audit the marked chain and clear the mark.
+#[tokio::test]
+async fn test_broken_mark_clears_with_no_gc_run() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, _b) = chain_of(&remote, 4).await;
+    let mut held = Vec::new();
+    for seq in [1, 2] {
+        let key = journal::entry_key(a.engine.node(), seq);
+        held.push((key.clone(), remote.get(&key).await.unwrap().unwrap()));
+        remote.delete(&key).await.unwrap();
+    }
+    let c = proxy(&remote, 3).await;
+    assert_eq!(c.engine.sync().await.unwrap().broken, vec![a.engine.node()]);
+
+    for (key, bytes) in held {
+        remote.put(&key, bytes).await.unwrap();
+    }
+    c.engine.sync().await.unwrap();
+    let report = c.engine.sync().await.unwrap();
+
+    assert!(report.broken.is_empty(), "{:?}", report.broken_causes);
+}

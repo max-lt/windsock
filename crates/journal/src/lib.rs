@@ -382,8 +382,9 @@ impl<R: Remote> Journal<R> {
         }
 
         let mut entries = self.take_stashed();
-        // The flag stays set until a whole audit runs: a remote error must not skip it.
-        let audit = self.audit;
+        // The flag stays set until a whole audit runs: a remote error must not skip it. A marked
+        // chain is audited at each sync, so a proxy with no GC run clears the mark too.
+        let audit = self.audit || !self.broken.is_empty();
         let mut queue: Vec<NodeId> = nodes.iter().copied().collect();
         let mut known = nodes;
 
@@ -790,14 +791,8 @@ mod tests {
 
         overwrite(&remote, &good).await;
         let entries = reader.sync_all().await.unwrap();
+        // The marked chain is audited at this sync: the mark goes once the chain reads.
         assert_eq!(entries, vec![good]);
-        assert!(
-            !reader.broken().is_empty(),
-            "the mark stays until an audit passes"
-        );
-        reader.audit_next_sync();
-        reader.sync_all().await.unwrap();
-
         assert!(reader.broken().is_empty());
     }
 

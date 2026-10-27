@@ -13,7 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::sim::Point;
-use engine::{Config, Engine, EngineError, RepoKey, WriteMode};
+use engine::{Config, Engine, EngineError, ListEntry, ListQuery, RepoKey, WriteMode};
 use remote::{MemoryRemote, Remote, RemoteError, Sweep};
 use tempfile::TempDir;
 
@@ -71,6 +71,8 @@ enum Fault {
     Refuse,
     /// Stores, then fails: the answer is lost.
     LoseAnswer,
+    /// Stores while the host sleeps for H/2: the plan of the flush is stale at its commit.
+    Slow,
 }
 
 /// A memory remote that fails the next write under a prefix.
@@ -110,6 +112,10 @@ impl Remote for SimRemote {
                 self.inner.put(key, data).await?;
                 Err(Self::injected())
             }
+            Some(Fault::Slow) => {
+                journal::suspend_manual((config().gc_horizon / 2).as_nanos() as u64);
+                self.inner.put(key, data).await
+            }
             None => self.inner.put(key, data).await,
         }
     }
@@ -120,6 +126,10 @@ impl Remote for SimRemote {
             Some(Fault::LoseAnswer) => {
                 self.inner.create(key, data).await?;
                 Err(Self::injected())
+            }
+            Some(Fault::Slow) => {
+                journal::suspend_manual((config().gc_horizon / 2).as_nanos() as u64);
+                self.inner.create(key, data).await
             }
             None => self.inner.create(key, data).await,
         }
@@ -205,6 +215,13 @@ struct Stats {
     lost_index: bool,
     stale_index: bool,
     suspend: bool,
+    tombstone_prune: bool,
+    deleted_pack: bool,
+    intent_quarantined: bool,
+    young_kept: bool,
+    stale_plan: bool,
+    marker_fault: bool,
+    far_ahead: bool,
 }
 
 /// One acked write: its rank and what a reader must see if it wins.
@@ -229,6 +246,8 @@ struct Proxy {
     outage: Arc<AtomicBool>,
     /// An older copy of the index directory, for a crash that restores it.
     stale_index: Option<TempDir>,
+    /// How far the wall clock of this proxy is ahead of the shared time.
+    offset: u64,
 }
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -264,10 +283,13 @@ struct Sim {
     buckets: BTreeMap<String, Vec<Acked>>,
     log: Vec<String>,
     stats: Stats,
+    /// A clock ran more than R ahead: a GC or a snapshot may then fail on a broken chain.
+    faulty: bool,
 }
 
 impl Sim {
     async fn open(&mut self, i: usize) -> Result<(), String> {
+        journal::set_manual_wall(Some(self.now + self.proxies[i].offset));
         let proxy = &mut self.proxies[i];
         let remote = Arc::new(ProxyRemote {
             shared: self.remote.clone(),
@@ -302,6 +324,24 @@ impl Sim {
                     .map_err(|e| format!("p{i} quarantine: {e}"))?;
                 self.log.push(format!("p{i} quarantine at open: {held:?}"));
                 self.stats.quarantine = true;
+                // A write is late when its HLC is under the clock less (R - M), and the clock of
+                // the open is at most R ahead of its wall clock.
+                let wall = self.now + self.proxies[i].offset;
+                let bound = wall + config().late_margin.as_nanos() as u64;
+                if let Some(young) = held.iter().find(|w| w.hlc >= bound) {
+                    return Err(format!(
+                        "p{i}: a young write is in the quarantine: {young:?}"
+                    ));
+                }
+                let intent = std::fs::read_dir(dir.join("quarantine")).unwrap().any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("intent")
+                });
+                self.stats.intent_quarantined |= intent;
+                let newest = held.iter().map(|w| w.hlc).max().unwrap_or(0);
+                self.stats.young_kept |= self.acked_after(i, newest);
                 for write in held {
                     self.drop_acked(i, &write.target, write.hlc)?;
                 }
@@ -315,6 +355,15 @@ impl Sim {
             }
             Err(e) => Err(format!("p{i} open: {e}")),
         }
+    }
+
+    /// True when proxy `i` acked a write after `hlc` that the operator did not drop.
+    fn acked_after(&self, i: usize, hlc: u64) -> bool {
+        self.keys
+            .values()
+            .chain(self.buckets.values())
+            .flatten()
+            .any(|a| a.proxy == i && a.hlc > hlc && !a.dropped)
     }
 
     /// Marks the acked write of proxy `i` to `target` at `hlc` as dropped by the operator.
@@ -343,7 +392,7 @@ impl Sim {
         self.proxies[i].engine = None;
         let index = self.proxies[i].dir.path().join("index");
         match self.rng.below(8) {
-            0 | 1 => {
+            0 | 1 if index.exists() => {
                 std::fs::remove_dir_all(&index).unwrap();
                 self.stats.lost_index = true;
             }
@@ -364,7 +413,9 @@ impl Sim {
         self.open(i).await
     }
 
+    /// The engine of proxy `i`, with the wall clock of that proxy for the call.
     fn engine(&self, i: usize) -> &Engine<ProxyRemote> {
+        journal::set_manual_wall(Some(self.now + self.proxies[i].offset));
         self.proxies[i].engine.as_ref().expect("the proxy is open")
     }
 
@@ -388,6 +439,24 @@ impl Sim {
     fn quarantine(&mut self, i: usize, e: &EngineError) {
         if matches!(e, EngineError::Quarantined(_)) {
             self.log.push(format!("p{i} quarantine: {e}"));
+        }
+    }
+
+    /// A GC run on proxy 0. An error fails the run, unless a fault for it is in place.
+    async fn gc(&mut self) -> Result<(), String> {
+        let armed = self.remote.next.lock().unwrap().is_some();
+        let r = self.engine(0).gc().await;
+        self.log.push(format!("gc {r:?}"));
+        let hit = armed && self.remote.next.lock().unwrap().is_none();
+        match r {
+            Ok(report) => {
+                self.stats.tombstone_prune |= report.pruned_keys > 0;
+                self.stats.deleted_pack |= report.deleted_packs > 0;
+                Ok(())
+            }
+            Err(EngineError::Quarantined(_)) => Ok(()),
+            Err(_) if self.faulty || hit => Ok(()),
+            Err(e) => Err(format!("gc: {e}")),
         }
     }
 
@@ -428,8 +497,7 @@ impl Sim {
             }
             let r = self.engine(o).flush().await;
             self.log.push(format!("p{o} outage flush {r:?}"));
-            let r = self.engine(0).gc().await;
-            self.log.push(format!("outage gc {r:?}"));
+            self.gc().await?;
         }
         self.proxies[o].outage.store(false, Ordering::SeqCst);
         if let Err(e) = self.engine(o).flush().await {
@@ -534,18 +602,40 @@ impl Sim {
                 let r = self.engine(i).flush().await;
                 self.log.push(format!("p{i} flush {r:?}"));
                 if let Err(e) = r {
+                    self.stats.stale_plan |= matches!(e, EngineError::StalePlan);
                     self.quarantine(i, &e);
                 }
             }
-            61..=72 => {
+            61 => {
+                // A slow pack upload: the host sleeps between the plan and the commit.
+                *self.remote.next.lock().unwrap() = Some(("packs/", Fault::Slow));
+                let r = self.engine(i).flush().await;
+                self.log.push(format!("p{i} slow flush {r:?}"));
+                // The shared time follows the clock that the sleep moved on.
+                let wall = journal::wall_clock_nanos();
+                self.now = self.now.max(wall.saturating_sub(self.proxies[i].offset));
+                if let Err(e) = r {
+                    self.stats.stale_plan |= matches!(e, EngineError::StalePlan);
+                    self.quarantine(i, &e);
+                }
+                *self.remote.next.lock().unwrap() = None;
+            }
+            62..=72 => {
                 let _ = self.engine(i).sync().await;
             }
-            73..=76 => {
-                let r = self.engine(0).gc().await;
-                self.log.push(format!("gc {r:?}"));
-            }
+            73..=76 => self.gc().await?,
             77..=78 => {
-                let _ = self.engine(0).snapshot().await;
+                let armed = self.remote.next.lock().unwrap().is_some();
+                let r = self.engine(0).snapshot().await;
+                // The key holds a random nonce: the log keeps only the result.
+                self.log
+                    .push(format!("snapshot {:?}", r.as_ref().map(|_| ())));
+                let hit = armed && self.remote.next.lock().unwrap().is_none();
+                match r {
+                    Ok(_) | Err(EngineError::Quarantined(_)) => {}
+                    Err(_) if self.faulty || hit => {}
+                    Err(e) => return Err(format!("snapshot: {e}")),
+                }
             }
             79..=81 => self.crash(i).await?,
             82..=84 => self.crash_in_flush(i).await?,
@@ -556,7 +646,24 @@ impl Sim {
                 self.now += pause;
                 self.stats.suspend = true;
             }
-            85..=88 => {
+            85 => {
+                // One proxy runs ahead past M, and now and then past R: the others then see
+                // its new entries as a broken chain until their clocks catch up.
+                let m = config().late_margin.as_nanos() as u64;
+                let r = config().retention.as_nanos() as u64;
+                self.proxies[i].offset = match self.rng.chance(20) {
+                    true => {
+                        self.stats.far_ahead = true;
+                        self.faulty = true;
+                        r + self.rng.below(m)
+                    }
+                    false => m + self.rng.below(m),
+                };
+            }
+            86 => {
+                self.proxies[i].offset = self.rng.below(config().late_margin.as_nanos() as u64);
+            }
+            87..=88 => {
                 // A step of the wall clock, back or ahead, inside the bound R - M.
                 let step = self.rng.below(120 * SECOND);
                 self.now = match self.rng.chance(50) {
@@ -566,14 +673,17 @@ impl Sim {
                 journal::set_manual_wall(Some(self.now));
             }
             _ => {
-                let prefix =
-                    ["log/", "packs/", "manifests/", "snapshots/"][self.rng.below(4) as usize];
+                let prefix = ["log/", "packs/", "manifests/", "snapshots/", "nodes/"]
+                    [self.rng.below(5) as usize];
                 let fault = match self.rng.chance(50) {
                     true => Fault::Refuse,
                     false => Fault::LoseAnswer,
                 };
                 *self.remote.next.lock().unwrap() = Some((prefix, fault));
-                if let Err(e) = self.engine(i).flush().await {
+                let result = self.engine(i).flush().await;
+                let used = self.remote.next.lock().unwrap().is_none();
+                self.stats.marker_fault |= prefix == "nodes/" && used && result.is_err();
+                if let Err(e) = result {
                     self.quarantine(i, &e);
                 }
             }
@@ -594,6 +704,12 @@ impl Sim {
 
     async fn settle(&mut self) -> Result<(), String> {
         *self.remote.next.lock().unwrap() = None;
+        // Clocks come back, and time passes every HLC that ran ahead.
+        let ahead = self.proxies.iter().map(|p| p.offset).max().unwrap_or(0);
+        for proxy in &mut self.proxies {
+            proxy.offset = 0;
+        }
+        self.now += ahead;
         for i in 0..3 {
             if self.proxies[i].engine.is_none() {
                 self.open(i).await?;
@@ -635,13 +751,52 @@ impl Sim {
         Ok(())
     }
 
+    /// Every proxy lists the keys whose winner is a put, each at the HLC of that put.
+    async fn check_lists(&self) -> Result<(), String> {
+        let expected: Vec<(String, u64)> = Self::winners(&self.keys)
+            .into_iter()
+            .filter_map(|(key, w)| w.filter(|w| w.value.is_some()).map(|w| (key, w.hlc)))
+            .collect();
+        for i in 0..3 {
+            let query = ListQuery {
+                prefix: "",
+                delimiter: None,
+                after: None,
+                max_keys: 1000,
+            };
+            let page = self.engine(i).list_page(BUCKET, &query).await;
+            let page = page.map_err(|e| format!("p{i} list: {e}"))?;
+            let listed: Vec<(String, u64)> = page
+                .entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Object(info) => Some((info.key, info.last_modified)),
+                    ListEntry::CommonPrefix(_) => None,
+                })
+                .collect();
+            if listed != expected {
+                return Err(format!("p{i} lists {listed:?}, expected {expected:?}"));
+            }
+        }
+        Ok(())
+    }
+
     async fn check(&self) -> Result<(), String> {
         for (key, winner) in Self::winners(&self.keys) {
             let expected = winner.as_ref().and_then(|w| w.value.clone());
             let mut seen = Vec::new();
             for i in 0..3 {
                 let got = match self.engine(i).get(BUCKET, &key, None).await {
-                    Ok(object) => Some(object.data.to_vec()),
+                    Ok(object) => {
+                        let hlc = winner.as_ref().map(|w| w.hlc);
+                        if Some(object.info.last_modified) != hlc {
+                            return Err(format!(
+                                "p{i} {key}: Last-Modified {}, the winner is {winner:?}",
+                                object.info.last_modified
+                            ));
+                        }
+                        Some(object.data.to_vec())
+                    }
                     Err(EngineError::NoSuchKey { .. }) => None,
                     Err(e) => {
                         let versions = self.engine(i).versions(BUCKET, &key).ok().flatten();
@@ -656,6 +811,25 @@ impl Sim {
             if seen.iter().any(|s| s != &seen[0]) {
                 return Err(format!("{key}: proxies differ: {seen:?}"));
             }
+            let mut versions = Vec::new();
+            for i in 0..3 {
+                let state = self.engine(i).versions(BUCKET, &key);
+                let state = state.map_err(|e| format!("p{i} versions {key}: {e}"))?;
+                let ranks: Vec<_> = state
+                    .into_iter()
+                    .flat_map(|s| s.versions)
+                    .map(|v| (v.hlc, v.node))
+                    .collect();
+                versions.push(ranks);
+            }
+            // The version prune is local: a proxy can hold fewer old versions, never other ones.
+            let shortest = versions.iter().map(Vec::len).min().unwrap_or(0);
+            if versions
+                .iter()
+                .any(|v| v[..shortest] != versions[0][..shortest])
+            {
+                return Err(format!("{key}: version lists differ: {versions:?}"));
+            }
             if seen[0] != expected {
                 return Err(format!(
                     "{key}: read {:?}, the winner is {winner:?}",
@@ -663,6 +837,8 @@ impl Sim {
                 ));
             }
         }
+
+        self.check_lists().await?;
 
         let winners = Self::winners(&self.buckets);
         let mut names = Vec::new();
@@ -707,6 +883,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         buckets: BTreeMap::new(),
         log: Vec::new(),
         stats: Stats::default(),
+        faulty: false,
     };
     for seed in 1..=3u8 {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -718,6 +895,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
             last_ack: 0,
             outage: Arc::new(AtomicBool::new(false)),
             stale_index: None,
+            offset: 0,
         });
     }
     for i in 0..3 {
@@ -753,6 +931,13 @@ struct Totals {
     lost_index: u64,
     stale_index: u64,
     suspend: u64,
+    tombstone_prune: u64,
+    deleted_pack: u64,
+    intent_quarantined: u64,
+    young_kept: u64,
+    stale_plan: u64,
+    marker_fault: u64,
+    far_ahead: u64,
     crashes: BTreeMap<Point, u64>,
 }
 
@@ -764,6 +949,13 @@ impl Totals {
         self.lost_index += u64::from(stats.lost_index);
         self.stale_index += u64::from(stats.stale_index);
         self.suspend += u64::from(stats.suspend);
+        self.tombstone_prune += u64::from(stats.tombstone_prune);
+        self.deleted_pack += u64::from(stats.deleted_pack);
+        self.intent_quarantined += u64::from(stats.intent_quarantined);
+        self.young_kept += u64::from(stats.young_kept);
+        self.stale_plan += u64::from(stats.stale_plan);
+        self.marker_fault += u64::from(stats.marker_fault);
+        self.far_ahead += u64::from(stats.far_ahead);
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
         }
@@ -781,6 +973,19 @@ impl Totals {
             self.stale_index > 0,
             "no seed restored an older index: {self:?}"
         );
+        let branches = [
+            ("a host suspend", self.suspend),
+            ("a tombstone prune", self.tombstone_prune),
+            ("a deleted pack", self.deleted_pack),
+            ("an intent in the quarantine", self.intent_quarantined),
+            ("a young write kept at a quarantine", self.young_kept),
+            ("a StalePlan", self.stale_plan),
+            ("a failed marker write", self.marker_fault),
+            ("a clock more than R ahead", self.far_ahead),
+        ];
+        for (branch, count) in branches {
+            assert!(count > 0, "no seed had {branch}: {self:?}");
+        }
         for point in POINTS {
             assert!(
                 self.crashes.contains_key(&point),

@@ -27,6 +27,21 @@ struct TestRemote {
     refuse_snapshot_get: AtomicBool,
     /// The size a snapshot reports, when set.
     snapshot_len: std::sync::Mutex<Option<u64>>,
+    /// A fault on the ranged reads of snapshot parts, when set.
+    tamper: std::sync::Mutex<Option<Tamper>>,
+}
+
+/// What the remote does to a ranged read of a snapshot part.
+#[derive(Clone, Copy)]
+enum Tamper {
+    /// Every part comes back one byte short.
+    ShortRange,
+    /// The last part comes back one byte short.
+    TruncatedLast,
+    /// The first part comes back with one bit flipped.
+    FlippedBit,
+    /// The object takes this size after the size probe.
+    Resize(usize),
 }
 
 #[async_trait::async_trait]
@@ -70,12 +85,51 @@ impl Remote for TestRemote {
                     len,
                 });
             }
+            let tamper = *self.tamper.lock().unwrap();
+            if range.start != u64::MAX - 1
+                && let Some(tamper) = tamper
+            {
+                return self.tampered(key, range, tamper).await;
+            }
         }
         self.inner.get_range(key, range).await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
         self.inner.list(prefix).await
+    }
+}
+
+impl TestRemote {
+    async fn tampered(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        tamper: Tamper,
+    ) -> Result<Option<Bytes>, RemoteError> {
+        let whole = self.inner.get(key).await?.expect("the snapshot exists");
+        if let Tamper::Resize(len) = tamper
+            && range.start == 0
+        {
+            let mut resized = whole.to_vec();
+            resized.resize(len, 0x5a);
+            self.inner.put(key, Bytes::from(resized)).await?;
+        }
+        let Some(bytes) = self.inner.get_range(key, range.clone()).await? else {
+            return Ok(None);
+        };
+        let mut part = bytes.to_vec();
+        match tamper {
+            Tamper::ShortRange => {
+                part.pop();
+            }
+            Tamper::TruncatedLast if range.end == whole.len() as u64 => {
+                part.pop();
+            }
+            Tamper::FlippedBit if range.start == 0 => part[0] ^= 1,
+            _ => {}
+        }
+        Ok(Some(Bytes::from(part)))
     }
 }
 
@@ -405,4 +459,201 @@ async fn test_snapshot_over_the_cap_fails_with_its_key_and_the_cap() {
 
     assert!(error.contains("snapshots/"), "{error}");
     assert!(error.contains(&engine::MAX_SNAPSHOT.to_string()), "{error}");
+}
+
+/// The newest snapshot key and its size.
+async fn latest(remote: &TestRemote) -> (String, u64) {
+    let key = remote
+        .list(engine::SNAPSHOTS_PREFIX)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let len = remote.inner.get(&key).await.unwrap().unwrap().len() as u64;
+    (key, len)
+}
+
+async fn open_with(remote: &Arc<TestRemote>, part: u64) -> Result<Proxy, engine::EngineError> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config {
+            snapshot_part: part,
+            ..Config::default()
+        },
+    )
+    .await?;
+    Ok(Proxy { dir, engine })
+}
+
+/// Node 1 writes the same history as `history` and a snapshot, with no prune: a full replay works.
+async fn history_with_entries(remote: &Arc<TestRemote>) -> Proxy {
+    let a = proxy(remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    for (key, data) in [("x", "one"), ("y", "two"), ("z", "three")] {
+        put(&a.engine, key, data).await;
+        a.engine.flush().await.unwrap();
+    }
+    a.engine.delete(BUCKET, "z").await.unwrap();
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+    a
+}
+
+/// A load ends with the full index or with an error, never with a part of the index.
+async fn assert_full_or_error(remote: &Arc<TestRemote>, part: u64) -> Option<String> {
+    let b = match open_with(remote, part).await {
+        Ok(b) => b,
+        Err(e) => return Some(e.to_string()),
+    };
+    if let Err(e) = b.engine.sync().await {
+        let error = e.to_string();
+        assert!(b.engine.get(BUCKET, "y", None).await.is_err());
+        return Some(error);
+    }
+    assert_eq!(keys(&b.engine).await, ["x", "y"]);
+    assert_eq!(get(&b.engine, "y").await, "two");
+    None
+}
+
+async fn ranges_to_load(remote: &Arc<TestRemote>, part: u64) -> usize {
+    remote.refuse_snapshot_get.store(true, Ordering::SeqCst);
+    remote.snapshot_ranges.store(0, Ordering::SeqCst);
+    let b = open_with(remote, part).await.unwrap();
+    assert_eq!(keys(&b.engine).await, ["x", "y"]);
+    assert_eq!(get(&b.engine, "y").await, "two");
+    remote.snapshot_ranges.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn test_snapshot_of_exactly_one_part_loads_in_one_read() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (_, len) = latest(&remote).await;
+
+    assert_eq!(ranges_to_load(&remote, len).await, 1 + 1);
+}
+
+#[tokio::test]
+async fn test_snapshot_of_exactly_n_parts_loads_in_n_reads() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (_, len) = latest(&remote).await;
+    let n = (2..len)
+        .find(|n| len % n == 0)
+        .expect("the snapshot size is not a prime");
+
+    assert_eq!(ranges_to_load(&remote, len / n).await, 1 + n as usize);
+}
+
+#[tokio::test]
+async fn test_short_ranged_read_fails_the_load_with_the_key() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (key, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::ShortRange);
+
+    let error = assert_full_or_error(&remote, len.div_ceil(3))
+        .await
+        .unwrap();
+
+    assert!(error.contains(&key), "{error}");
+    assert!(error.contains("ranged read"), "{error}");
+}
+
+#[tokio::test]
+async fn test_truncated_last_part_fails_the_load_with_the_key() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (key, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::TruncatedLast);
+
+    let error = assert_full_or_error(&remote, len.div_ceil(3))
+        .await
+        .unwrap();
+
+    assert!(error.contains(&key), "{error}");
+}
+
+#[tokio::test]
+async fn test_corrupted_part_skips_the_snapshot_and_replays_the_journal() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history_with_entries(&remote).await;
+    let (_, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::FlippedBit);
+
+    assert_eq!(assert_full_or_error(&remote, len.div_ceil(3)).await, None);
+}
+
+#[tokio::test]
+async fn test_corrupted_part_with_a_pruned_journal_fails_the_sync() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (_, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::FlippedBit);
+
+    let error = assert_full_or_error(&remote, len.div_ceil(3))
+        .await
+        .unwrap();
+
+    assert!(error.contains("no snapshot"), "{error}");
+}
+
+#[tokio::test]
+async fn test_short_ranged_read_with_the_journal_falls_back_to_the_replay() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history_with_entries(&remote).await;
+    let (_, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::ShortRange);
+
+    assert_eq!(assert_full_or_error(&remote, len.div_ceil(3)).await, None);
+}
+
+#[tokio::test]
+async fn test_snapshot_that_shrinks_after_the_size_probe_fails_the_load() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (_, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::Resize(len as usize / 2));
+
+    let error = assert_full_or_error(&remote, len.div_ceil(3))
+        .await
+        .unwrap();
+
+    assert!(error.contains("no snapshot"), "{error}");
+}
+
+#[tokio::test]
+async fn test_snapshot_that_grows_after_the_size_probe_skips_to_the_replay() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history_with_entries(&remote).await;
+    let (_, len) = latest(&remote).await;
+    *remote.tamper.lock().unwrap() = Some(Tamper::Resize(len as usize * 2));
+
+    assert_eq!(assert_full_or_error(&remote, len.div_ceil(3)).await, None);
+}
+
+#[tokio::test]
+async fn test_empty_snapshot_is_skipped_for_the_older_one() {
+    let remote = Arc::new(TestRemote::default());
+    let _a = history(&remote).await;
+    let (key, _) = latest(&remote).await;
+    let (time, _) = key
+        .strip_prefix(engine::SNAPSHOTS_PREFIX)
+        .unwrap()
+        .split_once('-')
+        .unwrap();
+    let newer = time.parse::<u64>().unwrap() + 1;
+    let empty = format!(
+        "{}{newer:020}-{}",
+        engine::SNAPSHOTS_PREFIX,
+        blake3::hash(&[])
+    );
+    remote.inner.put(&empty, Bytes::new()).await.unwrap();
+    assert_eq!(latest(&remote).await.0, empty);
+
+    assert_eq!(assert_full_or_error(&remote, 64).await, None);
 }

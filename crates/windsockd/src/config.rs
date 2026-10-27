@@ -113,6 +113,8 @@ pub struct GcConfig {
     /// H of the GC rules. Every proxy of a remote must use the same value: writers use it too.
     pub horizon_secs: u64,
     pub retention_secs: u64,
+    /// The GC writes a snapshot when the latest one is this old.
+    pub snapshot_interval_secs: u64,
 }
 
 impl Default for GcConfig {
@@ -122,6 +124,7 @@ impl Default for GcConfig {
             interval_secs: 3600,
             horizon_secs: 24 * 3600,
             retention_secs: 24 * 3600,
+            snapshot_interval_secs: 24 * 3600,
         }
     }
 }
@@ -194,6 +197,7 @@ impl Config {
             buffer_limit: self.engine.buffer_limit_bytes,
             gc_horizon: Duration::from_secs(self.gc.horizon_secs),
             retention: Duration::from_secs(self.gc.retention_secs),
+            snapshot_interval: Duration::from_secs(self.gc.snapshot_interval_secs),
             ..engine::Config::default()
         }
     }
@@ -289,6 +293,22 @@ mod tests {
             config.remote,
             RemoteConfig::S3 { ca_file: Some(ref ca), .. } if *ca == dir.path().join("ca.pem")
         ));
+    }
+
+    #[test]
+    fn test_snapshot_interval_reaches_the_engine() {
+        let base = "data_dir = \"d\"\n[remote]\ntype = \"dir\"\npath = \"r\"\n\
+                    [[keys]]\naccess_key = \"c\"\nsecret_key = \"d\"\n";
+
+        let set: Config =
+            toml::from_str(&format!("{base}[gc]\nsnapshot_interval_secs = 60\n")).unwrap();
+        let default: Config = toml::from_str(base).unwrap();
+
+        assert_eq!(set.engine().snapshot_interval, Duration::from_secs(60));
+        assert_eq!(
+            default.engine().snapshot_interval,
+            Duration::from_secs(86_400)
+        );
     }
 
     #[test]

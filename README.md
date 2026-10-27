@@ -107,6 +107,7 @@ the configuration file.
 | `gc.interval_secs`          | `3600`                                     | How often the GC runs                                                                                                                         |
 | `gc.horizon_secs`           | `86400`                                    | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning |
 | `gc.retention_secs`         | `86400`                                    | Old versions stay readable for this time                                                                                                      |
+| `gc.snapshot_interval_secs` | `86400`                                    | The GC writes a snapshot when the latest one is this old                                                                                      |
 
 The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 

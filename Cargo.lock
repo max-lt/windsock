@@ -496,6 +496,7 @@ dependencies = [
  "cache",
  "chunking",
  "ed25519-dalek",
+ "engine",
  "hex",
  "index",
  "journal",

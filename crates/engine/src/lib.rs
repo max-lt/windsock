@@ -14,6 +14,7 @@ mod list;
 mod manifest;
 mod plan;
 mod read;
+pub mod sim;
 mod snapshot;
 mod sync;
 mod write;
@@ -43,6 +44,7 @@ use tracing::{debug, error, info, warn};
 use buffer::{Buffer, BufferedObject, BufferedPut, Durability, Head, Intent, Op, SegmentReader};
 use plan::{Fetch, Nonces, Planner};
 
+pub use buffer::QuarantinedWrite;
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::MAX_OPEN_FILES as INDEX_MAX_OPEN_FILES;
@@ -93,6 +95,10 @@ pub enum EngineError {
     BufferFull { limit: u64 },
     #[error("configuration: {0}")]
     Config(String),
+    /// A crash point of the simulation test fired: drop the engine.
+    #[cfg(feature = "sim")]
+    #[error("simulated crash after {0:?}")]
+    SimCrash(sim::Point),
     #[error("buffered writes older than the late limit are in quarantine: {0}")]
     Quarantined(String),
     #[error("the object has {size} bytes, over the limit of {limit} bytes")]
@@ -229,6 +235,12 @@ pub struct Engine<R> {
     orphans_file: PathBuf,
     /// Another node that wrote a condemn in the last H: a second GC runner.
     other_gc_node: Mutex<Option<NodeId>>,
+}
+
+/// The writes that the quarantine of the engine directory `dir` holds: what an operator decides
+/// on before the next start.
+pub async fn quarantined_writes(dir: impl AsRef<Path>) -> Result<Vec<QuarantinedWrite>> {
+    buffer::read_quarantine(&dir.as_ref().join(QUARANTINE_DIR)).await
 }
 
 /// Refuses to open with a quarantine. A buffered write older than the late limit, R - M, moves

@@ -156,6 +156,7 @@ impl<R: Remote + 'static> Engine<R> {
 
         for &seq in segments {
             let path = buffer::segment_path(&self.buffer_dir, seq);
+            crate::sim::crash_point(crate::sim::Point::SegmentRead)?;
             let mut reader = SegmentReader::open(&path).await?;
 
             while let Some(record) = reader.next(&path).await? {
@@ -206,7 +207,9 @@ impl<R: Remote + 'static> Engine<R> {
         }
 
         let (last, manifests) = planner.finish();
+        crate::sim::crash_point(crate::sim::Point::Plan)?;
         self.upload_packs(last.into_iter().collect()).await?;
+        crate::sim::crash_point(crate::sim::Point::PackUpload)?;
 
         let mut actions = Vec::with_capacity(planned.len());
         for next in planned {
@@ -241,10 +244,13 @@ impl<R: Remote + 'static> Engine<R> {
             .commit(&mut journal, actions, segments, planned_at)
             .await?;
         debug!(seq = entry.seq, segments = segments.len(), "flushed");
+        crate::sim::crash_point(crate::sim::Point::Commit)?;
         self.apply_own(&mut journal, entry).await?;
+        crate::sim::crash_point(crate::sim::Point::Apply)?;
         drop(journal);
 
         self.buffer.lock().await.release(segments).await?;
+        crate::sim::crash_point(crate::sim::Point::Release)?;
         buffer::remove_intent(&self.buffer_dir).await?;
         Ok(Flushed::Committed)
     }
@@ -357,6 +363,7 @@ impl<R: Remote + 'static> Engine<R> {
             };
             self.refuse_late(&intent.entry, intent.entry.hlc)?;
             buffer::write_intent(&self.buffer_dir, &intent).await?;
+            crate::sim::crash_point(crate::sim::Point::Intent)?;
 
             match journal.commit(&intent.entry).await? {
                 Commit::Written => return Ok(intent.entry),

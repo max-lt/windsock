@@ -3,23 +3,36 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "sim")]
 thread_local! {
     /// A wall clock that a test sets on its thread. Zero: the system clock.
     static MANUAL_WALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+fn system_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// The wall clock in unix nanoseconds.
+#[cfg(not(feature = "sim"))]
+pub fn wall_clock_nanos() -> u64 {
+    system_nanos()
+}
+
 /// The wall clock in unix nanoseconds: the system clock, or the value of [`set_manual_wall`].
+#[cfg(feature = "sim")]
 pub fn wall_clock_nanos() -> u64 {
     match MANUAL_WALL.with(std::cell::Cell::get) {
-        0 => SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64),
+        0 => system_nanos(),
         manual => manual,
     }
 }
 
 /// Replaces the wall clock of this thread with `nanos`, or gives back the system clock for
-/// `None`. For deterministic tests only, with all their engines on one thread.
+/// `None`. Only with the feature `sim`, for deterministic tests.
+#[cfg(feature = "sim")]
 pub fn set_manual_wall(nanos: Option<u64>) {
     MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
 }

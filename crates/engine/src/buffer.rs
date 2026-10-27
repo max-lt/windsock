@@ -937,6 +937,35 @@ async fn quarantine_late_until(
     Ok(moved)
 }
 
+/// A write that the quarantine holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedWrite {
+    /// `bucket/key`, or a bucket name.
+    pub target: String,
+    /// The HLC of its ack.
+    pub hlc: u64,
+}
+
+/// The writes in the quarantine directory `dir`, in order.
+pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>, EngineError> {
+    let mut out = Vec::new();
+    let seqs = match tokio::fs::try_exists(dir).await? {
+        true => list_segments(dir).await?,
+        false => Vec::new(),
+    };
+    for seq in seqs {
+        let path = segment_path(dir, seq);
+        let mut reader = SegmentReader::open(&path).await?;
+        while let Some(record) = reader.next(&path).await? {
+            out.push(QuarantinedWrite {
+                target: record.head.op.target(),
+                hlc: record.head.time,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Moves the intent file to `quarantine`: its entry never commits.
 pub(crate) async fn quarantine_intent(dir: &Path, quarantine: &Path) -> Result<(), EngineError> {
     tokio::fs::create_dir_all(quarantine).await?;

@@ -351,6 +351,8 @@ impl Sim {
         engine::sim::arm_crash(Some(point));
         let result = self.engine(i).flush().await;
         engine::sim::arm_crash(None);
+        self.log
+            .push(format!("p{i} crash flush {point:?}: {result:?}"));
         match result {
             Err(EngineError::SimCrash(point)) => {
                 self.stats.crashes.insert(point);
@@ -378,8 +380,10 @@ impl Sim {
             if let Err(e) = self.engine(other).flush().await {
                 self.quarantine(other, &e);
             }
-            let _ = self.engine(o).flush().await;
-            let _ = self.engine(0).gc().await;
+            let r = self.engine(o).flush().await;
+            self.log.push(format!("p{o} outage flush {r:?}"));
+            let r = self.engine(0).gc().await;
+            self.log.push(format!("outage gc {r:?}"));
         }
         self.proxies[o].outage.store(false, Ordering::SeqCst);
         if let Err(e) = self.engine(o).flush().await {
@@ -403,6 +407,8 @@ impl Sim {
             .await;
         match result {
             Ok(info) => {
+                self.log
+                    .push(format!("p{i} put {key} at {}", info.last_modified));
                 self.acked(i, info.last_modified)?;
                 let node = self.proxies[i].node;
                 self.keys.entry(key).or_default().push(Acked {
@@ -479,7 +485,9 @@ impl Sim {
                 }
             }
             46..=60 => {
-                if let Err(e) = self.engine(i).flush().await {
+                let r = self.engine(i).flush().await;
+                self.log.push(format!("p{i} flush {r:?}"));
+                if let Err(e) = r {
                     self.quarantine(i, &e);
                 }
             }
@@ -487,7 +495,8 @@ impl Sim {
                 let _ = self.engine(i).sync().await;
             }
             73..=76 => {
-                let _ = self.engine(0).gc().await;
+                let r = self.engine(0).gc().await;
+                self.log.push(format!("gc {r:?}"));
             }
             77..=78 => {
                 let _ = self.engine(0).snapshot().await;
@@ -581,7 +590,13 @@ impl Sim {
                 let got = match self.engine(i).get(BUCKET, &key, None).await {
                     Ok(object) => Some(object.data.to_vec()),
                     Err(EngineError::NoSuchKey { .. }) => None,
-                    Err(e) => return Err(format!("p{i} get {key}: {e}")),
+                    Err(e) => {
+                        let versions = self.engine(i).versions(BUCKET, &key).ok().flatten();
+                        let acked = self.keys.get(&key);
+                        return Err(format!(
+                            "p{i} get {key}: {e}\nversions {versions:?}\nacked {acked:?}"
+                        ));
+                    }
                 };
                 seen.push(got);
             }
@@ -780,7 +795,9 @@ fn test_simulation_of_three_proxies_20000_seeds() {
 ///   commit at every start.
 /// - 32, 35, 40: an empty segment stopped the quarantine move; a late intent stayed in the buffer.
 /// - 61: a remote error at open, with the supervisor starting the proxy again.
-const REGRESSION_SEEDS: &[u64] = &[522, 50, 10, 32, 35, 40, 61];
+/// - 598: a first entry reached the remote with a lost answer and no node marker; the GC did not
+///   see the chain and deleted its pack.
+const REGRESSION_SEEDS: &[u64] = &[522, 50, 10, 32, 35, 40, 61, 598];
 
 #[test]
 fn test_simulation_regression_seeds() {

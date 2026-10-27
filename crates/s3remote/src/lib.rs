@@ -27,7 +27,7 @@ use tracing::debug;
 
 pub use retry::Retry;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct S3Config {
     /// `http://host:port`, or `https://host[:port]` with the feature `tls`.
     pub endpoint: String,
@@ -40,6 +40,21 @@ pub struct S3Config {
     pub retry: Retry,
     /// PEM certificates to trust next to the public roots, for a store with a private CA.
     pub ca_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("retry", &self.retry)
+            .field("ca_pem", &self.ca_pem.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 /// A response with its whole body.
@@ -540,6 +555,17 @@ impl Sweep for S3Remote {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_config_debug_hides_the_secret_key() {
+        let mut config = config("http://127.0.0.1:1", "");
+        config.secret_key = "very-secret-value".into();
+
+        let text = format!("{config:?}");
+
+        assert!(!text.contains("very-secret-value"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
 
     fn config(endpoint: &str, prefix: &str) -> S3Config {
         S3Config {

@@ -206,13 +206,24 @@ pub fn same_signature(a: &str, b: &str) -> bool {
 }
 
 /// What signs the chunks of an `aws-chunked` body.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ChunkSigner {
     pub key: [u8; 32],
     pub timestamp: String,
     pub scope: String,
     /// The signature of the previous chunk; the request signature for the first one.
     pub previous: String,
+}
+
+impl std::fmt::Debug for ChunkSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkSigner")
+            .field("key", &"<redacted>")
+            .field("timestamp", &self.timestamp)
+            .field("scope", &self.scope)
+            .field("previous", &self.previous)
+            .finish()
+    }
 }
 
 impl ChunkSigner {
@@ -403,6 +414,21 @@ pub fn sign(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chunk_signer_debug_hides_the_key() {
+        let signer = ChunkSigner {
+            key: [0xab; 32],
+            timestamp: "t".into(),
+            scope: "s".into(),
+            previous: "p".into(),
+        };
+
+        let text = format!("{signer:?}");
+
+        assert!(!text.contains("171"), "{text}");
+        assert!(!text.to_lowercase().contains("abab"), "{text}");
+    }
 
     const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";

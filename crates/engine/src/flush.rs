@@ -346,7 +346,7 @@ impl<R: Remote + 'static> Engine<R> {
 
             let seen = self.index().seen(self.node)?;
             let intent = Intent {
-                entry: journal.prepare(actions.clone(), seen),
+                entry: journal.prepare(actions.clone(), seen)?,
                 segments: segments.to_vec(),
                 planned_at,
             };

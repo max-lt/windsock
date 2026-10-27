@@ -39,7 +39,7 @@ impl<R: Remote + 'static> Engine<R> {
                     });
                 }
 
-                let time = self.clock.tick();
+                let time = self.tick()?;
                 let op = Op::Put {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -130,9 +130,16 @@ impl<R: Remote + 'static> Engine<R> {
         self.buffer.lock().await.bytes()
     }
 
+    /// The HLC of a new ack. Fails at the end of the u64 range instead of a wrap to 0.
+    fn tick(&self) -> Result<u64> {
+        self.clock
+            .tick()
+            .ok_or(EngineError::Journal(JournalError::ClockOverflow))
+    }
+
     /// Appends a record. Returns its number for [`Engine::acknowledge`].
     pub(crate) async fn append(&self, buffer: &mut Buffer, op: Op, data: &[u8]) -> Result<u64> {
-        self.append_at(buffer, self.clock.tick(), op, data).await
+        self.append_at(buffer, self.tick()?, op, data).await
     }
 
     pub(crate) async fn append_at(

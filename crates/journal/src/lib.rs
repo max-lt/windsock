@@ -69,6 +69,8 @@ pub enum JournalError {
     Chain { node: NodeId, source: ChainError },
     #[error("{0} appends lost the seq to another process with this identity")]
     Contended(u32),
+    #[error("the HLC is at the end of its range: a new entry would rank under the old ones")]
+    ClockOverflow,
 }
 
 /// Reads all chains of a remote and appends to the chain of one node.
@@ -148,7 +150,7 @@ impl<R: Remote> Journal<R> {
         seen: Seen,
     ) -> Result<Entry, JournalError> {
         for _ in 0..MAX_ATTEMPTS {
-            let entry = self.prepare(actions.clone(), seen.clone());
+            let entry = self.prepare(actions.clone(), seen.clone())?;
 
             match self.commit(&entry).await? {
                 Commit::Written => return Ok(entry),
@@ -160,18 +162,19 @@ impl<R: Remote> Journal<R> {
     }
 
     /// Signs actions as the next entry of the own chain, without writing it.
-    pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Entry {
+    pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Result<Entry, JournalError> {
         let frontier = self.frontier(self.node);
 
-        Entry::sign(
+        let hlc = self.clock.tick().ok_or(JournalError::ClockOverflow)?;
+        Ok(Entry::sign(
             &self.signing_key,
             frontier.next_seq,
             frontier.last_hash,
-            self.clock.tick(),
+            hlc,
             seen,
             actions,
             &self.sealer,
-        )
+        ))
     }
 
     /// Writes a prepared entry. Safe to call again with the same entry after a
@@ -542,7 +545,7 @@ mod tests {
     async fn test_commit_of_a_written_entry_is_idempotent() {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
-        let entry = a.prepare(vec![put("k")], Seen::new());
+        let entry = a.prepare(vec![put("k")], Seen::new()).unwrap();
 
         assert_eq!(a.commit(&entry).await.unwrap(), Commit::Written);
         assert_eq!(a.commit(&entry).await.unwrap(), Commit::Written);
@@ -556,7 +559,7 @@ mod tests {
     async fn test_commit_after_restart_finds_the_written_entry() {
         let remote = Arc::new(MemoryRemote::default());
         let mut before = journal(&remote, 1);
-        let entry = before.prepare(vec![put("k")], Seen::new());
+        let entry = before.prepare(vec![put("k")], Seen::new()).unwrap();
         before.commit(&entry).await.unwrap();
         drop(before);
 
@@ -572,7 +575,7 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut first = journal(&remote, 1);
         let mut zombie = journal(&remote, 1);
-        let prepared = first.prepare(vec![put("from first")], Seen::new());
+        let prepared = first.prepare(vec![put("from first")], Seen::new()).unwrap();
         zombie
             .append(vec![put("from zombie")], Seen::new())
             .await
@@ -581,7 +584,7 @@ mod tests {
         assert_eq!(first.commit(&prepared).await.unwrap(), Commit::SeqTaken);
         assert_eq!(first.frontier(first.node()).next_seq, 1);
 
-        let retried = first.prepare(vec![put("from first")], Seen::new());
+        let retried = first.prepare(vec![put("from first")], Seen::new()).unwrap();
         assert_eq!(retried.seq, 1);
         assert_eq!(first.commit(&retried).await.unwrap(), Commit::Written);
     }
@@ -591,7 +594,7 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut first = journal(&remote, 1);
         let mut zombie = journal(&remote, 1);
-        let prepared = first.prepare(vec![put("from first")], Seen::new());
+        let prepared = first.prepare(vec![put("from first")], Seen::new()).unwrap();
 
         assert!(!first.is_written(&prepared).await.unwrap());
         zombie
@@ -609,7 +612,7 @@ mod tests {
         let remote = Arc::new(MemoryRemote::default());
         let mut first = journal(&remote, 1);
         let mut zombie = journal(&remote, 1);
-        let prepared = first.prepare(vec![put("from first")], Seen::new());
+        let prepared = first.prepare(vec![put("from first")], Seen::new()).unwrap();
         let from_zombie = zombie
             .append(vec![put("from zombie")], Seen::new())
             .await

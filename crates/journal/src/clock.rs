@@ -23,18 +23,19 @@ impl Default for HybridClock {
 }
 
 impl HybridClock {
-    /// Returns `max(wall clock, last) + 1`: unique and rising, even under clock skew.
-    pub fn tick(&self) -> u64 {
+    /// Returns `max(wall clock, last) + 1`: unique and rising, even under clock skew. `None` at
+    /// the end of the u64 range: a wrap to 0 would rank a new write under every old one.
+    pub fn tick(&self) -> Option<u64> {
         loop {
             let prev = self.last.load(Ordering::SeqCst);
-            let next = prev.max(wall_clock_nanos()) + 1;
+            let next = prev.max(wall_clock_nanos()).checked_add(1)?;
 
             if self
                 .last
                 .compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return next;
+                return Some(next);
             }
         }
     }
@@ -52,9 +53,18 @@ mod tests {
     #[test]
     fn test_ticks_rise() {
         let clock = HybridClock::default();
-        let ticks: Vec<_> = (0..1000).map(|_| clock.tick()).collect();
+        let ticks: Vec<_> = (0..1000).map(|_| clock.tick().unwrap()).collect();
 
         assert!(ticks.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn test_tick_at_the_end_of_the_range_fails_and_does_not_wrap() {
+        let clock = HybridClock::default();
+        clock.witness(u64::MAX);
+
+        assert_eq!(clock.tick(), None);
+        assert_eq!(clock.tick(), None);
     }
 
     #[test]
@@ -63,6 +73,6 @@ mod tests {
         let far_future = u64::MAX / 2;
         clock.witness(far_future);
 
-        assert!(clock.tick() > far_future);
+        assert!(clock.tick().unwrap() > far_future);
     }
 }

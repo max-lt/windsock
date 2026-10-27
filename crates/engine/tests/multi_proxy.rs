@@ -710,3 +710,26 @@ async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
     assert!(error.to_string().contains("quarantine"), "{error}");
     assert!(dir.path().join("quarantine").exists());
 }
+
+/// A proxy acked a write at an HLC ahead of its wall clock, then lost its index directory. At
+/// open it loads the snapshot. Its next ack must still rank above the first one.
+#[tokio::test]
+async fn test_ack_after_a_snapshot_load_ranks_above_the_snapshot() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    let ahead = now_nanos() + HORIZON.as_nanos() as u64;
+    forged_entry(&remote, 9, ahead, vec![delete("x", ahead)]).await;
+    a.engine.sync().await.unwrap();
+    put(&a.engine, "k", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    std::fs::remove_dir_all(dir.path().join("index")).unwrap();
+
+    let a = open_in(&remote, 1, dir).await;
+    put(&a.engine, "k", "two").await;
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
+}

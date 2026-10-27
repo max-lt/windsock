@@ -755,7 +755,10 @@ mod tests {
         overwrite(&remote, &good).await;
         let entries = reader.sync_all().await.unwrap();
         assert_eq!(entries, vec![good]);
-        assert!(!reader.broken().is_empty(), "the mark stays until an audit passes");
+        assert!(
+            !reader.broken().is_empty(),
+            "the mark stays until an audit passes"
+        );
         reader.audit_next_sync();
         reader.sync_all().await.unwrap();
 

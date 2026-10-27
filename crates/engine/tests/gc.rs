@@ -455,7 +455,11 @@ async fn test_broken_chain_fails_alone_and_recovers() {
 
     remote.put(&key, good).await.unwrap();
     let report = reader.engine.sync().await.unwrap();
-    assert_eq!(report.broken, [broken], "the mark stays until an audit passes");
+    assert_eq!(
+        report.broken,
+        [broken],
+        "the mark stays until an audit passes"
+    );
 
     // The GC sync lists every chain: the chain passes the audit and the GC runs.
     reader.engine.gc().await.unwrap();

@@ -212,15 +212,19 @@ def full_disk(p, sub, work, image_mb, seconds):
     mount = os.path.join(work, f"{sub}-mnt")
     p.signal(signal.SIGTERM)
     p.wait(90)
+    # Room for the directory itself, then the filler takes the rest.
+    used = sum(
+        os.path.getsize(os.path.join(root, name)) for root, _, names in os.walk(target) for name in names
+    )
+    size_mb = max(image_mb, used // (1 << 20) + image_mb)
     subprocess.run(
-        ["hdiutil", "create", "-size", f"{image_mb}m", "-fs", "HFS+", "-volname", sub, "-ov", image],
+        ["hdiutil", "create", "-size", f"{size_mb}m", "-fs", "HFS+", "-volname", sub, "-ov", image],
         check=True, capture_output=True,
     )
     os.makedirs(mount, exist_ok=True)
     subprocess.run(["hdiutil", "attach", image, "-mountpoint", mount, "-nobrowse"], check=True, capture_output=True)
-    for name in os.listdir(target):
-        shutil.move(os.path.join(target, name), os.path.join(mount, name))
-    os.rmdir(target)
+    subprocess.run(["rsync", "-a", target + "/", mount + "/"], check=True, capture_output=True)
+    shutil.rmtree(target)
     os.symlink(mount, target)
     p.start()
     filler = os.path.join(mount, "filler")

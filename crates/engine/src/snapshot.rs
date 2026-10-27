@@ -120,17 +120,25 @@ impl<R: Remote + 'static> Engine<R> {
     /// The whole snapshot at `key`, read in ranges of `snapshot_part`. `None` if it is gone.
     async fn read_snapshot(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let failed = |e: RemoteError| EngineError::Corrupt(format!("{key}: {e}"));
-        // A range past any object fails with the object size.
-        let len = match self.remote.get_range(key, u64::MAX - 1..u64::MAX).await {
+        let over_cap = || {
+            EngineError::Corrupt(format!(
+                "{key}: the snapshot is over the cap of {MAX_SNAPSHOT} bytes"
+            ))
+        };
+        // A range at the cap fails with the size of a smaller object. It stays under
+        // i64::MAX, because some stores parse a range as a signed number.
+        let len = match self
+            .remote
+            .get_range(key, MAX_SNAPSHOT..MAX_SNAPSHOT + 1)
+            .await
+        {
             Err(RemoteError::InvalidRange { len, .. }) => len,
             Ok(None) => return Ok(None),
-            Ok(Some(_)) => return Err(EngineError::Corrupt(format!("{key}: no size"))),
+            Ok(Some(_)) => return Err(over_cap()),
             Err(e) => return Err(failed(e)),
         };
         if len > MAX_SNAPSHOT {
-            return Err(EngineError::Corrupt(format!(
-                "{key}: the snapshot has {len} bytes, over the cap of {MAX_SNAPSHOT} bytes"
-            )));
+            return Err(over_cap());
         }
 
         let part = self.config.snapshot_part.max(1);

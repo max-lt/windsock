@@ -77,6 +77,14 @@ impl Remote for TestRemote {
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
         if key.starts_with(engine::SNAPSHOTS_PREFIX) {
             self.snapshot_ranges.fetch_add(1, Ordering::SeqCst);
+            // Some stores parse the range as a signed 64-bit number.
+            if range.start > i64::MAX as u64 {
+                return Err(RemoteError::Service {
+                    status: 400,
+                    code: "InvalidArgument".into(),
+                    message: "range start above i64::MAX".into(),
+                });
+            }
             if let Some(len) = *self.snapshot_len.lock().unwrap() {
                 return Err(RemoteError::InvalidRange {
                     key: key.to_string(),
@@ -86,7 +94,7 @@ impl Remote for TestRemote {
                 });
             }
             let tamper = *self.tamper.lock().unwrap();
-            if range.start != u64::MAX - 1
+            if range.start != engine::MAX_SNAPSHOT
                 && let Some(tamper) = tamper
             {
                 return self.tampered(key, range, tamper).await;

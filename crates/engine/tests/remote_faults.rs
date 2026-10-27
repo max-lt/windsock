@@ -30,6 +30,8 @@ struct FaultRemote {
     failing_reads: Mutex<Option<&'static str>>,
     /// Reads of journal entries.
     log_gets: std::sync::atomic::AtomicUsize,
+    /// A put on a key that exists fails, as on a write-once store.
+    write_once: std::sync::atomic::AtomicBool,
 }
 
 impl FaultRemote {
@@ -60,6 +62,11 @@ fn unavailable() -> RemoteError {
 #[async_trait::async_trait]
 impl Remote for FaultRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        if self.write_once.load(std::sync::atomic::Ordering::SeqCst)
+            && self.inner.get(key).await?.is_some()
+        {
+            return Err(unavailable());
+        }
         match self.take(key) {
             Some(Fault::Refuse) => Err(unavailable()),
             Some(Fault::LoseAnswer) => {
@@ -784,4 +791,49 @@ async fn test_plan_is_stale_after_a_host_suspend() {
         "the plan is stale by the wall clock: the flush planned and uploaded again"
     );
     journal::set_manual_wall(None);
+}
+
+/// On a write-once store, the node marker exists after the first process. A restarted process
+/// must still commit: the marker is created once and checked, not written again.
+#[tokio::test]
+async fn test_restart_commits_on_a_write_once_store() {
+    let remote = Arc::new(FaultRemote::default());
+    remote
+        .write_once
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    drop(writer);
+
+    let writer = proxy(&remote, 1).await;
+    let put = writer.engine.put(
+        BUCKET,
+        "k",
+        Bytes::from_static(b"v"),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+
+    writer.engine.flush().await.unwrap();
+}
+
+/// A marker with data was not written by this node: the commit fails closed and names it.
+#[tokio::test]
+async fn test_node_marker_with_data_fails_the_commit() {
+    let remote = Arc::new(FaultRemote::default());
+    let writer = proxy(&remote, 1).await;
+    let marker = journal::node_key(writer.engine.node());
+    remote
+        .inner
+        .put(&marker, Bytes::from_static(b"not empty"))
+        .await
+        .unwrap();
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+
+    let error = writer.engine.flush().await.unwrap_err().to_string();
+
+    assert!(error.contains(&marker), "{error}");
+    assert!(error.contains("holds data"), "{error}");
 }

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use journal::Action;
 use model::{ObjectId, PackId};
 use remote::Sweep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     Engine, EngineError, MANIFESTS_PREFIX, PACKS_PREFIX, Result, buffer, manifest_key, pack_key,
@@ -113,8 +113,14 @@ impl<R: Sweep + 'static> Engine<R> {
         let now = buffer::unix_nanos();
         // A snapshot time ahead of this clock comes from a clock that is ahead: write anyway.
         if latest.is_none_or(|time| now >= time.saturating_add(interval) || time > now) {
-            self.snapshot().await?;
-            report.snapshot_written = true;
+            match self.snapshot().await {
+                Ok(_) => report.snapshot_written = true,
+                // The previous snapshot stays, and the prune goes on under it.
+                Err(e @ EngineError::SnapshotTooLarge { .. }) => {
+                    error!(%e, "no new snapshot: no proxy could load it");
+                }
+                Err(e) => return Err(e),
+            }
         }
         let (redacted, loaded) = self.prune_journal().await?;
         report.redacted_entries = redacted;

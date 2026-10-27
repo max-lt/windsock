@@ -143,6 +143,14 @@ impl<R: Remote + 'static> Engine<R> {
         let base = format!("{SNAPSHOTS_PREFIX}{time:020}-{}", blake3::hash(&sealed));
 
         let size = self.config.snapshot_object.max(1) as usize;
+        // No proxy would load it: keep the previous snapshot and its prune.
+        let parts = sealed.len().div_ceil(size);
+        if sealed.len() as u64 > MAX_SNAPSHOT || parts > MAX_SNAPSHOT_PARTS {
+            return Err(EngineError::SnapshotTooLarge {
+                size: sealed.len() as u64,
+                parts,
+            });
+        }
         let mut parts = Vec::new();
         for (n, bytes) in sealed.chunks(size).enumerate() {
             self.remote
@@ -215,8 +223,8 @@ impl<R: Remote + 'static> Engine<R> {
             .iter()
             .try_fold(0u64, |sum, part| sum.checked_add(part.len));
         if total.is_none_or(|total| total > MAX_SNAPSHOT) {
-            return Err(EngineError::Corrupt(format!(
-                "{key}: the snapshot is over the cap of {MAX_SNAPSHOT} bytes"
+            return Ok(Err(format!(
+                "the parts are over the cap of {MAX_SNAPSHOT} bytes"
             )));
         }
         let listed = self
@@ -243,8 +251,9 @@ impl<R: Remote + 'static> Engine<R> {
         let mut sealed = Vec::new();
         for (n, part) in head.parts.iter().enumerate() {
             let key = part_key(base, n);
-            let Some(bytes) = self.read_snapshot(&key).await? else {
-                return Ok(Err(format!("{key} is gone")));
+            let bytes = match self.read_snapshot(&key).await? {
+                Ok(bytes) => bytes,
+                Err(cause) => return Ok(Err(format!("{key}: {cause}"))),
             };
             if bytes.len() as u64 != part.len {
                 return Ok(Err(format!(
@@ -275,10 +284,7 @@ impl<R: Remote + 'static> Engine<R> {
                 skipped.0.push(format!("{key}: {cause}"));
             };
             let read = match snapshot.form {
-                Form::Single => self
-                    .read_snapshot(&key)
-                    .await?
-                    .ok_or_else(|| "it is gone".to_string()),
+                Form::Single => self.read_snapshot(&key).await?,
                 Form::Parts => self.read_parts(&snapshot.base).await?,
             };
             let sealed = match read {
@@ -318,13 +324,9 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     /// The whole snapshot at `key`, read in ranges of `snapshot_part`. `None` if it is gone.
-    async fn read_snapshot(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    async fn read_snapshot(&self, key: &str) -> Result<std::result::Result<Vec<u8>, String>> {
         let failed = |e: RemoteError| EngineError::Corrupt(format!("{key}: {e}"));
-        let over_cap = || {
-            EngineError::Corrupt(format!(
-                "{key}: the snapshot is over the cap of {MAX_SNAPSHOT} bytes"
-            ))
-        };
+        let over_cap = || Ok(Err(format!("it is over the cap of {MAX_SNAPSHOT} bytes")));
         // A range at the cap fails with the size of a smaller object. It stays under
         // i64::MAX, because some stores parse a range as a signed number.
         let len = match self
@@ -333,12 +335,12 @@ impl<R: Remote + 'static> Engine<R> {
             .await
         {
             Err(RemoteError::InvalidRange { len, .. }) => len,
-            Ok(None) => return Ok(None),
-            Ok(Some(_)) => return Err(over_cap()),
+            Ok(None) => return Ok(Err("it is gone".to_string())),
+            Ok(Some(_)) => return over_cap(),
             Err(e) => return Err(failed(e)),
         };
         if len > MAX_SNAPSHOT {
-            return Err(over_cap());
+            return over_cap();
         }
 
         let part = self.config.snapshot_part.max(1);
@@ -353,7 +355,7 @@ impl<R: Remote + 'static> Engine<R> {
                 .await
                 .map_err(failed)?
             else {
-                return Ok(None);
+                return Ok(Err("it is gone".to_string()));
             };
             if bytes.len() as u64 != end - start {
                 return Err(EngineError::Corrupt(format!(
@@ -365,7 +367,7 @@ impl<R: Remote + 'static> Engine<R> {
             sealed.extend_from_slice(&bytes);
         }
 
-        Ok(Some(sealed))
+        Ok(Ok(sealed))
     }
 
     /// Replaces the index with the latest snapshot. Returns why when none loads.

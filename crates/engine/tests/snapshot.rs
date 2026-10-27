@@ -801,15 +801,35 @@ async fn test_snapshot_head_with_a_wrong_part_count_is_skipped() {
     assert!(error.contains("the remote has"), "{error}");
 }
 
-/// A head over the part cap does not load, so the GC does not prune under it.
+/// A snapshot over the part cap would load nowhere. The GC writes no part of it, logs an error,
+/// and goes on: the journal stays whole and a new proxy replays it.
 #[tokio::test]
-async fn test_snapshot_head_over_the_part_cap_is_skipped() {
+async fn test_gc_writes_no_snapshot_over_the_part_cap() {
     let remote = Arc::new(TestRemote::default());
-    let (base, redacted) = history_in_parts(&remote, 1, 200).await;
-    let parts = remote.list(&format!("{base}/")).await.unwrap().len() - 1;
-    assert!(parts > engine::MAX_SNAPSHOT_PARTS, "{parts} parts");
+    let config = Config {
+        snapshot_object: 1,
+        ..Config::default()
+    };
+    let a = proxy_config(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    put(&a.engine, "y", "two").await;
+    for n in 0..200 {
+        put(&a.engine, &format!("more-{n:05}"), "v").await;
+    }
+    a.engine.flush().await.unwrap();
 
-    assert_eq!(redacted, 0, "no prune under a snapshot that does not load");
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(!report.snapshot_written);
+    assert_eq!(report.redacted_entries, 0);
+    assert!(
+        remote
+            .list(engine::SNAPSHOTS_PREFIX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(load_after_prune(&remote).await, None, "the journal replays");
 }
 
@@ -1130,4 +1150,16 @@ async fn to_one_object(remote: &TestRemote, head: &str) {
         remote.inner.delete(&key).await.unwrap();
     }
     remote.inner.put(base, Bytes::from(whole)).await.unwrap();
+}
+
+/// A snapshot over the cap is skipped like any snapshot that does not load: the GC run goes on.
+#[tokio::test]
+async fn test_snapshot_over_the_cap_is_skipped_and_the_gc_goes_on() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history(&remote).await;
+    *remote.snapshot_len.lock().unwrap() = Some(engine::MAX_SNAPSHOT + 1);
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert_eq!(report.redacted_entries, 0);
 }

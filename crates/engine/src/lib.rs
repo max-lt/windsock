@@ -90,6 +90,12 @@ pub enum EngineError {
     ObjectTooLarge { size: u64, limit: u64 },
     #[error("the key and metadata take {size} bytes, over the limit of {limit} bytes")]
     MetadataTooLarge { size: u64, limit: u64 },
+    #[error(
+        "the snapshot has {size} bytes in {parts} parts, over the cap of {} bytes or {} parts",
+        snapshot::MAX_SNAPSHOT,
+        snapshot::MAX_SNAPSHOT_PARTS
+    )]
+    SnapshotTooLarge { size: u64, parts: usize },
     #[error("the buffer fsync failed, so the write is not stored")]
     WriteLost,
     #[error("the buffer did not recover from a failed fsync. Restart the proxy")]

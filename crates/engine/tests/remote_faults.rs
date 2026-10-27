@@ -562,3 +562,52 @@ async fn test_late_record_stops_the_flush_and_only_it_goes_to_quarantine() {
     );
     assert!(engine.get(BUCKET, "late", None).await.is_err());
 }
+
+/// A flush wrote its intent, then the journal refused the entry, and the write grew late. The
+/// intent can never commit. The open moves it to the quarantine with its records, so that the
+/// proxy starts once the operator empties the quarantine.
+#[tokio::test]
+async fn test_late_intent_goes_to_the_quarantine_at_open() {
+    let remote = Arc::new(FaultRemote::default());
+    let config = Config {
+        retention: Duration::from_millis(3000),
+        late_margin: Duration::from_millis(1000),
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config.clone(),
+        )
+    };
+    let engine = open().await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = engine.put(
+        BUCKET,
+        "late",
+        Bytes::from(data()),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::Refuse);
+    assert!(engine.flush().await.is_err());
+    drop(engine);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    assert!(
+        open().await.is_err(),
+        "the late write goes to the quarantine"
+    );
+    assert!(dir.path().join("quarantine").join("intent").exists());
+    std::fs::remove_dir_all(dir.path().join("quarantine")).unwrap();
+    let engine = open().await.unwrap();
+    engine.flush().await.unwrap();
+
+    assert!(engine.get(BUCKET, "late", None).await.is_err());
+}

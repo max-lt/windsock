@@ -937,6 +937,14 @@ async fn quarantine_late_until(
     Ok(moved)
 }
 
+/// Moves the intent file to `quarantine`: its entry never commits.
+pub(crate) async fn quarantine_intent(dir: &Path, quarantine: &Path) -> Result<(), EngineError> {
+    tokio::fs::create_dir_all(quarantine).await?;
+    tokio::fs::rename(dir.join(INTENT_FILE), quarantine.join(INTENT_FILE)).await?;
+    sync_dir(quarantine).await?;
+    sync_dir(dir).await
+}
+
 /// Writes `bytes` to `path` through a fsynced temporary file and a rename, then fsyncs `dir`.
 async fn write_durable(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
     let tmp = path.with_extension("tmp");

@@ -349,9 +349,6 @@ impl<R: Remote + 'static> Engine<R> {
         if !buffer.is_empty() {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
         }
-        // The commit measures an ack against its entry HLC: the clock, not the wall clock.
-        let now = clock.last().max(buffer::unix_nanos());
-        quarantine_at_open(dir, &buffer_dir, &buffer, now, config.late_limit()).await?;
 
         let engine = Self {
             node: journal.node(),
@@ -397,6 +394,29 @@ impl<R: Remote + 'static> Engine<R> {
             engine
                 .clock
                 .witness_at_most(hlc, engine.config.retention.as_nanos() as u64);
+        }
+
+        // Last, once the clock passed every HLC that the open found. The commit measures an ack
+        // against its entry HLC: the clock, not the wall clock. An intent in the remote applies
+        // first and frees its segments. An intent that is late and not in the remote never
+        // commits: it goes to the quarantine with its records.
+        if let Err(e) = engine.recover().await {
+            if !matches!(e, EngineError::Quarantined(_)) {
+                return Err(e);
+            }
+            buffer::quarantine_intent(&engine.buffer_dir, &dir.join(QUARANTINE_DIR)).await?;
+        }
+        let now = engine.clock.last().max(buffer::unix_nanos());
+        {
+            let buffer = engine.buffer.lock().await;
+            quarantine_at_open(
+                dir,
+                &engine.buffer_dir,
+                &buffer,
+                now,
+                engine.config.late_limit(),
+            )
+            .await?;
         }
 
         Ok(engine)

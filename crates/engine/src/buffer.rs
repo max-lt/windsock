@@ -920,7 +920,7 @@ async fn quarantine_late_until(
         }
 
         tokio::fs::create_dir_all(quarantine).await?;
-        write_durable(quarantine, &segment_path(quarantine, seq), &late).await?;
+        create_durable(quarantine, &format!("{seq:020}"), &late).await?;
         check(&mut step)?;
         match young.is_empty() {
             true => {
@@ -950,12 +950,18 @@ pub struct QuarantinedWrite {
 /// The writes in the quarantine directory `dir`, in order.
 pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>, EngineError> {
     let mut out = Vec::new();
-    let seqs = match tokio::fs::try_exists(dir).await? {
-        true => list_segments(dir).await?,
-        false => Vec::new(),
-    };
-    for seq in seqs {
-        let path = segment_path(dir, seq);
+    let mut paths = Vec::new();
+    if tokio::fs::try_exists(dir).await? {
+        let mut entries = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "log") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    for path in paths {
         let mut reader = SegmentReader::open(&path).await?;
         while let Some(record) = reader.next(&path).await? {
             out.push(QuarantinedWrite {
@@ -970,9 +976,41 @@ pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>,
 /// Moves the intent file to `quarantine`: its entry never commits.
 pub(crate) async fn quarantine_intent(dir: &Path, quarantine: &Path) -> Result<(), EngineError> {
     tokio::fs::create_dir_all(quarantine).await?;
-    tokio::fs::rename(dir.join(INTENT_FILE), quarantine.join(INTENT_FILE)).await?;
+    let held = free_name(quarantine, INTENT_FILE, "").await?;
+    tokio::fs::rename(dir.join(INTENT_FILE), held).await?;
     sync_dir(quarantine).await?;
     sync_dir(dir).await
+}
+
+/// The first path `<stem><suffix>`, `<stem>.1<suffix>`, ... in `dir` that does not exist.
+async fn free_name(dir: &Path, stem: &str, suffix: &str) -> Result<PathBuf, EngineError> {
+    let mut n = 0u32;
+    loop {
+        let name = match n {
+            0 => format!("{stem}{suffix}"),
+            n => format!("{stem}.{n}{suffix}"),
+        };
+        let path = dir.join(name);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(path);
+        }
+        n += 1;
+    }
+}
+
+/// Writes `bytes` to a new quarantine file `<stem>.log`, or to `<stem>.<n>.log` when that name
+/// is taken. A file that already holds the same bytes, from a move that stopped, is kept as is.
+/// A quarantine file is never replaced.
+async fn create_durable(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(), EngineError> {
+    let first = dir.join(format!("{stem}{SEGMENT_SUFFIX}"));
+    if tokio::fs::read(&first)
+        .await
+        .is_ok_and(|held| held == bytes)
+    {
+        return Ok(());
+    }
+    let path = free_name(dir, stem, SEGMENT_SUFFIX).await?;
+    write_durable(dir, &path, bytes).await
 }
 
 /// Writes `bytes` to `path` through a fsynced temporary file and a rename, then fsyncs `dir`.

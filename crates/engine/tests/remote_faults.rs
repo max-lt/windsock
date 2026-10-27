@@ -687,3 +687,55 @@ async fn test_wall_clock_step_back_does_not_make_an_old_plan_young() {
     );
     journal::set_manual_wall(None);
 }
+
+/// One segment holds a late write and a young one. The first open moves the late one to the
+/// quarantine and fails. Later starts, with the young one late too, must not replace the file
+/// that holds the first write: a held quarantine blocks the start before any move.
+#[tokio::test]
+async fn test_failed_starts_never_replace_a_held_quarantine() {
+    let second = 1_000_000_000u64;
+    let start = 1_900_000_000_000_000_000u64;
+    let config = Config {
+        retention: Duration::from_secs(5),
+        late_margin: Duration::from_secs(1),
+        ..Config::default()
+    };
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config.clone(),
+        )
+    };
+    journal::set_manual_wall(Some(start));
+    let engine = open().await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = |key: &'static str| {
+        engine.put(
+            BUCKET,
+            key,
+            Bytes::from_static(b"v"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+    };
+    put("a").await.unwrap();
+    journal::set_manual_wall(Some(start + 3 * second));
+    put("b").await.unwrap();
+    drop(engine);
+
+    for at in [4_500_000_000, 8 * second, 9 * second] {
+        journal::set_manual_wall(Some(start + at));
+        assert!(open().await.is_err(), "a start with a quarantine fails");
+    }
+
+    let held = engine::quarantined_writes(dir.path()).await.unwrap();
+    let targets: Vec<_> = held.iter().map(|w| w.target.as_str()).collect();
+    assert!(targets.contains(&"bkt/a"), "{targets:?}");
+    journal::set_manual_wall(None);
+}

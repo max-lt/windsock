@@ -197,6 +197,8 @@ impl Sweep for ProxyRemote {
 #[derive(Default)]
 struct Stats {
     quarantine: bool,
+    /// A start failed again with the quarantine still held.
+    held_restart: bool,
     crashes: BTreeSet<Point>,
     lost_index: bool,
 }
@@ -265,8 +267,16 @@ impl Sim {
                 Ok(())
             }
             Err(EngineError::Quarantined(_)) => {
-                // The operator reads the late writes, drops them, and starts the proxy again.
                 let dir = proxy.dir.path().to_path_buf();
+                // The supervisor starts the proxy again before the operator acts: a held
+                // quarantine must block the start and stay as it is.
+                if self.rng.chance(30) {
+                    self.now += self.rng.below(120 * SECOND);
+                    journal::set_manual_wall(Some(self.now));
+                    self.stats.held_restart = true;
+                    return Box::pin(self.open(i)).await;
+                }
+                // The operator reads the late writes, drops them, and starts the proxy again.
                 let held = engine::quarantined_writes(&dir)
                     .await
                     .map_err(|e| format!("p{i} quarantine: {e}"))?;
@@ -692,6 +702,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
 struct Totals {
     seeds: u64,
     quarantine: u64,
+    held_restart: u64,
     lost_index: u64,
     crashes: BTreeMap<Point, u64>,
 }
@@ -700,6 +711,7 @@ impl Totals {
     fn add(&mut self, stats: &Stats) {
         self.seeds += 1;
         self.quarantine += u64::from(stats.quarantine);
+        self.held_restart += u64::from(stats.held_restart);
         self.lost_index += u64::from(stats.lost_index);
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
@@ -709,6 +721,10 @@ impl Totals {
     /// Fails when a branch that the oracle must check never ran.
     fn assert_every_branch_ran(&self) {
         assert!(self.quarantine > 0, "no seed had a quarantine: {self:?}");
+        assert!(
+            self.held_restart > 0,
+            "no seed restarted on a held quarantine: {self:?}"
+        );
         assert!(self.lost_index > 0, "no seed lost an index: {self:?}");
         for point in POINTS {
             assert!(

@@ -129,11 +129,12 @@ entry that the proxy commits, also when it commits an intent after a restart.
 - At a flush, such a write stops the flush before any plan or upload. The proxy logs
   `ERROR buffered writes older than the late limit` with the keys, refuses writes, and stops its
   flusher until a restart.
-- At open, the proxy moves only the late writes to `data/engine/quarantine/<segment>.log`, and
+- At open, the proxy moves only the late writes to `data/engine/quarantine/<segment>.log` (or `<segment>.<n>.log`: a quarantine file is never replaced), and
   the open fails with the keys. The young writes stay in the buffer. The move survives a crash
   at each step: a record is in the buffer, in the quarantine, or in both, and the next open ends
   the move. A record in the quarantine never applies.
-- While the quarantine holds files, the proxy does not start.
+- While the quarantine holds files, the proxy does not start, and a start moves nothing more
+  there.
 
 What the operator does:
 

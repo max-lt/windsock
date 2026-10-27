@@ -272,13 +272,21 @@ async fn quarantine_at_open(
         error!(keys, path = %quarantine.display(), "buffered writes older than the late limit: moved to quarantine");
         return refuse(format!("{keys}: "));
     }
+    Ok(())
+}
 
-    let held = match std::fs::read_dir(&quarantine) {
+/// Refuses to start while the quarantine directory holds a file.
+fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
+    let held = match std::fs::read_dir(quarantine) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => false,
     };
     if held {
-        return refuse(String::new());
+        return Err(EngineError::Quarantined(format!(
+            "{} holds writes that were never committed. Decide for each key, then empty the \
+             directory and start again",
+            quarantine.display()
+        )));
     }
     Ok(())
 }
@@ -415,7 +423,10 @@ impl<R: Remote + 'static> Engine<R> {
         // Last, once the clock passed every HLC that the open found. The commit measures an ack
         // against its entry HLC: the clock, not the wall clock. An intent in the remote applies
         // first and frees its segments. An intent that is late and not in the remote never
-        // commits: it goes to the quarantine with its records.
+        // commits: it goes to the quarantine with its records. A held quarantine blocks the start
+        // first: a move now could put a write next to, or in place of, one the operator has not
+        // decided on yet.
+        refuse_held_quarantine(&dir.join(QUARANTINE_DIR))?;
         if let Err(e) = engine.recover().await {
             if !matches!(e, EngineError::Quarantined(_)) {
                 return Err(e);

@@ -100,6 +100,7 @@ fn config(retention: Duration) -> Config {
 }
 
 async fn proxy_with(remote: &Arc<TestRemote>, seed: u8, config: Config) -> Proxy {
+    hold_clock();
     let dir = tempfile::tempdir().unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
     let engine = Engine::open(
@@ -186,16 +187,42 @@ async fn dead_object(engine: &Engine<TestRemote>, data: &[u8]) {
 }
 
 /// Past the short retention: a GC can prune the versions written before.
+thread_local! {
+    /// The manual wall clock of the test on this thread: time moves only when the test says so,
+    /// so a slow machine does not change what the GC rules see.
+    static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A fixed start, far from the system clock of any machine.
+const START: u64 = 1_900_000_000_000_000_000;
+
+/// Sets the manual clock of this thread to its current value, from START at the first call.
+fn hold_clock() {
+    let now = NOW.with(|now| {
+        if now.get() == 0 {
+            now.set(START);
+        }
+        now.get()
+    });
+    journal::set_manual_wall(Some(now));
+}
+
+fn advance(by: Duration) {
+    hold_clock();
+    NOW.with(|now| now.set(now.get() + by.as_nanos() as u64));
+    hold_clock();
+}
+
 async fn past_retention() {
-    tokio::time::sleep(SHORT_RETENTION + Duration::from_millis(20)).await;
+    advance(SHORT_RETENTION + Duration::from_millis(20));
 }
 
 async fn past_horizon() {
-    tokio::time::sleep(HORIZON + Duration::from_millis(100)).await;
+    advance(HORIZON + Duration::from_millis(100));
 }
 
 async fn past_half_horizon() {
-    tokio::time::sleep(HORIZON / 2 + Duration::from_millis(100)).await;
+    advance(HORIZON / 2 + Duration::from_millis(100));
 }
 
 #[tokio::test]

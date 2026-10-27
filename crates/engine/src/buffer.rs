@@ -244,16 +244,6 @@ pub(crate) struct BufferedPut {
     pub time: u64,
 }
 
-impl Op {
-    /// `bucket/key`, or the bucket name: what the record writes.
-    pub(crate) fn target(&self) -> String {
-        match self {
-            Op::Put { bucket, key, .. } | Op::Delete { bucket, key } => format!("{bucket}/{key}"),
-            Op::CreateBucket { bucket, .. } | Op::DeleteBucket { bucket } => bucket.clone(),
-        }
-    }
-}
-
 /// The last buffered write to one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BufferedObject {
@@ -349,8 +339,8 @@ pub(crate) struct Buffer {
     sealed: BTreeMap<u64, u64>,
     objects: BTreeMap<(String, String), BufferedObject>,
     buckets: BTreeMap<String, BufferedBucket>,
-    /// The lowest ack HLC of the records read or written since open.
-    oldest: Option<u64>,
+    /// The lowest ack HLC in each segment that holds records.
+    oldest: BTreeMap<u64, u64>,
     written: u64,
     durable: u64,
     lost: Vec<Range<u64>>,
@@ -379,7 +369,7 @@ impl Buffer {
             objects: BTreeMap::new(),
             buckets: BTreeMap::new(),
             written: 0,
-            oldest: None,
+            oldest: BTreeMap::new(),
             durable: 0,
             lost: Vec::new(),
             broken: false,
@@ -400,9 +390,35 @@ impl Buffer {
 
         Ok(buffer)
     }
-    /// The lowest ack HLC of the records that this buffer replayed or took since open.
+    /// The lowest ack HLC of the buffered records.
     pub fn oldest_time(&self) -> Option<u64> {
-        self.oldest
+        self.oldest.values().min().copied()
+    }
+
+    /// The keys and bucket names whose last buffered write is older than `limit`.
+    pub fn late_targets(&self, limit: u64) -> Vec<String> {
+        let keys = self.objects.iter().filter_map(|((bucket, key), object)| {
+            let time = match object {
+                BufferedObject::Put(put) => put.time,
+                BufferedObject::Delete { time, .. } => *time,
+            };
+            (time < limit).then(|| format!("{bucket}/{key}"))
+        });
+        let buckets = self
+            .buckets
+            .iter()
+            .filter(|(_, state)| state.time < limit)
+            .map(|(name, _)| name.clone());
+        keys.chain(buckets).collect()
+    }
+
+    /// The lowest ack HLC of the records in `segments`.
+    pub fn oldest_in(&self, segments: &[u64]) -> Option<u64> {
+        segments
+            .iter()
+            .filter_map(|seq| self.oldest.get(seq))
+            .min()
+            .copied()
     }
 
     /// The latest ack HLC of the buffered writes. Zero for an empty buffer.
@@ -603,10 +619,8 @@ impl Buffer {
     }
 
     fn track(&mut self, segment: u64, head: &Head, data_offset: u64, size: u64) {
-        self.oldest = Some(
-            self.oldest
-                .map_or(head.time, |oldest| oldest.min(head.time)),
-        );
+        let oldest = self.oldest.entry(segment).or_insert(head.time);
+        *oldest = (*oldest).min(head.time);
         match &head.op {
             Op::Put {
                 bucket,
@@ -719,6 +733,7 @@ impl Buffer {
             .retain(|_, state| !released.contains(&state.segment));
 
         for seq in &released {
+            self.oldest.remove(seq);
             if self.sealed.remove(seq).is_some() {
                 remove_if_present(&self.segment_path(*seq)).await?;
             }

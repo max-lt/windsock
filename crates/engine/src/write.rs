@@ -120,6 +120,11 @@ impl<R: Remote + 'static> Engine<R> {
         self.config.buffer_limit.min(buffer::MAX_DATA_LEN)
     }
 
+    /// True when a buffered write is older than the late limit: no flush until a restart.
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::SeqCst)
+    }
+
     /// True when the local index refuses every call until a restart, as after a full disk.
     pub fn index_is_poisoned(&self) -> bool {
         self.index().is_poisoned()

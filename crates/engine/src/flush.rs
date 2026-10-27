@@ -55,6 +55,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         tokio::spawn(async move {
             loop {
+                // A quarantine needs a restart: a retry would only fail again.
+                if engine.is_quarantined() {
+                    error!("buffered writes older than the late limit: the flusher stops");
+                    return;
+                }
                 // The first pass runs at once: writes replayed after a crash do not wait.
                 if let Err(e) = engine.flush().await {
                     warn!(%e, "flush failed");
@@ -116,6 +121,22 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     pub(crate) async fn flush_segments(&self, segments: &[u64]) -> Result<Flushed> {
+        // A late record stops the flush before any plan or upload: it can never commit.
+        let limit = buffer::unix_nanos().saturating_sub(self.config.late_limit().as_nanos() as u64);
+        let late = {
+            let buffer = self.buffer.lock().await;
+            match buffer.oldest_in(segments) {
+                Some(oldest) if oldest < limit => Some(buffer.late_targets(limit).join(", ")),
+                _ => None,
+            }
+        };
+        if let Some(keys) = late {
+            self.quarantined.store(true, Ordering::SeqCst);
+            error!(keys, "buffered writes older than the late limit: no flush");
+            return Err(EngineError::Quarantined(format!(
+                "{keys}. Restart the proxy to move them to quarantine"
+            )));
+        }
         let dedup = self.ensure_fresh_sync().await?;
         let planned_at = buffer::unix_nanos();
         let seed = blake3::Hasher::new()
@@ -131,20 +152,12 @@ impl<R: Remote + 'static> Engine<R> {
         );
         let mut planned = Vec::new();
         let mut objects = 0;
-        let mut late = Vec::new();
-        let oldest_allowed =
-            buffer::unix_nanos().saturating_sub(self.config.late_limit().as_nanos() as u64);
 
         for &seq in segments {
             let path = buffer::segment_path(&self.buffer_dir, seq);
             let mut reader = SegmentReader::open(&path).await?;
 
             while let Some(record) = reader.next(&path).await? {
-                // A commit could rank under a delete that a prune already removed.
-                if record.head.time < oldest_allowed {
-                    late.push(record.head.op.target());
-                    continue;
-                }
                 let next = match record.head.op {
                     Op::Put {
                         bucket,
@@ -189,15 +202,6 @@ impl<R: Remote + 'static> Engine<R> {
                 };
                 planned.push(next);
             }
-        }
-
-        if !late.is_empty() {
-            self.quarantined.store(true, Ordering::SeqCst);
-            let keys = late.join(", ");
-            error!(keys, "buffered writes older than the late limit: no commit");
-            return Err(EngineError::Quarantined(format!(
-                "{keys}. Restart the proxy to move them to quarantine"
-            )));
         }
 
         let (last, manifests) = planner.finish();

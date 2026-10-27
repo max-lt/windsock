@@ -416,6 +416,11 @@ async fn flush_until_empty<R: Sweep + 'static>(engine: &Engine<R>) {
         match engine.flush().await {
             Ok(()) if engine.buffered_bytes().await == 0 => return,
             Ok(()) => {}
+            // A retry fails again: the next start moves the late writes to quarantine.
+            Err(e) if engine.is_quarantined() => {
+                error!(%e, "final flush stopped: buffered writes are older than the late limit");
+                return;
+            }
             Err(e) if warned.is_none_or(|at| at.elapsed() >= SHUTDOWN_WARN_EVERY) => {
                 warned = Some(Instant::now());
                 let bytes = engine.buffered_bytes().await;

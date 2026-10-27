@@ -498,3 +498,48 @@ async fn test_audit_runs_again_after_a_sync_that_failed() {
 
     assert_eq!(report.broken, vec![writer.engine.node()]);
 }
+
+/// A late record stops the flush before any plan or upload, also of the young records next to
+/// it, and the engine stays quarantined until a restart.
+#[tokio::test]
+async fn test_flush_with_a_late_record_uploads_nothing() {
+    let remote = Arc::new(FaultRemote::default());
+    let config = Config {
+        retention: Duration::from_millis(300),
+        late_margin: Duration::from_millis(100),
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = |key: &'static str| {
+        engine.put(
+            BUCKET,
+            key,
+            Bytes::from(data()),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+    };
+    put("late").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    put("young").await.unwrap();
+
+    let result = engine.flush().await;
+
+    assert!(
+        matches!(result, Err(engine::EngineError::Quarantined(_))),
+        "{result:?}"
+    );
+    assert!(remote.inner.list("packs/").await.unwrap().is_empty());
+    assert!(engine.is_quarantined());
+}

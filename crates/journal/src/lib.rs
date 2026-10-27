@@ -191,6 +191,9 @@ impl<R: Remote> Journal<R> {
     /// Writes a prepared entry. Safe to call again with the same entry after a
     /// crash or an ambiguous error: an entry already in the remote counts as written.
     pub async fn commit(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
+        // A reader finds a chain through its marker: an entry with no marker is invisible to the
+        // GC, which then takes its packs for orphans.
+        self.register().await?;
         let bytes = entry.to_wire();
 
         match self
@@ -200,7 +203,6 @@ impl<R: Remote> Journal<R> {
         {
             Ok(()) => {
                 self.advance_own(entry).await?;
-                self.register().await;
                 debug!(seq = entry.seq, "appended entry");
                 Ok(Commit::Written)
             }
@@ -237,7 +239,6 @@ impl<R: Remote> Journal<R> {
 
     async fn resolve_taken_seq(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
         if self.is_written(entry).await? {
-            self.register().await;
             return Ok(Commit::Written);
         }
 
@@ -455,16 +456,14 @@ impl<R: Remote> Journal<R> {
         Ok(entries)
     }
 
-    /// Writes the node marker once. A failure only delays discovery by other proxies.
-    async fn register(&mut self) {
+    /// Writes the node marker once, before the first entry of the chain.
+    async fn register(&mut self) -> Result<(), JournalError> {
         if self.registered {
-            return;
+            return Ok(());
         }
-
-        match self.remote.put(&node_key(self.node), Bytes::new()).await {
-            Ok(()) => self.registered = true,
-            Err(e) => warn!(%e, "failed to write the node marker"),
-        }
+        self.remote.put(&node_key(self.node), Bytes::new()).await?;
+        self.registered = true;
+        Ok(())
     }
 }
 

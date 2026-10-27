@@ -611,3 +611,32 @@ async fn test_late_intent_goes_to_the_quarantine_at_open() {
 
     assert!(engine.get(BUCKET, "late", None).await.is_err());
 }
+
+/// The first entry of a node reaches the remote and its answer is lost. Its chain must still be
+/// visible to the other proxies, and to the GC: else the GC takes its packs for orphans and
+/// deletes them. The node marker must exist before the first entry.
+#[tokio::test]
+async fn test_first_entry_with_a_lost_answer_is_visible_to_other_proxies() {
+    let remote = Arc::new(FaultRemote::default());
+    let owner = proxy(&remote, 3).await;
+    owner.engine.create_bucket(BUCKET, None).await.unwrap();
+    owner.engine.flush().await.unwrap();
+    let writer = proxy(&remote, 1).await;
+    writer.engine.sync().await.unwrap();
+    let put = writer.engine.put(
+        BUCKET,
+        "k",
+        Bytes::from(data()),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::LoseAnswer);
+    assert!(writer.engine.flush().await.is_err());
+
+    let reader = proxy(&remote, 2).await;
+    reader.engine.sync().await.unwrap();
+
+    let object = reader.engine.get(BUCKET, "k", None).await.unwrap();
+    assert_eq!(object.data, data());
+}

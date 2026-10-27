@@ -817,3 +817,37 @@ async fn test_range_past_any_object_reports_its_size() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn test_service_error_names_the_host_and_the_key() {
+    let server = server().await;
+    let mut wrong = config(&server.endpoint, "");
+    wrong.secret_key = "other".into();
+    let remote = S3Remote::new(wrong).unwrap();
+
+    let error = remote.get("log/n1/7").await.unwrap_err().to_string();
+
+    let host = server.endpoint.trim_start_matches("http://");
+    assert!(error.contains("SignatureDoesNotMatch"), "{error}");
+    assert!(error.contains(host), "{error}");
+    assert!(error.contains("log/n1/7"), "{error}");
+}
+
+#[tokio::test]
+async fn test_refused_connection_names_the_host_and_the_key() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut refused = config(&endpoint, "");
+    refused.retry = quick_retry();
+    let remote = S3Remote::new(refused).unwrap();
+
+    let error = remote.get("log/n1/7").await.unwrap_err().to_string();
+
+    assert!(
+        error.contains(endpoint.trim_start_matches("http://")),
+        "{error}"
+    );
+    assert!(error.contains("log/n1/7"), "{error}");
+    assert!(error.to_lowercase().contains("refused"), "{error}");
+}

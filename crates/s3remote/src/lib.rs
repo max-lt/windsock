@@ -47,6 +47,8 @@ struct Reply {
     status: StatusCode,
     headers: HeaderMap,
     body: Bytes,
+    /// Method and URL, so an error names the host and the key.
+    target: String,
 }
 
 impl Reply {
@@ -60,7 +62,7 @@ impl Reply {
         RemoteError::Service {
             status: self.status.as_u16(),
             code,
-            message,
+            message: format!("{message} ({})", self.target),
         }
     }
 }
@@ -297,6 +299,13 @@ impl S3Remote {
     /// A reply with a status that a retry does not fix comes back as `Ok`.
     async fn send(&self, call: Call<'_>) -> Result<Reply, RemoteError> {
         let policy = &self.config.retry;
+        let target = format!(
+            "{} {}://{}{}",
+            call.method,
+            self.scheme,
+            self.authority,
+            self.path(call.key)
+        );
 
         policy
             .run(|| async {
@@ -330,6 +339,7 @@ impl S3Remote {
                     status,
                     headers,
                     body,
+                    target: target.clone(),
                 };
 
                 if retry::is_transient(status, &xml::error(&reply.body).0) {
@@ -339,6 +349,12 @@ impl S3Remote {
                 Ok(reply)
             })
             .await
+            .map_err(|e| match e {
+                RemoteError::Io(io) => {
+                    RemoteError::Io(std::io::Error::new(io.kind(), format!("{target}: {io}")))
+                }
+                other => other,
+            })
     }
 
     /// The size of an object, or `None` if it does not exist.

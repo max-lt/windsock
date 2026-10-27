@@ -53,14 +53,16 @@ longer than its content.
 
 ## What the remote holds
 
-| Object                 | Sealed                                                    | In clear                                                          |
-| ---------------------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| `packs/<id>`           | Each chunk, and the footer with the chunk IDs and offsets | The header (format and nonce), the total size and the footer size |
-| `manifests/<id>`       | All the content                                           | The key name                                                      |
-| `log/<node>/<seq>`     | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, and the signature                     |
-| `snapshots/<time>-<h>` | All the content                                           | The write time in the key name                                    |
-| `repo/key-check`       | A known value                                             | Nothing else                                                      |
-| `nodes/<node>`         | Empty marker                                              | The node ID                                                       |
+| Object                      | Sealed                                                    | In clear                                                          |
+| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
+| `packs/<id>`                | Each chunk, and the footer with the chunk IDs and offsets | The header (format and nonce), the total size and the footer size |
+| `manifests/<id>`            | All the content                                           | The key name                                                      |
+| `log/<node>/<seq>`          | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, and the signature                     |
+| `snapshots/<time>-<h>/<n>`  | Part n of the sealed snapshot                             | The write time in the key name, the part number and size          |
+| `snapshots/<time>-<h>/head` | The size and hash of each part, the frontiers             | The write time in the key name                                    |
+| `snapshots/<time>-<h>`      | All the content (one object, read only)                   | The write time in the key name                                    |
+| `repo/key-check`            | A known value                                             | Nothing else                                                      |
+| `nodes/<node>`              | Empty marker                                              | The node ID                                                       |
 
 A pack upload whose answer is lost is sent again with a new nonce. The first pack then has no
 manifest, and the GC condemns it.

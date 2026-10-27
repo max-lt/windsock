@@ -62,6 +62,7 @@ impl Remote for TestRemote {
 
     async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
         if key.starts_with(engine::SNAPSHOTS_PREFIX)
+            && !key.ends_with("/head")
             && self.refuse_snapshot_get.load(Ordering::SeqCst)
         {
             return Err(RemoteError::Io(std::io::Error::other(
@@ -363,10 +364,7 @@ async fn test_snapshot_is_written_once_per_interval() {
         report.redacted_entries, 0,
         "entries above the snapshot stay whole"
     );
-    assert_eq!(
-        remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap().len(),
-        1
-    );
+    assert_eq!(heads(&remote).await, 1);
     assert!(entries(&remote).await.iter().any(|e| e.actions.is_some()));
 }
 
@@ -421,13 +419,7 @@ async fn test_restart_keeps_reading_after_the_prune() {
 async fn test_snapshot_loads_in_ranged_parts() {
     let remote = Arc::new(TestRemote::default());
     let a = history(&remote).await;
-    let key = remote
-        .list(engine::SNAPSHOTS_PREFIX)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let len = remote.inner.get(&key).await.unwrap().unwrap().len() as u64;
+    let (_, len) = latest(&remote).await;
     remote.refuse_snapshot_get.store(true, Ordering::SeqCst);
     remote.snapshot_ranges.store(0, Ordering::SeqCst);
     let config = Config {
@@ -461,24 +453,32 @@ async fn test_snapshot_loads_in_ranged_parts() {
 async fn test_snapshot_over_the_cap_fails_with_its_key_and_the_cap() {
     let remote = Arc::new(TestRemote::default());
     let a = history(&remote).await;
+    let _ = a;
     *remote.snapshot_len.lock().unwrap() = Some(engine::MAX_SNAPSHOT + 1);
+    let b = proxy(&remote, 2).await;
 
-    let error = a.engine.gc().await.unwrap_err().to_string();
+    let error = b.engine.sync().await.unwrap_err().to_string();
 
     assert!(error.contains("snapshots/"), "{error}");
     assert!(error.contains(&engine::MAX_SNAPSHOT.to_string()), "{error}");
 }
 
-/// The newest snapshot key and its size.
+/// The first part of the newest snapshot, and its size.
 async fn latest(remote: &TestRemote) -> (String, u64) {
     let key = remote
         .list(engine::SNAPSHOTS_PREFIX)
         .await
         .unwrap()
-        .pop()
+        .into_iter()
+        .rfind(|key| key.ends_with("/000000"))
         .unwrap();
     let len = remote.inner.get(&key).await.unwrap().unwrap().len() as u64;
     (key, len)
+}
+
+async fn heads(remote: &TestRemote) -> usize {
+    let keys = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    keys.iter().filter(|key| key.ends_with("/head")).count()
 }
 
 async fn open_with(remote: &Arc<TestRemote>, part: u64) -> Result<Proxy, engine::EngineError> {
@@ -608,7 +608,7 @@ async fn test_corrupted_part_with_a_pruned_journal_fails_the_sync() {
         .unwrap();
 
     assert!(error.contains(&key), "{error}");
-    assert!(error.contains("do not match the key hash"), "{error}");
+    assert!(error.contains("does not match its hash"), "{error}");
 }
 
 #[tokio::test]
@@ -633,7 +633,7 @@ async fn test_snapshot_that_shrinks_after_the_size_probe_fails_the_load() {
         .unwrap();
 
     assert!(error.contains(&key), "{error}");
-    assert!(error.contains("do not match the key hash"), "{error}");
+    assert!(error.contains("the head says"), "{error}");
 }
 
 #[tokio::test]
@@ -650,7 +650,8 @@ async fn test_snapshot_that_grows_after_the_size_probe_skips_to_the_replay() {
 async fn test_empty_snapshot_is_skipped_for_the_older_one() {
     let remote = Arc::new(TestRemote::default());
     let _a = history(&remote).await;
-    let (key, _) = latest(&remote).await;
+    let keys = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    let key = keys.iter().find(|key| key.ends_with("/head")).unwrap();
     let (time, _) = key
         .strip_prefix(engine::SNAPSHOTS_PREFIX)
         .unwrap()
@@ -663,7 +664,210 @@ async fn test_empty_snapshot_is_skipped_for_the_older_one() {
         blake3::hash(&[])
     );
     remote.inner.put(&empty, Bytes::new()).await.unwrap();
-    assert_eq!(latest(&remote).await.0, empty);
+    assert!(remote.list(&empty).await.unwrap().contains(&empty));
 
     assert_eq!(assert_full_or_error(&remote, 64).await, None);
+}
+
+async fn proxy_config(remote: &Arc<TestRemote>, seed: u8, config: Config) -> Proxy {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[seed; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
+    Proxy { dir, engine }
+}
+
+/// Like `history`, with a snapshot in parts of `object` bytes. Returns the snapshot base key
+/// and the number of entries that the prune redacted.
+async fn history_in_parts(remote: &Arc<TestRemote>, object: u64, keys: usize) -> (String, usize) {
+    let config = Config {
+        snapshot_object: object,
+        ..Config::default()
+    };
+    let a = proxy_config(remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    for (key, data) in [("x", "one"), ("y", "two")] {
+        put(&a.engine, key, data).await;
+    }
+    for n in 0..keys {
+        put(&a.engine, &format!("more-{n:05}"), "v").await;
+    }
+    a.engine.flush().await.unwrap();
+    let report = a.engine.gc().await.unwrap();
+    assert!(report.snapshot_written);
+    let head = remote
+        .list(engine::SNAPSHOTS_PREFIX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|key| key.ends_with("/head"))
+        .unwrap();
+    let base = head.strip_suffix("/head").unwrap().to_string();
+    (base, report.redacted_entries)
+}
+
+/// A new proxy after a prune: the error, or `None` when it reads x and y.
+async fn load_after_prune(remote: &Arc<TestRemote>) -> Option<String> {
+    let b = proxy(remote, 2).await;
+    if let Err(e) = b.engine.sync().await {
+        assert!(b.engine.get(BUCKET, "y", None).await.is_err());
+        return Some(e.to_string());
+    }
+    assert_eq!(get(&b.engine, "x").await, "one");
+    assert_eq!(get(&b.engine, "y").await, "two");
+    None
+}
+
+#[tokio::test]
+async fn test_snapshot_in_parts_loads_and_checks_each_part() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 100, 0).await;
+    assert!(redacted > 0);
+    let parts = remote.list(&format!("{base}/")).await.unwrap().len() - 1;
+    assert!(parts > 2, "{parts} parts");
+
+    assert_eq!(load_after_prune(&remote).await, None);
+}
+
+#[tokio::test]
+async fn test_snapshot_with_a_missing_part_fails_with_its_head_key() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 100, 0).await;
+    assert!(redacted > 0);
+    remote
+        .inner
+        .delete(&format!("{base}/000001"))
+        .await
+        .unwrap();
+
+    let error = load_after_prune(&remote).await.unwrap();
+
+    assert!(error.contains(&format!("{base}/head")), "{error}");
+    assert!(error.contains("the remote has"), "{error}");
+}
+
+#[tokio::test]
+async fn test_snapshot_with_a_corrupt_part_fails_with_the_part_key() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 100, 0).await;
+    assert!(redacted > 0);
+    let part = format!("{base}/000001");
+    let mut bytes = remote.inner.get(&part).await.unwrap().unwrap().to_vec();
+    bytes[10] ^= 1;
+    remote.inner.put(&part, Bytes::from(bytes)).await.unwrap();
+
+    let error = load_after_prune(&remote).await.unwrap();
+
+    assert!(error.contains(&part), "{error}");
+    assert!(error.contains("does not match its hash"), "{error}");
+}
+
+#[tokio::test]
+async fn test_snapshot_with_a_short_part_fails_with_the_part_key() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 100, 0).await;
+    assert!(redacted > 0);
+    let part = format!("{base}/000001");
+    let bytes = remote.inner.get(&part).await.unwrap().unwrap();
+    remote.inner.put(&part, bytes.slice(..50)).await.unwrap();
+
+    let error = load_after_prune(&remote).await.unwrap();
+
+    assert!(error.contains(&part), "{error}");
+    assert!(error.contains("the head says 100"), "{error}");
+}
+
+#[tokio::test]
+async fn test_snapshot_head_with_a_wrong_part_count_is_skipped() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 100, 0).await;
+    assert!(redacted > 0);
+    let extra = format!("{base}/000999");
+    remote
+        .inner
+        .put(&extra, Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+
+    let error = load_after_prune(&remote).await.unwrap();
+
+    assert!(error.contains(&format!("{base}/head")), "{error}");
+    assert!(error.contains("the remote has"), "{error}");
+}
+
+/// A head over the part cap does not load, so the GC does not prune under it.
+#[tokio::test]
+async fn test_snapshot_head_over_the_part_cap_is_skipped() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 1, 200).await;
+    let parts = remote.list(&format!("{base}/")).await.unwrap().len() - 1;
+    assert!(parts > engine::MAX_SNAPSHOT_PARTS, "{parts} parts");
+
+    assert_eq!(redacted, 0, "no prune under a snapshot that does not load");
+    assert_eq!(load_after_prune(&remote).await, None, "the journal replays");
+}
+
+#[tokio::test]
+async fn test_snapshot_in_one_object_still_loads() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, redacted) = history_in_parts(&remote, 1 << 30, 0).await;
+    assert!(redacted > 0);
+    let whole = remote
+        .inner
+        .get(&format!("{base}/000000"))
+        .await
+        .unwrap()
+        .unwrap();
+    for key in remote.list(&format!("{base}/")).await.unwrap() {
+        remote.inner.delete(&key).await.unwrap();
+    }
+    remote.inner.put(&base, whole).await.unwrap();
+
+    assert_eq!(load_after_prune(&remote).await, None);
+}
+
+#[tokio::test]
+async fn test_gc_prune_reads_the_head_and_no_part() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history(&remote).await;
+    put(&a.engine, "after", "the snapshot").await;
+    a.engine.flush().await.unwrap();
+    remote.snapshot_ranges.store(0, Ordering::SeqCst);
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(!report.snapshot_written);
+    assert_eq!(remote.snapshot_ranges.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_gc_deletes_an_old_snapshot_with_all_its_parts() {
+    let remote = Arc::new(TestRemote::default());
+    let config = Config {
+        snapshot_object: 100,
+        snapshot_interval: Duration::ZERO,
+        gc_horizon: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let a = proxy_config(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    let old = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    a.engine.gc().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(report.deleted_snapshots >= 1, "{report:?}");
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(old.iter().all(|key| !left.contains(key)), "{left:?}");
+    assert_eq!(get(&proxy(&remote, 2).await.engine, "x").await, "one");
 }

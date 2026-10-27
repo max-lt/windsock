@@ -85,8 +85,30 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
   off. For a private CA, set `ca_file`.
 - An empty access key or secret key stops the start.
 - A wait for a slot does not count in the time of an attempt.
-- One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in one PUT, so a
-  snapshot holds at most about 23,000,000 keys (231 bytes per key).
+
+## Snapshots
+
+One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts:
+
+- The GC seals the snapshot as one blob, then cuts the blob into parts of at most 1 GiB
+  . Part n is `snapshots/<time>-<h>/<n, 6 digits>`. `h` is the blake3
+  hash of the sealed blob.
+- The head `snapshots/<time>-<h>/head` holds the size and the blake3 hash of each part, and the
+  frontiers of the snapshot. It is sealed with the key name as context. The GC writes it after
+  all the parts.
+- A load reads the head, then each part in ranged reads of 64 MiB. It
+  checks the number of parts in the remote, and the size and hash of each part, before it uses
+  the part. Then it checks the blob hash against the key, and opens the blob.
+- A head lists at most 4096 parts. The parts hold at most 16 GiB together: about 74,000,000
+  keys at 231 bytes per key.
+- A snapshot that does not load is skipped, and the next older snapshot loads. If none loads,
+  the proxy replays the journal. After a prune, the sync fails with an error that names each
+  skipped key and its cause.
+- The journal prune reads only the head of the newest snapshot. If the head does not load, the
+  prune uses the newest snapshot that loads.
+- The GC deletes a snapshot when a newer snapshot is older than the GC horizon. It deletes the
+  head first, then the parts.
+- A snapshot in one object, `snapshots/<time>-<h>`, still loads.
 
 ## Cloudflare R2
 

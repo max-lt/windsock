@@ -47,7 +47,7 @@ pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::ObjectState;
 pub use manifest::{ChunkRef, INLINE_MAX, MANIFESTS_PREFIX, Manifest, manifest_id, manifest_key};
-pub use snapshot::{MAX_SNAPSHOT, SNAPSHOTS_PREFIX};
+pub use snapshot::{MAX_SNAPSHOT, MAX_SNAPSHOT_PARTS, SNAPSHOTS_PREFIX};
 
 /// Prefix of all pack keys.
 pub const PACKS_PREFIX: &str = "packs/";

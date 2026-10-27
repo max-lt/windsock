@@ -74,6 +74,8 @@ pub struct Config {
     pub snapshot_interval: Duration,
     /// A snapshot loads in ranged reads of this size, so it can be larger than one remote reply.
     pub snapshot_part: u64,
+    /// The GC writes a snapshot in remote objects of at most this size. One PUT holds 5 GiB.
+    pub snapshot_object: u64,
     /// A flush splits its segments over more entries when the actions of one entry exceed this.
     pub max_entry_actions: u64,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
@@ -93,6 +95,7 @@ impl Default for Config {
             retention: Duration::from_secs(24 * 3600),
             snapshot_interval: Duration::from_secs(24 * 3600),
             snapshot_part: 64 * 1024 * 1024,
+            snapshot_object: 1024 * 1024 * 1024,
             // Far under the 1 GiB that a remote reply can hold.
             max_entry_actions: 256 * 1024 * 1024,
             policies: Vec::new(),

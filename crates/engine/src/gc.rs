@@ -29,6 +29,8 @@ pub struct GcReport {
     pub snapshot_written: bool,
     /// Journal entries replaced by their redacted form.
     pub redacted_entries: usize,
+    /// Old snapshots deleted with all their parts.
+    pub deleted_snapshots: usize,
 }
 
 /// Dead objects of one kind, split by what this run does with them.
@@ -112,6 +114,7 @@ impl<R: Sweep + 'static> Engine<R> {
             report.snapshot_written = true;
         }
         report.redacted_entries = self.prune_journal().await?;
+        report.deleted_snapshots = self.delete_old_snapshots().await?;
 
         info!(?report, "gc run");
         Ok(report)

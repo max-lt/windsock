@@ -138,6 +138,7 @@ pub enum Kind {
     Actions = 4,
     Snapshot = 5,
     KeyCheck = 6,
+    SnapshotHead = 7,
 }
 
 #[derive(Clone)]

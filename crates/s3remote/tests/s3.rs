@@ -880,3 +880,36 @@ async fn test_wait_for_a_slot_does_not_use_up_the_attempt_time() {
         assert_eq!(read.await.unwrap().unwrap(), None);
     }
 }
+
+/// With every slot taken by slow calls, a new call fails at its own time limit. It does not
+/// wait for a slot for longer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wait_for_a_slot_ends_at_the_call_time_limit() {
+    let (slow, _) = slow_server(Duration::from_secs(3)).await;
+    let mut config = config(&slow.endpoint, "");
+    config.retry = Retry {
+        attempts: 1,
+        attempt_timeout: Duration::from_secs(10),
+        total: Duration::from_millis(500),
+        ..quick_retry()
+    };
+    let remote = Arc::new(S3Remote::new(config).unwrap());
+    let busy: Vec<_> = (0..s3remote::MAX_IN_FLIGHT)
+        .map(|_| {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.get("packs/none").await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let start = Instant::now();
+    let result = remote.get("packs/other").await;
+    let waited = start.elapsed();
+
+    assert!(waited < Duration::from_millis(1500), "waited {waited:?}");
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("no free connection slot"), "{error}");
+    for call in busy {
+        let _ = call.await;
+    }
+}

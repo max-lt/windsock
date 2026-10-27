@@ -53,8 +53,14 @@ impl Retry {
         half + Duration::from_nanos(u64::from(nanos) % (half.as_nanos() as u64).max(1))
     }
 
-    /// Runs `attempt` until it succeeds. Every error of `attempt` counts as transient.
-    pub(crate) async fn run<T, F, Fut>(&self, attempt: F) -> Result<T, RemoteError>
+    /// Runs `attempt` until it succeeds. Every error of `attempt` counts as transient. Each
+    /// attempt holds one of `slots`. The wait for a slot is not in the attempt time, but it ends
+    /// at the time limit of the call. The slot is free during the pause between attempts.
+    pub(crate) async fn run<T, F, Fut>(
+        &self,
+        slots: &tokio::sync::Semaphore,
+        attempt: F,
+    ) -> Result<T, RemoteError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, RemoteError>>,
@@ -63,7 +69,17 @@ impl Retry {
         let mut n = 0;
 
         loop {
-            let error = match tokio::time::timeout(self.attempt_timeout, attempt()).await {
+            let left = self.total.saturating_sub(start.elapsed());
+            let Ok(slot) = tokio::time::timeout(left, slots.acquire()).await else {
+                return Err(RemoteError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no free connection slot before the time limit of the call",
+                )));
+            };
+            let slot = slot.expect("the semaphore is never closed");
+            let result = tokio::time::timeout(self.attempt_timeout, attempt()).await;
+            drop(slot);
+            let error = match result {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(e)) => e,
                 Err(_) => RemoteError::Io(std::io::Error::new(
@@ -126,7 +142,7 @@ mod tests {
         let calls = AtomicU32::new(0);
 
         let result = quick()
-            .run(|| async {
+            .run(&tokio::sync::Semaphore::new(1), || async {
                 match calls.fetch_add(1, Ordering::SeqCst) {
                     0 | 1 => Err(transient()),
                     _ => Ok(7),
@@ -143,7 +159,7 @@ mod tests {
         let calls = AtomicU32::new(0);
 
         let result: Result<(), _> = quick()
-            .run(|| async {
+            .run(&tokio::sync::Semaphore::new(1), || async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Err(transient())
             })
@@ -164,7 +180,7 @@ mod tests {
         let start = Instant::now();
 
         let result: Result<(), _> = policy
-            .run(|| async {
+            .run(&tokio::sync::Semaphore::new(1), || async {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(())
             })

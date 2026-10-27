@@ -84,7 +84,8 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - The client always verifies the TLS certificate and its host name. No setting turns the check
   off. For a private CA, set `ca_file`.
 - An empty access key or secret key stops the start.
-- A wait for a slot does not count in the time of an attempt.
+- A wait for a slot does not count in the time of an attempt, but it ends at the time limit of
+  the call (120 s). A call frees its slot during the pause between attempts.
 
 ## Snapshots
 

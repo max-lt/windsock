@@ -474,3 +474,83 @@ async fn test_node_with_no_marker_is_found_through_a_seen_link() {
 
     assert_all_see(&[&a, &b, &c], &["k"], &[None]).await;
 }
+
+/// A bad signature in the middle of a chain: the sync names the node and the seq, the other
+/// chains go on, and the GC refuses to run.
+#[tokio::test]
+async fn test_bad_signature_mid_chain_names_node_and_seq() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = chain_of(&remote, 3).await;
+    let key = journal::entry_key(a.engine.node(), 1);
+    let read =
+        Entry::from_wire(&remote.get(&key).await.unwrap().unwrap(), keys().sealer()).unwrap();
+    let forged = Entry::sign(
+        &SigningKey::from_bytes(&[7; 32]),
+        1,
+        read.prev,
+        read.hlc,
+        read.seen.clone(),
+        read.actions.clone().unwrap(),
+        keys().sealer(),
+    );
+    let mut wire = forged.to_wire();
+    // The node ID leads the wire form: give the entry the node of a, with the signature of 7.
+    wire[..32].copy_from_slice(a.engine.node().as_bytes());
+    remote.put(&key, Bytes::from(wire)).await.unwrap();
+    put(&b.engine, "from-b", "b").await;
+    b.engine.flush().await.unwrap();
+
+    let c = proxy(&remote, 3).await;
+    let report = c.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, vec![a.engine.node()]);
+    let cause = &report.broken_causes[0];
+    assert!(cause.contains(&a.engine.node().to_string()), "{cause}");
+    assert!(cause.contains("entry 1"), "{cause}");
+    assert_eq!(view(&c.engine, &["from-b"]).await, [Some("b".into())]);
+    assert!(matches!(
+        c.engine.gc().await,
+        Err(EngineError::BrokenChains(_))
+    ));
+}
+
+/// Seqs at the end of the u64 range, a seq far ahead, and an entry copied to another seq.
+#[tokio::test]
+async fn test_extreme_and_duplicate_seqs_break_the_chain_with_no_panic() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, _b) = chain_of(&remote, 2).await;
+    let node = a.engine.node();
+    let first = remote
+        .get(&journal::entry_key(node, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    // A duplicate: entry 0 again at seq 2.
+    remote
+        .put(&journal::entry_key(node, 2), first.clone())
+        .await
+        .unwrap();
+    let c = proxy(&remote, 3).await;
+    let report = c.engine.sync().await.unwrap();
+    assert_eq!(report.broken, vec![node], "duplicate seq");
+
+    for seq in [u64::MAX, u64::MAX - 1, 1_000_000] {
+        let remote = Arc::new(MemoryRemote::default());
+        let (a, _b) = chain_of(&remote, 1).await;
+        let node = a.engine.node();
+        let bytes = remote
+            .get(&journal::entry_key(node, 0))
+            .await
+            .unwrap()
+            .unwrap();
+        remote
+            .put(&journal::entry_key(node, seq), bytes)
+            .await
+            .unwrap();
+
+        let c = proxy(&remote, 3).await;
+        let report = c.engine.sync().await.unwrap();
+
+        assert_eq!(report.broken, vec![node], "seq {seq}");
+    }
+}

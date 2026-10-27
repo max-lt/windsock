@@ -161,6 +161,8 @@ pub struct SyncReport {
     pub applied: usize,
     /// Chains that could not be read past their frontier. The other chains synced.
     pub broken: Vec<NodeId>,
+    /// For each broken chain: its node, the seq and the cause.
+    pub broken_causes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

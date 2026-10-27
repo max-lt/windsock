@@ -30,6 +30,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         let mut report = SyncReport {
             broken: journal.broken().keys().copied().collect(),
+            broken_causes: journal
+                .broken()
+                .iter()
+                .map(|(node, cause)| format!("chain of node {node}: {cause}"))
+                .collect(),
             ..SyncReport::default()
         };
 

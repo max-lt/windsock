@@ -88,30 +88,58 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 
 ## Snapshots
 
-One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts:
+One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts.
 
-- The GC seals the snapshot as one blob, then cuts the blob into parts of at most 1 GiB
-  . Part n is `snapshots/<time>-<h>/<n, 6 digits>`. `h` is the blake3
-  hash of the sealed blob.
+| Limit                   | Value                                        |
+| ----------------------- | -------------------------------------------- |
+| Size of one part        | 1 GiB at most                                |
+| Parts in one snapshot   | 4096 at most                                 |
+| Size of one snapshot    | 16 GiB at most: about 74,000,000 keys        |
+| Ranged read of a part   | 64 MiB                                       |
+| Parts with no head stay | for the GC horizon (`gc.horizon_secs`, 24 h) |
+
+The format:
+
+- The GC seals the snapshot as one blob, then cuts the blob into parts. Part n is
+  `snapshots/<time>-<h>/<n, 6 digits>`. `h` is the blake3 hash of the sealed blob.
 - The head `snapshots/<time>-<h>/head` holds the size and the blake3 hash of each part, and the
   frontiers of the snapshot. It is sealed with the key name as context. The GC writes it after
   all the parts.
-- A load reads the head, then each part in ranged reads of 64 MiB. It
-  checks the number of parts in the remote, and the size and hash of each part, before it uses
-  the part. Then it checks the blob hash against the key, and opens the blob.
-- A head lists at most 4096 parts. The parts hold at most 16 GiB together: about 74,000,000
-  keys at 231 bytes per key.
+- A snapshot in one object, `snapshots/<time>-<h>`, still loads.
+
+The load:
+
+- A load reads the head, then the parts. It checks the number of parts in the remote, and the
+  size and hash of each part, before it uses the part. Then it checks the blob hash against the
+  key, and opens the blob.
 - A snapshot that does not load is skipped, and the next older snapshot loads. If none loads,
-  the proxy replays the journal. After a prune, the sync fails with an error that names each
-  skipped key and its cause.
+  the proxy replays the journal.
 - The journal prune reads only the head of the newest snapshot. If the head does not load, the
-  prune uses the newest snapshot that loads.
+  prune uses the newest snapshot that loads. It never prunes under a snapshot that does not load.
+
+The GC:
+
 - The GC deletes a snapshot when a newer snapshot is older than the GC horizon. It deletes the
   head first, then the parts.
 - Parts with no head come from a write that stopped before its head, or from a delete that
   stopped after it. A load ignores them. The GC deletes them when their write time is older than
-  the GC horizon (24 h).
-- A snapshot in one object, `snapshots/<time>-<h>`, still loads.
+  the GC horizon. Each writer leaves at most one such snapshot in one horizon.
+
+A failed load in the log:
+
+- `WARN skipped a snapshot key=snapshots/.../head cause="..."`, once for each skipped snapshot.
+  Causes: `the head is gone`, `the head does not open`, `the head lists N parts, over the cap of
+4096`, `the head lists N parts, the remote has M`, `<part key> is gone`, `<part key> has N
+bytes, the head says M`, `<part key> does not match its hash in the head`, `... bytes that do
+not match the key hash`, `it does not open`, `it does not decode`.
+- `WARN no snapshot loaded at open`: a new proxy found no snapshot that loads, and replays the
+  journal.
+- After a prune, the sync fails with `corrupt data: redacted entries and no snapshot loads:
+<key>: <cause>; ...`, or `... and no snapshot in the remote`. The proxy cannot read the pruned
+  writes until a snapshot loads. Restore the named object, or let the GC write a new snapshot
+  from a proxy that has the full index.
+- A snapshot over the cap stops the load with `corrupt data: <key>: the snapshot is over the cap
+of 17179869184 bytes`.
 
 ## Cloudflare R2
 

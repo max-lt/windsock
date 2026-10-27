@@ -144,7 +144,7 @@ not match the key hash`, `it does not open`, `it does not decode`.
 <key>: <cause>; ...`, or `... and no snapshot in the remote`. The proxy cannot read the pruned
   writes until a snapshot loads. Restore the named object, or let the GC write a new snapshot
   from a proxy that has the full index.
-- A snapshot over the cap is skipped with the cause `it is over the cap of 17179869184 bytes`
+- A snapshot over the cap is skipped with the cause `it is larger than 17179869184 bytes`
   or `the parts are over the cap of 17179869184 bytes`.
 - The GC writes no snapshot above 16 GiB or 4096 parts. It logs `ERROR no new snapshot: no proxy
 could load it`, keeps the previous snapshot, and goes on.

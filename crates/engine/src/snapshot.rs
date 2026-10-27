@@ -251,7 +251,7 @@ impl<R: Remote + 'static> Engine<R> {
         let mut sealed = Vec::new();
         for (n, part) in head.parts.iter().enumerate() {
             let key = part_key(base, n);
-            let bytes = match self.read_snapshot(&key).await? {
+            let bytes = match self.read_snapshot(&key, part.len).await? {
                 Ok(bytes) => bytes,
                 Err(cause) => return Ok(Err(format!("{key}: {cause}"))),
             };
@@ -284,7 +284,7 @@ impl<R: Remote + 'static> Engine<R> {
                 skipped.0.push(format!("{key}: {cause}"));
             };
             let read = match snapshot.form {
-                Form::Single => self.read_snapshot(&key).await?,
+                Form::Single => self.read_snapshot(&key, MAX_SNAPSHOT).await?,
                 Form::Parts => self.read_parts(&snapshot.base).await?,
             };
             let sealed = match read {
@@ -323,24 +323,29 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(Err(skipped))
     }
 
-    /// The whole snapshot at `key`, read in ranges of `snapshot_part`. `None` if it is gone.
-    async fn read_snapshot(&self, key: &str) -> Result<std::result::Result<Vec<u8>, String>> {
+    /// The object at `key`, read in ranges of `snapshot_part`, or why it does not read. An
+    /// object larger than `limit` is not read: the remote is not trusted with its size.
+    async fn read_snapshot(
+        &self,
+        key: &str,
+        limit: u64,
+    ) -> Result<std::result::Result<Vec<u8>, String>> {
         let failed = |e: RemoteError| EngineError::Corrupt(format!("{key}: {e}"));
-        let over_cap = || Ok(Err(format!("it is over the cap of {MAX_SNAPSHOT} bytes")));
-        // A range at the cap fails with the size of a smaller object. It stays under
+        let over = || Ok(Err(format!("it is larger than {limit} bytes")));
+        // A range at the limit fails with the size of a smaller object. It stays under
         // i64::MAX, because some stores parse a range as a signed number.
         let len = match self
             .remote
-            .get_range(key, MAX_SNAPSHOT..MAX_SNAPSHOT + 1)
+            .get_range(key, limit..limit.saturating_add(1))
             .await
         {
             Err(RemoteError::InvalidRange { len, .. }) => len,
             Ok(None) => return Ok(Err("it is gone".to_string())),
-            Ok(Some(_)) => return over_cap(),
+            Ok(Some(_)) => return over(),
             Err(e) => return Err(failed(e)),
         };
-        if len > MAX_SNAPSHOT {
-            return over_cap();
+        if len > limit {
+            return over();
         }
 
         let part = self.config.snapshot_part.max(1);

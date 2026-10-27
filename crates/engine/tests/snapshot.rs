@@ -460,7 +460,8 @@ async fn test_snapshot_over_the_cap_fails_with_its_key_and_the_cap() {
     let error = b.engine.sync().await.unwrap_err().to_string();
 
     assert!(error.contains("snapshots/"), "{error}");
-    assert!(error.contains(&engine::MAX_SNAPSHOT.to_string()), "{error}");
+    // A part is not read past the size that the head gives it.
+    assert!(error.contains("larger than"), "{error}");
 }
 
 /// The first part of the newest snapshot, and its size.
@@ -1162,4 +1163,26 @@ async fn test_snapshot_over_the_cap_is_skipped_and_the_gc_goes_on() {
     let report = a.engine.gc().await.unwrap();
 
     assert_eq!(report.redacted_entries, 0);
+}
+
+/// A part that the remote replaces with a much larger object is not read: the head gives its
+/// size, and the size probe stops at it.
+#[tokio::test]
+async fn test_part_larger_than_the_head_says_is_not_read() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, _) = history_in_parts(&remote, 100, 0).await;
+    let part = format!("{base}/000001");
+    remote
+        .inner
+        .put(&part, Bytes::from(vec![0u8; 100_000]))
+        .await
+        .unwrap();
+    remote.snapshot_ranges.store(0, Ordering::SeqCst);
+
+    let error = assert_full_or_error(&remote, 100).await.unwrap();
+
+    assert!(error.contains(&part), "{error}");
+    assert!(error.contains("larger than 100 bytes"), "{error}");
+    let reads = remote.snapshot_ranges.load(Ordering::SeqCst);
+    assert!(reads < 50, "{reads} ranged reads");
 }

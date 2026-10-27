@@ -359,6 +359,12 @@ async fn test_gap_of_two_entries_is_found_by_the_listing_at_open() {
     let report = c.engine.sync().await.unwrap();
 
     assert_eq!(report.broken, vec![a.engine.node()]);
+    let again = c.engine.sync().await.unwrap();
+    assert_eq!(
+        again.broken,
+        vec![a.engine.node()],
+        "the mark stays until an audit passes"
+    );
     assert!(matches!(
         c.engine.gc().await,
         Err(EngineError::BrokenChains(_))

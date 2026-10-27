@@ -351,7 +351,8 @@ impl<R: Remote> Journal<R> {
         }
 
         let mut entries = self.take_stashed();
-        let audit = std::mem::take(&mut self.audit);
+        // The flag stays set until a whole audit runs: a remote error must not skip it.
+        let audit = self.audit;
         let mut queue: Vec<NodeId> = nodes.iter().copied().collect();
         let mut known = nodes;
 
@@ -381,9 +382,11 @@ impl<R: Remote> Journal<R> {
                             warn!(%node, %source, "chain is broken: the other chains go on");
                             self.broken.insert(node, source);
                         }
-                        _ => {
+                        // A gap or a changed entry shows only in an audit: the mark stays until one passes.
+                        _ if audit => {
                             self.broken.remove(&node);
                         }
+                        _ => {}
                     }
                 }
                 // One bad chain must not stop the sync of every chain.
@@ -395,6 +398,7 @@ impl<R: Remote> Journal<R> {
             }
         }
 
+        self.audit = false;
         Ok(entries)
     }
 
@@ -750,8 +754,11 @@ mod tests {
 
         overwrite(&remote, &good).await;
         let entries = reader.sync_all().await.unwrap();
-
         assert_eq!(entries, vec![good]);
+        assert!(!reader.broken().is_empty(), "the mark stays until an audit passes");
+        reader.audit_next_sync();
+        reader.sync_all().await.unwrap();
+
         assert!(reader.broken().is_empty());
     }
 

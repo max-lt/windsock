@@ -455,10 +455,11 @@ async fn test_broken_chain_fails_alone_and_recovers() {
 
     remote.put(&key, good).await.unwrap();
     let report = reader.engine.sync().await.unwrap();
+    assert_eq!(report.broken, [broken], "the mark stays until an audit passes");
 
-    assert!(report.broken.is_empty());
-    assert_eq!(keys(&reader.engine).await, ["copy", "k0", "k1", "k2"]);
+    // The GC sync lists every chain: the chain passes the audit and the GC runs.
     reader.engine.gc().await.unwrap();
+    assert_eq!(keys(&reader.engine).await, ["copy", "k0", "k1", "k2"]);
 }
 
 /// A chain whose HLC runs far ahead of the GC clock raises the stable HLC past real

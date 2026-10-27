@@ -461,3 +461,40 @@ async fn test_recover_refuses_an_intent_older_than_the_late_limit() {
     );
     assert_eq!(chains(&remote).await.values().next().unwrap().len(), 1);
 }
+
+/// The first sync after open lists each chain. When a remote error stops that sync, the next
+/// sync must list the chains again, or a gap of two entries stays unseen.
+#[tokio::test]
+async fn test_audit_runs_again_after_a_sync_that_failed() {
+    let remote = Arc::new(FaultRemote::default());
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    for n in 0..3 {
+        let key = format!("k{n}");
+        let put = writer.engine.put(
+            BUCKET,
+            &key,
+            Bytes::from_static(b"v"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        );
+        put.await.unwrap();
+        writer.engine.flush().await.unwrap();
+    }
+    for seq in [1, 2] {
+        remote
+            .inner
+            .delete(&journal::entry_key(writer.engine.node(), seq))
+            .await
+            .unwrap();
+    }
+    let reader = proxy(&remote, 2).await;
+    *remote.failing_reads.lock().unwrap() = Some("log/");
+    assert!(reader.engine.sync().await.is_err());
+    *remote.failing_reads.lock().unwrap() = None;
+
+    let report = reader.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, vec![writer.engine.node()]);
+}

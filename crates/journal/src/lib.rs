@@ -325,6 +325,30 @@ impl<R: Remote> Journal<R> {
         self.audit = true;
     }
 
+    /// The HLC of the last entry of the own chain in the remote, read with one LIST and one GET.
+    /// A redacted entry keeps its HLC. `None` for a chain with no entry.
+    pub async fn own_tail_hlc(&self) -> Result<Option<u64>, JournalError> {
+        let prefix = format!("{LOG_PREFIX}{}/", self.node);
+        let last = self
+            .remote
+            .list(&prefix)
+            .await?
+            .iter()
+            .filter_map(|key| key.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .max();
+        let Some(seq) = last else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.remote.get(&entry_key(self.node, seq)).await? else {
+            return Ok(None);
+        };
+        let entry = Entry::from_wire(&bytes, &self.sealer).map_err(|_| JournalError::Chain {
+            node: self.node,
+            source: ChainError::Malformed { seq },
+        })?;
+        Ok(Some(entry.hlc))
+    }
+
     /// The highest seq in the listing of a chain, and an error when the last entry read changed.
     async fn audit_chain(&self, node: NodeId) -> Result<Option<u64>, JournalError> {
         let prefix = format!("{LOG_PREFIX}{node}/");

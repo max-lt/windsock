@@ -387,6 +387,15 @@ impl<R: Remote + 'static> Engine<R> {
             }
         }
 
+        // A lost index, or a new host with this node key, does not know the newest own entry:
+        // the next ack must still rank above it.
+        let tail = engine.journal.lock().await.own_tail_hlc().await?;
+        if let Some(hlc) = tail {
+            engine
+                .clock
+                .witness_at_most(hlc, engine.config.retention.as_nanos() as u64);
+        }
+
         Ok(engine)
     }
 

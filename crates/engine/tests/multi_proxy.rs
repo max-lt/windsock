@@ -765,3 +765,27 @@ async fn test_later_acked_bucket_create_wins_when_the_earlier_one_flushes_last()
         assert_eq!(owner.as_deref(), Some("second"));
     }
 }
+
+/// A proxy acks at an HLC ahead of its wall clock and flushes it, after the last snapshot. Then
+/// it loses its index directory. At open, the snapshot does not hold that entry: the clock must
+/// still pass it, through the tail of the own chain in the remote.
+#[tokio::test]
+async fn test_ack_after_a_lost_index_ranks_above_the_own_entries_after_the_snapshot() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    a.engine.snapshot().await.unwrap();
+    let ahead = now_nanos() + HORIZON.as_nanos() as u64;
+    forged_entry(&remote, 9, ahead, vec![delete("x", ahead)]).await;
+    a.engine.sync().await.unwrap();
+    put(&a.engine, "k", "one").await;
+    a.engine.flush().await.unwrap();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    std::fs::remove_dir_all(dir.path().join("index")).unwrap();
+
+    let a = open_in(&remote, 1, dir).await;
+    put(&a.engine, "k", "two").await;
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
+}

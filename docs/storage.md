@@ -89,8 +89,14 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 
 ## Order of writes
 
-- The versions of one key rank by the HLC of their ack, then by node ID. The last ack wins on
-  every proxy, also when an earlier write reaches the journal after a later one.
+- The versions of one key rank by the HLC of their ack, then by node ID. Every proxy gives the
+  same order, also when an earlier write reaches the journal after a later one.
+- That order is the real-time order of two writes only outside a window. A client writes a key
+  through proxy A, gets the ack, then writes it through proxy B. The second write wins when the
+  time between the two requests is more than the amount by which the clock of A is ahead of the
+  clock of B. It also wins when B synced the entry of the first write before the second ack
+  (flush delay plus sync interval, 1 s + 10 s by default). Inside that window, the first write
+  can win. Through one proxy, the later ack always wins.
 - The ack HLC is max(wall clock, last HLC that the proxy issued or saw) + 1. It never goes down
   on one proxy, also across a restart: at open, the clock passes the last HLC of every chain
   and the latest buffered ack.

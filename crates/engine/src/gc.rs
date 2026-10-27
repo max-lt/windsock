@@ -40,7 +40,7 @@ struct Dead<T> {
 }
 
 impl<R: Sweep + 'static> Engine<R> {
-    /// Runs the GC once. Run it on one proxy only: two runners are safe, but cost twice.
+    /// Runs the GC once. Run it on one proxy only: the model check covers one runner.
     pub async fn gc(&self) -> Result<GcReport> {
         let started = buffer::unix_nanos();
         // A broken chain can hold puts of packs that look dead, and it pins the stable HLC.
@@ -110,7 +110,9 @@ impl<R: Sweep + 'static> Engine<R> {
 
         let interval = self.config.snapshot_interval.as_nanos() as u64;
         let latest = self.latest_snapshot_time().await?;
-        if latest.is_none_or(|time| buffer::unix_nanos() >= time.saturating_add(interval)) {
+        let now = buffer::unix_nanos();
+        // A snapshot time ahead of this clock comes from a clock that is ahead: write anyway.
+        if latest.is_none_or(|time| now >= time.saturating_add(interval) || time > now) {
             self.snapshot().await?;
             report.snapshot_written = true;
         }

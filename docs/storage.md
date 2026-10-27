@@ -123,8 +123,13 @@ The GC:
 - The GC deletes a snapshot when it is older than the snapshot that the same run loaded in full,
   and a newer snapshot is older than the GC horizon. It deletes the head first, then the parts.
 - Parts with no head come from a write that stopped before its head, or from a delete that
-  stopped after it. A load ignores them. The GC deletes them when their write time is older than
-  the GC horizon. Each writer leaves at most one such snapshot in one horizon.
+  stopped after it. A load ignores them. The GC deletes them when its own process has listed them
+  for the GC horizon. The rule uses only the clock of the GC process, not the time in the key. A
+  GC restart starts the count again. Each writer leaves at most one such snapshot in one horizon.
+- After it writes the head, the GC lists the parts again. When a part is gone, the snapshot
+  write fails, and the previous snapshot stays in use.
+- A snapshot key with a time ahead of the GC clock does not stop the GC from writing a new
+  snapshot.
 
 A failed load in the log:
 

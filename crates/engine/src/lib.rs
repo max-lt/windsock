@@ -202,6 +202,8 @@ pub struct Engine<R> {
     flush_wanted: Notify,
     /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
     draining: AtomicBool,
+    /// Snapshot bases with parts and no head, and when this process first listed each one.
+    orphans_seen: Mutex<BTreeMap<String, Instant>>,
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -249,6 +251,7 @@ impl<R: Remote + 'static> Engine<R> {
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
+            orphans_seen: Mutex::new(BTreeMap::new()),
         };
 
         engine.check_repo_key().await?;

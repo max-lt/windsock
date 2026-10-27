@@ -20,6 +20,8 @@ use remote::{Remote, RemoteError, Sweep};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use std::time::Instant;
+
 use crate::{Engine, EngineError, Manifest, Result, buffer};
 
 /// Prefix of all snapshot keys: `snapshots/<unix nanos, 20 digits>-<blake3>`, so list order is time order.
@@ -161,6 +163,16 @@ impl<R: Remote + 'static> Engine<R> {
         let key = format!("{base}{HEAD}");
         let sealed = sealer.seal(seal::Kind::SnapshotHead, key.as_bytes(), &plain);
         self.remote.put(&key, Bytes::from(sealed)).await?;
+
+        // A GC on another proxy can take parts with no head for orphans: check that all stay.
+        let listed = self.remote.list(&format!("{base}/")).await?.len();
+        if listed != head.parts.len() + 1 {
+            return Err(EngineError::Corrupt(format!(
+                "{key}: {} parts written, {} listed after the head",
+                head.parts.len(),
+                listed.saturating_sub(1)
+            )));
+        }
 
         info!(key, parts = head.parts.len(), "wrote a snapshot");
         Ok(key)
@@ -446,36 +458,40 @@ impl<R: Sweep + 'static> Engine<R> {
             deleted += 1;
         }
 
-        deleted += self.delete_parts_with_no_head(&keys, now, horizon).await?;
+        deleted += self.delete_parts_with_no_head(&keys).await?;
         Ok(deleted)
     }
 
-    /// Deletes the parts of a snapshot with no head once its write time is older than H:
-    /// a write that crashed before its head, or a delete that stopped after it.
-    async fn delete_parts_with_no_head(
-        &self,
-        keys: &[String],
-        now: u64,
-        horizon: u64,
-    ) -> Result<usize> {
+    /// Deletes the parts of a snapshot with no head once this process has listed them for H:
+    /// a write that crashed before its head, or a delete that stopped after it. The rule uses
+    /// only the clock of this process, so a writer with another clock keeps its parts for H.
+    async fn delete_parts_with_no_head(&self, keys: &[String]) -> Result<usize> {
         let heads: std::collections::BTreeSet<&str> = keys
             .iter()
             .filter_map(|key| key.strip_suffix(HEAD))
             .collect();
-        let mut orphans = std::collections::BTreeSet::new();
-        for key in keys {
-            let Some((base, _)) = key.rsplit_once('/') else {
-                continue;
-            };
-            let Some((time, _)) = parse_key(base) else {
-                continue;
-            };
-            if !heads.contains(base) && now >= time.saturating_add(horizon) {
-                orphans.insert(base);
-            }
-        }
+        let bases: std::collections::BTreeSet<&str> = keys
+            .iter()
+            .filter_map(|key| key.rsplit_once('/').map(|(base, _)| base))
+            .filter(|base| parse_key(base).is_some() && !heads.contains(base))
+            .collect();
 
-        for base in &orphans {
+        let expired: Vec<String> = {
+            let mut seen = self
+                .orphans_seen
+                .lock()
+                .expect("no panic while the lock is held");
+            seen.retain(|base, _| bases.contains(base.as_str()));
+            for base in &bases {
+                seen.entry(base.to_string()).or_insert_with(Instant::now);
+            }
+            seen.iter()
+                .filter(|(_, first)| first.elapsed() >= self.config.gc_horizon)
+                .map(|(base, _)| base.clone())
+                .collect()
+        };
+
+        for base in &expired {
             for key in keys
                 .iter()
                 .filter(|key| key.starts_with(&format!("{base}/")))
@@ -484,6 +500,10 @@ impl<R: Sweep + 'static> Engine<R> {
             }
             info!(base, "deleted the parts of a snapshot with no head");
         }
-        Ok(orphans.len())
+        self.orphans_seen
+            .lock()
+            .expect("no panic while the lock is held")
+            .retain(|base, _| !expired.contains(base));
+        Ok(expired.len())
     }
 }

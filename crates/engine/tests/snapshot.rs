@@ -934,12 +934,16 @@ async fn test_parts_with_no_head_are_ignored_and_kept_inside_the_horizon() {
     assert!(orphans.iter().all(|key| left.contains(key)), "{left:?}");
 }
 
-/// A GC that dies after it deleted a head, or a crash before the head, leaves parts. The
-/// first GC run after H deletes them.
+/// A GC that dies after it deleted a head, or a crash before the head, leaves parts. A GC run
+/// deletes them once its own process has listed them for H.
 #[tokio::test]
-async fn test_parts_left_by_a_gc_that_died_are_deleted_by_the_next_run() {
+async fn test_parts_left_by_a_gc_that_died_are_deleted_h_after_the_first_listing() {
     let remote = Arc::new(TestRemote::default());
-    let a = proxy_config(&remote, 1, gc_config()).await;
+    let config = Config {
+        gc_horizon: Duration::from_millis(300),
+        ..gc_config()
+    };
+    let a = proxy_config(&remote, 1, config).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     put(&a.engine, "x", "one").await;
     a.engine.flush().await.unwrap();
@@ -947,22 +951,59 @@ async fn test_parts_left_by_a_gc_that_died_are_deleted_by_the_next_run() {
     let old = parts_with_no_head(&remote, now_nanos() - 3_600_000_000_000).await;
 
     a.engine.gc().await.unwrap();
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(
+        old.iter().all(|key| left.contains(key)),
+        "kept at the first listing"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    a.engine.gc().await.unwrap();
 
     let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
     assert!(old.iter().all(|key| !left.contains(key)), "{left:?}");
 }
 
-/// Replaces a snapshot in parts with the same snapshot in one object.
-async fn to_one_object(remote: &TestRemote, head: &str) {
-    let base = head.strip_suffix("/head").unwrap();
-    let mut whole = Vec::new();
-    for key in remote.list(&format!("{base}/")).await.unwrap() {
-        if !key.ends_with("/head") {
-            whole.extend_from_slice(&remote.inner.get(&key).await.unwrap().unwrap());
-        }
-        remote.inner.delete(&key).await.unwrap();
-    }
-    remote.inner.put(base, Bytes::from(whole)).await.unwrap();
+/// A writer with a clock 25 h behind writes parts whose key time is old. A GC on another proxy
+/// must not take them for orphans while the writer can still write its head.
+#[tokio::test]
+async fn test_fresh_parts_with_an_old_key_time_are_kept() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    let behind = parts_with_no_head(&remote, now_nanos() - 25 * 3_600_000_000_000).await;
+
+    a.engine.gc().await.unwrap();
+
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(behind.iter().all(|key| left.contains(key)), "{left:?}");
+}
+
+/// A snapshot key with a time 10 days ahead comes from a clock that is ahead. It must not stop
+/// this GC from writing snapshots.
+#[tokio::test]
+async fn test_snapshot_key_time_in_the_future_does_not_block_new_snapshots() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let ahead = now_nanos() + 10 * 24 * 3_600_000_000_000;
+    let future = format!(
+        "{}{ahead:020}-{}/head",
+        engine::SNAPSHOTS_PREFIX,
+        "cd".repeat(32)
+    );
+    remote
+        .inner
+        .put(&future, Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(report.snapshot_written);
 }
 
 #[tokio::test]
@@ -1076,4 +1117,17 @@ async fn test_gc_keeps_the_older_snapshot_when_the_newer_does_not_load() {
     );
     let b = proxy(&remote, 2).await;
     assert_eq!(get(&b.engine, "x").await, "one");
+}
+
+/// Replaces a snapshot in parts with the same snapshot in one object.
+async fn to_one_object(remote: &TestRemote, head: &str) {
+    let base = head.strip_suffix("/head").unwrap();
+    let mut whole = Vec::new();
+    for key in remote.list(&format!("{base}/")).await.unwrap() {
+        if !key.ends_with("/head") {
+            whole.extend_from_slice(&remote.inner.get(&key).await.unwrap().unwrap());
+        }
+        remote.inner.delete(&key).await.unwrap();
+    }
+    remote.inner.put(base, Bytes::from(whole)).await.unwrap();
 }

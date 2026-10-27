@@ -81,6 +81,11 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
 because the proxy deletes empty segments.
 
+The buffer directory holds a file `format` with the record format (2). A buffer of another
+format stops the start with both numbers: start the build that wrote it and let it flush. If the
+file is empty or does not read, for example after a power loss, and this build wrote the buffer,
+write `2` into it and start again.
+
 If a buffered write is older than `gc.retention_secs - gc.late_margin_secs` when it reaches the
 remote, the proxy does not commit it: a newer delete of the key can be gone. The proxy logs an
 ERROR with the keys and stops its flusher. At the next start, only those writes move to

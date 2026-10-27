@@ -43,27 +43,34 @@ const FORMAT_FILE: &str = "format";
 const INTENT_FILE: &str = "intent";
 const INTENT_TEMP: &str = ".intent.tmp";
 
-/// Refuses a buffer directory of another record format. A buffer with segments and no format
-/// file comes from format 1. An empty directory gets the format of this build.
+/// Refuses a buffer directory of another record format. A directory with segments or an intent
+/// and no format file comes from format 1. An empty directory gets the format of this build,
+/// durable before the first segment exists.
 async fn check_format(dir: &Path, has_segments: bool) -> Result<(), EngineError> {
     let path = dir.join(FORMAT_FILE);
-    let found = match tokio::fs::read_to_string(&path).await {
-        Ok(text) => text.trim().parse::<u32>().unwrap_or(0),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && has_segments => 1,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tokio::fs::write(&path, format!("{FORMAT}\n")).await?;
-            return Ok(());
+    let has_data = has_segments || tokio::fs::try_exists(dir.join(INTENT_FILE)).await?;
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound && has_data => "1".to_string(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return write_durable(dir, &path, format!("{FORMAT}\n").as_bytes()).await;
         }
         Err(e) => return Err(e.into()),
     };
-    if found != FORMAT {
-        return Err(EngineError::Corrupt(format!(
-            "{}: the buffer has record format {found}, this build reads format {FORMAT}. \
-             Flush it with the build that wrote it",
+    match text.trim().parse::<u32>() {
+        Ok(FORMAT) => Ok(()),
+        Ok(found) => Err(EngineError::Corrupt(format!(
+            "{}: the buffer has record format {found}, this build reads format {FORMAT}. Start \
+             the build that wrote it, and let it flush the buffer",
             dir.display()
-        )));
+        ))),
+        Err(_) => Err(EngineError::Corrupt(format!(
+            "{}: the format file does not read. If this build wrote the buffer, write {FORMAT} \
+             into it and start again. If another build wrote it, start that build and let it \
+             flush the buffer",
+            path.display()
+        ))),
     }
-    Ok(())
 }
 
 pub(crate) fn unix_nanos() -> u64 {
@@ -1063,6 +1070,39 @@ mod tests {
             blake3::hash(&bytes).to_string(),
             "16160308b47a1cbf772609dd37102a41263dad1f0d306352d659a7f905102949"
         );
+    }
+
+    #[tokio::test]
+    async fn test_directory_with_only_an_intent_is_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(INTENT_FILE), b"from format 1").unwrap();
+
+        let Err(error) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("a buffer with an old intent and no format file opens");
+        };
+
+        assert!(error.to_string().contains("record format 1"), "{error}");
+        assert!(!dir.path().join(FORMAT_FILE).exists());
+    }
+
+    /// A power loss after the segments and before the format data reached the disk leaves an
+    /// empty format file. The error says what to do.
+    #[tokio::test]
+    async fn test_empty_format_file_names_the_action() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+            buffer.append(put("k", b"v"), b"v").await.unwrap();
+        }
+        std::fs::write(dir.path().join(FORMAT_FILE), b"").unwrap();
+
+        let Err(error) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("a buffer with an empty format file opens");
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("does not read"), "{text}");
+        assert!(text.contains("write 2 into it"), "{text}");
     }
 
     #[tokio::test]

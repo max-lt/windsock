@@ -910,6 +910,10 @@ async fn quarantine_late_until(
                 false => young.extend(bytes),
             }
         }
+        // An empty segment, such as the active one of a past open, holds no boundary.
+        if late.is_empty() && young.is_empty() {
+            continue;
+        }
         if late.is_empty() {
             break;
         }
@@ -1050,6 +1054,24 @@ mod tests {
             assert_eq!(times(&quarantine).await, late, "stop at {stop_at}");
             assert!(moved.len() <= 3, "stop at {stop_at}: {moved:?}");
         }
+    }
+
+    /// An empty segment between late segments, such as the active segment of an earlier open,
+    /// must not stop the move: every late record goes.
+    #[tokio::test]
+    async fn test_quarantine_split_passes_an_empty_segment() {
+        let run = tempfile::tempdir().unwrap();
+        let (dir, quarantine) = (run.path().join("buffer"), run.path().join("quarantine"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(segment_path(&dir, 1), encode_record(&put_at("a", 1), b"a")).unwrap();
+        std::fs::write(segment_path(&dir, 2), b"").unwrap();
+        std::fs::write(segment_path(&dir, 3), encode_record(&put_at("b", 2), b"b")).unwrap();
+        std::fs::write(segment_path(&dir, 4), encode_record(&put_at("c", 10), b"c")).unwrap();
+
+        let moved = quarantine_late(&dir, &quarantine, 5).await.unwrap();
+
+        assert_eq!(moved, ["b/a", "b/b"]);
+        assert_eq!(times(&dir).await, [(10, "b/c".to_string())]);
     }
 
     #[tokio::test]

@@ -114,6 +114,9 @@ fn etag(info: &ObjectInfo) -> String {
 /// The S3 limit on user metadata: names and values of the `x-amz-meta-*` headers together.
 const MAX_USER_METADATA: usize = 2048;
 
+/// The limit on all stored headers, names and values together.
+const MAX_STORED_HEADERS: usize = 8192;
+
 /// Stored headers, and `x-amz-meta-*` headers under their full names.
 fn metadata(headers: &HeaderMap) -> Result<BTreeMap<String, String>, S3Error> {
     let stored: BTreeMap<String, String> = headers
@@ -135,6 +138,17 @@ fn metadata(headers: &HeaderMap) -> Result<BTreeMap<String, String>, S3Error> {
             "MetadataTooLarge",
             StatusCode::BAD_REQUEST,
             format!("user metadata is {user} bytes, more than {MAX_USER_METADATA}"),
+        ));
+    }
+    let all: usize = stored
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if all > MAX_STORED_HEADERS {
+        return Err(S3Error::new(
+            "MetadataTooLarge",
+            StatusCode::BAD_REQUEST,
+            format!("stored headers are {all} bytes, more than {MAX_STORED_HEADERS}"),
         ));
     }
     Ok(stored)

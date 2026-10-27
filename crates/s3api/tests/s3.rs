@@ -1076,6 +1076,26 @@ async fn test_key_longer_than_1024_bytes_is_refused() {
 }
 
 #[tokio::test]
+async fn test_stored_headers_over_8_kib_are_refused() {
+    let server = with_bucket().await;
+
+    let reply = run(
+        &server,
+        call("PUT", "/bkt/a")
+            .header("content-disposition", "x".repeat(100 * 1024))
+            .body("v"),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "MetadataTooLarge");
+    assert_eq!(
+        run(&server, call("GET", "/bkt/a")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
 async fn test_user_metadata_over_2_kib_is_refused() {
     let server = with_bucket().await;
     // The name after x-amz-meta- counts: "a" + value.

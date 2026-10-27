@@ -93,6 +93,7 @@ impl From<EngineError> for S3Error {
             // The buffer drains when the remote comes back: clients back off and retry.
             EngineError::BufferFull { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
             EngineError::ObjectTooLarge { .. } => ("EntityTooLarge", StatusCode::BAD_REQUEST),
+            EngineError::MetadataTooLarge { .. } => ("MetadataTooLarge", StatusCode::BAD_REQUEST),
             // A full local disk frees up when the flusher uploads: clients back off and retry.
             EngineError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {
                 ("SlowDown", StatusCode::SERVICE_UNAVAILABLE)

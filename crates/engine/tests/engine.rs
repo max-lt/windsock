@@ -675,6 +675,32 @@ async fn test_full_buffer_rejects_puts() {
 }
 
 #[tokio::test]
+async fn test_metadata_larger_than_a_record_head_is_refused() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let meta = BTreeMap::from([("content-disposition".to_string(), "x".repeat(100 * 1024))]);
+
+    let result = a
+        .engine
+        .put(
+            BUCKET,
+            "k",
+            Bytes::from_static(b"v"),
+            meta,
+            WriteMode::Overwrite,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(EngineError::MetadataTooLarge { .. })),
+        "{result:?}"
+    );
+    assert_eq!(a.engine.buffered_bytes().await, 0);
+}
+
+#[tokio::test]
 async fn test_object_larger_than_the_buffer_is_refused_for_good() {
     let remote = Arc::new(MemoryRemote::default());
     let config = Config {

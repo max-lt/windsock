@@ -432,6 +432,17 @@ impl Buffer {
             return Err(EngineError::BufferBroken);
         }
 
+        // A head that the replay refuses would block the flush for ever.
+        let head_len = postcard::to_allocvec(&head)
+            .expect("a record head always serializes")
+            .len() as u64;
+        if head_len > u64::from(MAX_HEAD_LEN) {
+            return Err(EngineError::MetadataTooLarge {
+                size: head_len,
+                limit: u64::from(MAX_HEAD_LEN),
+            });
+        }
+
         let record = encode_record(&head, data);
         let data_offset = self.active.len + (record.len() - data.len()) as u64;
 

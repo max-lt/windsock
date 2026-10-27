@@ -89,6 +89,8 @@ pub enum EngineError {
     BufferFull { limit: u64 },
     #[error("the object has {size} bytes, over the limit of {limit} bytes")]
     ObjectTooLarge { size: u64, limit: u64 },
+    #[error("the key and metadata take {size} bytes, over the limit of {limit} bytes")]
+    MetadataTooLarge { size: u64, limit: u64 },
     #[error("the buffer fsync failed, so the write is not stored")]
     WriteLost,
     #[error("the buffer did not recover from a failed fsync. Restart the proxy")]

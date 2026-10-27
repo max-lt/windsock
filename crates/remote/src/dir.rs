@@ -23,7 +23,7 @@ impl DirRemote {
     /// Opens a remote in `root`, and creates the directory if necessary.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, RemoteError> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&root).map_err(|e| at(&root, e.into()))?;
         Ok(Self { root })
     }
 
@@ -31,6 +31,17 @@ impl DirRemote {
         let relative = path.strip_prefix(&self.root).ok()?;
         let segments: Option<Vec<&str>> = relative.iter().map(|s| s.to_str()).collect();
         Some(segments?.join("/"))
+    }
+}
+
+/// An I/O error with the path it concerns.
+fn at(path: &Path, error: RemoteError) -> RemoteError {
+    match error {
+        RemoteError::Io(e) => RemoteError::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        )),
+        other => other,
     }
 }
 
@@ -71,9 +82,8 @@ async fn open_file(path: &Path) -> Result<Option<tokio::fs::File>, RemoteError> 
     }
 }
 
-#[async_trait::async_trait]
-impl Remote for DirRemote {
-    async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+impl DirRemote {
+    async fn put_at(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         check_key(key)?;
         let path = self.root.join(key);
         let tmp = write_temp(&path, &data).await?;
@@ -82,7 +92,7 @@ impl Remote for DirRemote {
         sync_parent(&path).await
     }
 
-    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+    async fn create_at(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         check_key(key)?;
         let path = self.root.join(key);
         let tmp = write_temp(&path, &data).await?;
@@ -100,7 +110,7 @@ impl Remote for DirRemote {
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get_at(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
 
         match tokio::fs::read(self.root.join(key)).await {
@@ -110,7 +120,11 @@ impl Remote for DirRemote {
         }
     }
 
-    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+    async fn get_range_at(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
 
         let Some(mut file) = open_file(&self.root.join(key)).await? else {
@@ -125,7 +139,7 @@ impl Remote for DirRemote {
         Ok(Some(Bytes::from(data)))
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+    async fn list_at(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
         check_prefix(prefix)?;
 
         // Walk only the directory that the prefix names, not the whole remote.
@@ -170,6 +184,36 @@ impl Remote for DirRemote {
 }
 
 #[async_trait::async_trait]
+impl Remote for DirRemote {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        let path = self.root.join(key);
+        self.put_at(key, data).await.map_err(|e| at(&path, e))
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        let path = self.root.join(key);
+        self.create_at(key, data).await.map_err(|e| at(&path, e))
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        let path = self.root.join(key);
+        self.get_at(key).await.map_err(|e| at(&path, e))
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        let path = self.root.join(key);
+        self.get_range_at(key, range)
+            .await
+            .map_err(|e| at(&path, e))
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+        let path = self.root.join(prefix);
+        self.list_at(prefix).await.map_err(|e| at(&path, e))
+    }
+}
+
+#[async_trait::async_trait]
 impl Sweep for DirRemote {
     async fn delete(&self, key: &str) -> Result<(), RemoteError> {
         check_key(key)?;
@@ -180,5 +224,39 @@ impl Sweep for DirRemote {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+        .map_err(|e| at(&path, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_error_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = DirRemote::open(dir.path()).unwrap();
+        remote.put("log/a", Bytes::from_static(b"x")).await.unwrap();
+
+        let error = remote.get("log/a/1").await.unwrap_err().to_string();
+
+        assert!(
+            error.contains(&dir.path().join("log/a/1").display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_open_error_names_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("remote");
+        std::fs::write(&root, "a file").unwrap();
+
+        let Err(error) = DirRemote::open(&root) else {
+            panic!("a file is not a remote root");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains(&root.display().to_string()), "{error}");
     }
 }

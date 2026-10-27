@@ -241,3 +241,39 @@ async fn test_unreadable_snapshot_names_its_key() {
 
     assert!(error.to_string().contains(&key), "{error}");
 }
+
+/// A sync that fails on one chain returns no entry of the chains it read before. The next sync
+/// must read those entries again.
+#[tokio::test]
+async fn test_sync_that_fails_on_one_chain_reads_the_other_chains_again() {
+    let remote = Arc::new(FaultRemote::default());
+    let reader = proxy(&remote, 3).await;
+    let a = proxy(&remote, 1).await;
+    let b = proxy(&remote, 2).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    for (writer, key) in [(&a, "from-a"), (&b, "from-b")] {
+        writer.engine.sync().await.unwrap();
+        let put = writer.engine.put(
+            BUCKET,
+            key,
+            Bytes::from_static(b"v"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        );
+        put.await.unwrap();
+        writer.engine.flush().await.unwrap();
+    }
+    let last = a.engine.node().max(b.engine.node());
+    let prefix: &'static str = format!("log/{last}/").leak();
+    *remote.failing_reads.lock().unwrap() = Some(prefix);
+
+    assert!(reader.engine.sync().await.is_err());
+    *remote.failing_reads.lock().unwrap() = None;
+    reader.engine.sync().await.unwrap();
+
+    for key in ["from-a", "from-b"] {
+        let object = reader.engine.get(BUCKET, key, None).await.unwrap();
+        assert_eq!(&object.data[..], b"v");
+    }
+}

@@ -13,6 +13,15 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     pub(crate) async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
+        let result = self.sync_entries(journal).await;
+        if result.is_err() {
+            // The journal is past entries that the index did not apply: read them again.
+            journal.reset(self.index().frontiers()?);
+        }
+        result
+    }
+
+    async fn sync_entries(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
         let started = Instant::now();
         *self
             .last_sync

@@ -7,8 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 thread_local! {
     /// A wall clock that a test sets on its thread. Zero: the system clock.
     static MANUAL_WALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// The highest manual wall clock so far: a monotonic clock that never steps back.
+    /// The highest manual wall clock so far, less the suspended time: a monotonic clock that
+    /// never steps back and does not count a suspend.
     static MANUAL_MONOTONIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Wall clock time that passed while the host was suspended.
+    static MANUAL_SUSPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Nanoseconds on a clock that never steps back, from an arbitrary start: for elapsed times.
@@ -50,8 +53,19 @@ pub fn wall_clock_nanos() -> u64 {
 #[cfg(feature = "sim")]
 pub fn set_manual_wall(nanos: Option<u64>) {
     MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
-    let nanos = nanos.unwrap_or(0);
-    MANUAL_MONOTONIC.with(|mono| mono.set(mono.get().max(nanos)));
+    let counted = nanos
+        .unwrap_or(0)
+        .saturating_sub(MANUAL_SUSPENDED.with(std::cell::Cell::get));
+    MANUAL_MONOTONIC.with(|mono| mono.set(mono.get().max(counted)));
+}
+
+/// A host suspend of `nanos` on this thread: the manual wall clock moves on, and the monotonic
+/// clock does not, as a monotonic clock of a suspended host or VM. Only with the feature `sim`.
+#[cfg(feature = "sim")]
+pub fn suspend_manual(nanos: u64) {
+    MANUAL_SUSPENDED.with(|suspended| suspended.set(suspended.get() + nanos));
+    let wall = MANUAL_WALL.with(std::cell::Cell::get);
+    set_manual_wall(Some(wall + nanos));
 }
 
 /// The highest HLC that a reader takes now, `ahead` past its wall clock.

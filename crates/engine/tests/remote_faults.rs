@@ -739,3 +739,49 @@ async fn test_failed_starts_never_replace_a_held_quarantine() {
     assert!(targets.contains(&"bkt/a"), "{targets:?}");
     journal::set_manual_wall(None);
 }
+
+/// A suspended host or VM: the wall clock moves H on, and the monotonic clock does not. The GC
+/// measures H on the wall clock, so an old plan is stale by the wall clock too: the flush plans
+/// again instead of a commit of a dedup that can name a deleted pack.
+#[tokio::test]
+async fn test_plan_is_stale_after_a_host_suspend() {
+    let horizon = Duration::from_secs(600);
+    let start = 1_900_000_000_000_000_000;
+    journal::set_manual_wall(Some(start));
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config {
+            gc_horizon: horizon,
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = engine.put(
+        BUCKET,
+        "k",
+        Bytes::from(data()),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::Refuse);
+    assert!(engine.flush().await.is_err());
+
+    journal::suspend_manual(horizon.as_nanos() as u64);
+    engine.flush().await.unwrap();
+
+    assert_eq!(
+        remote.inner.list("packs/").await.unwrap().len(),
+        2,
+        "the plan is stale by the wall clock: the flush planned and uploaded again"
+    );
+    journal::set_manual_wall(None);
+}

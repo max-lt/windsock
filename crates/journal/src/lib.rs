@@ -30,9 +30,9 @@ pub use entry::{
     redact_wire,
 };
 
-#[cfg(feature = "sim")]
-pub use clock::set_manual_wall;
 pub use clock::{HybridClock, monotonic_nanos, wall_clock_nanos};
+#[cfg(feature = "sim")]
+pub use clock::{set_manual_wall, suspend_manual};
 
 /// Appends that lose the seq to another process before `append` gives up.
 const MAX_ATTEMPTS: u32 = 8;

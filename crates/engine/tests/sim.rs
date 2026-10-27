@@ -202,6 +202,7 @@ struct Stats {
     crashes: BTreeSet<Point>,
     lost_index: bool,
     stale_index: bool,
+    suspend: bool,
 }
 
 /// One acked write: its rank and what a reader must see if it wins.
@@ -546,7 +547,14 @@ impl Sim {
             }
             79..=81 => self.crash(i).await?,
             82..=84 => self.crash_in_flush(i).await?,
-            85..=89 => {
+            89 => {
+                // A host suspend: the wall clock moves on, the monotonic clock does not.
+                let pause = self.rng.below(300 * SECOND);
+                journal::suspend_manual(pause);
+                self.now += pause;
+                self.stats.suspend = true;
+            }
+            85..=88 => {
                 // A step of the wall clock, back or ahead, inside the bound R - M.
                 let step = self.rng.below(120 * SECOND);
                 self.now = match self.rng.chance(50) {
@@ -739,6 +747,7 @@ struct Totals {
     held_restart: u64,
     lost_index: u64,
     stale_index: u64,
+    suspend: u64,
     crashes: BTreeMap<Point, u64>,
 }
 
@@ -749,6 +758,7 @@ impl Totals {
         self.held_restart += u64::from(stats.held_restart);
         self.lost_index += u64::from(stats.lost_index);
         self.stale_index += u64::from(stats.stale_index);
+        self.suspend += u64::from(stats.suspend);
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
         }

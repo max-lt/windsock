@@ -104,9 +104,9 @@ impl<R: Remote + 'static> Engine<R> {
         let ours = *self
             .own_plan
             .lock()
-            .expect("no panic while the lock is held")
-            == Some(intent.planned_at);
-        let written = if !ours || self.plan_is_stale(intent.planned_at) {
+            .expect("no panic while the lock is held");
+        let ours = ours.filter(|plan| plan.mono() == intent.planned_at);
+        let written = if ours.is_none_or(|plan| self.plan_is_stale(plan)) {
             journal.is_written(&intent.entry).await?
         } else {
             journal.commit(&intent.entry).await? == Commit::Written
@@ -146,7 +146,7 @@ impl<R: Remote + 'static> Engine<R> {
         }
         let dedup = self.ensure_fresh_sync().await?;
         // A local elapsed time: a wall clock step must not make an old plan look young.
-        let planned_at = journal::monotonic_nanos();
+        let planned_at = Stamp::now();
         let seed = blake3::Hasher::new()
             .update(self.node.as_bytes())
             .update(&buffer::unix_nanos().to_le_bytes())
@@ -354,7 +354,7 @@ impl<R: Remote + 'static> Engine<R> {
         journal: &mut Journal<R>,
         actions: Vec<Action>,
         segments: &[u64],
-        planned_at: u64,
+        planned_at: Stamp,
     ) -> Result<Entry> {
         for _ in 0..MAX_COMMIT_ATTEMPTS {
             // GC rule 2: a dedup decision older than H/2 can name a pack that the GC deleted.
@@ -366,7 +366,7 @@ impl<R: Remote + 'static> Engine<R> {
             let intent = Intent {
                 entry: journal.prepare(actions.clone(), seen)?,
                 segments: segments.to_vec(),
-                planned_at,
+                planned_at: planned_at.mono(),
             };
             self.refuse_late(&intent.entry, intent.entry.hlc)?;
             *self

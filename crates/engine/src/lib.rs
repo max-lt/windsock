@@ -227,9 +227,9 @@ pub struct Engine<R> {
     /// Monotonic nanoseconds at the start of the last sync.
     last_sync: Mutex<Option<u64>>,
     /// Start of the last sync that succeeded: GC rule 1 for dedup.
-    fresh_sync: Mutex<Option<u64>>,
+    fresh_sync: Mutex<Option<Stamp>>,
     /// The plan time of the last intent that this process wrote.
-    own_plan: Mutex<Option<u64>>,
+    own_plan: Mutex<Option<Stamp>>,
     flush_wanted: Notify,
     /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
     draining: AtomicBool,
@@ -292,6 +292,34 @@ fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A time on both clocks. The GC measures H on the wall clock, and a monotonic clock does not
+/// count a host suspend, so an age is the larger of the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    mono: u64,
+    wall: u64,
+}
+
+impl Stamp {
+    pub(crate) fn now() -> Self {
+        Self {
+            mono: journal::monotonic_nanos(),
+            wall: buffer::unix_nanos(),
+        }
+    }
+
+    pub(crate) fn mono(&self) -> u64 {
+        self.mono
+    }
+
+    /// True when `age` passed since this stamp, on either clock.
+    pub(crate) fn older_than(&self, age: Duration) -> bool {
+        let age = age.as_nanos() as u64;
+        let now = Self::now();
+        now.mono.saturating_sub(self.mono) >= age || now.wall.saturating_sub(self.wall) >= age
+    }
 }
 
 /// The rules that every proxy of one remote must share, kept in the key check.

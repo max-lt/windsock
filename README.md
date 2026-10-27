@@ -81,6 +81,11 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
 because the proxy deletes empty segments.
 
+If a buffered write is older than max(`gc.retention_secs`, `gc.horizon_secs`) when it reaches the
+remote, the proxy does not commit it: a newer delete of the key can be gone. At the next start
+the buffer moves to `data/engine/quarantine` and the start fails. Move that directory away to
+drop those writes. `docs/storage.md` (Order of writes) gives the details.
+
 If the chunk cache disk is full or cannot be written, the proxy logs `cache writes fail, reads go to
 the remote` once, and `cache writes work again` when a write works. Reads go on from the remote.
 

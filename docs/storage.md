@@ -87,6 +87,33 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - A wait for a slot does not count in the time of an attempt, but it ends at the time limit of
   the call (120 s). A call frees its slot during the pause between attempts.
 
+## Order of writes
+
+- The versions of one key rank by the HLC of their ack, then by node ID. The last ack wins on
+  every proxy, also when an earlier write reaches the journal after a later one.
+- The ack HLC is max(wall clock, last HLC that the proxy issued or saw) + 1. It never goes down
+  on one proxy, also across a restart: at open, the clock passes the last HLC of every chain
+  and the latest buffered ack.
+- An entry HLC is at or above every ack HLC in the entry. A reader refuses an entry that breaks
+  this rule, and names the node and the seq.
+- Last-Modified is the ack HLC. It does not change at the flush.
+- Format markers: `repo/key-check` holds the remote format, `data/engine/buffer/format` the
+  buffer format, the local index a format key, and each snapshot a format byte. This build
+  writes and reads format 2 only. An older format stops the open with an error that names both
+  formats.
+
+Late writes. A buffered write can reach the journal long after its ack, for example after a
+restart or a long remote outage. A prune can then have removed a newer delete of its key, and a
+commit would bring the key back. The rule: a proxy never commits a write whose ack HLC is older
+than the late limit, max(R, H) (24 h by default).
+
+- At a flush, such a write stops the flush. The proxy logs `ERROR buffered writes older than the
+late limit` with each key, and refuses writes until a restart.
+- At open, the proxy moves a buffer with such a write to `data/engine/quarantine`, and the open
+  fails. While that directory holds files, the proxy does not start.
+- The operator decides. To drop the writes, move the directory away. To keep them, read the
+  records with the build that wrote them, and write the objects again through the S3 API.
+
 ## Journal reads
 
 Each sync lists the node markers once, then reads each chain from the seq after the last one it

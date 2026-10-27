@@ -87,6 +87,37 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - A wait for a slot does not count in the time of an attempt, but it ends at the time limit of
   the call (120 s). A call frees its slot during the pause between attempts.
 
+## Journal reads
+
+Each sync lists the node markers once, then reads each chain from the seq after the last one it
+read.
+
+| When                        | For each chain                                             | Once          |
+| --------------------------- | ---------------------------------------------------------- | ------------- |
+| Each sync, no new entry     | 2 GET (the next seq, and the seq after it)                 | 1 LIST nodes/ |
+| Each sync, k new entries    | k + 2 GET                                                  | 1 LIST nodes/ |
+| First sync, and each GC run | also 1 LIST `log/<node>/` and 1 GET of the last entry read |               |
+
+With the default sync interval (10 s), an idle chain costs 720 GET in one hour, and the node
+markers cost 360 LIST. The GC run (1 h by default) adds 1 LIST and 1 GET for each chain.
+
+A chain is broken, and the GC refuses to run, when:
+
+- an entry does not verify: signature, hash, node, seq, link, or actions;
+- seq n is missing and seq n + 1 exists (each sync);
+- the listing holds a seq at or above the next seq after the read (first sync and each GC run):
+  a gap of any length;
+- the last entry read differs from the copy read before, or is gone (first sync and each GC run).
+
+The sync report and the log give the node, the seq and the cause. A node with no marker is found
+through the `seen` links of other entries.
+
+Known limit: a remote that drops the newest entries of a chain (a cut tail) looks like a chain
+with fewer entries. No reader can tell. The next commit of the writer goes after the cut, so the
+cut becomes a gap that the readers find at the first sync after open or at the next GC run. A
+writer that never commits again leaves the cut unseen. To check by hand, compare the highest seq
+under `log/<node>/` with the last `flushed seq=` line of that writer (log level debug).
+
 ## One GC runner
 
 One process per remote runs the GC (`gc.enabled = true`). No lock enforces this, and the model

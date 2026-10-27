@@ -20,8 +20,6 @@ use remote::{Remote, RemoteError, Sweep};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use std::time::Instant;
-
 use crate::{Engine, EngineError, Manifest, Result, buffer};
 
 /// Prefix of all snapshot keys: `snapshots/<unix nanos, 20 digits>-<blake3>`, so list order is time order.
@@ -119,6 +117,27 @@ impl std::fmt::Display for NoSnapshot {
             return f.write_str("no snapshot in the remote");
         }
         write!(f, "no snapshot loads: {}", self.0.join("; "))
+    }
+}
+
+/// The first-listing times of orphan parts that an earlier process kept. A bad file starts empty.
+pub(crate) fn read_orphans(path: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return std::collections::BTreeMap::new();
+    };
+    postcard::from_bytes(&bytes).unwrap_or_else(|e| {
+        warn!(path = %path.display(), %e, "orphan part times do not read: count again");
+        std::collections::BTreeMap::new()
+    })
+}
+
+/// Keeps the first-listing times for the next process. A failure only delays a delete.
+fn write_orphans(path: &std::path::Path, seen: &std::collections::BTreeMap<String, u64>) {
+    let bytes = postcard::to_allocvec(seen).expect("a map of strings and numbers serializes");
+    let tmp = path.with_extension("tmp");
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        warn!(path = %path.display(), %e, "orphan part times are not kept");
     }
 }
 
@@ -469,9 +488,9 @@ impl<R: Sweep + 'static> Engine<R> {
         Ok(deleted)
     }
 
-    /// Deletes the parts of a snapshot with no head once this process has listed them for H:
-    /// a write that crashed before its head, or a delete that stopped after it. The rule uses
-    /// only the clock of this process, so a writer with another clock keeps its parts for H.
+    /// Deletes the parts of a snapshot with no head once this node has listed them for H: a
+    /// write that crashed before its head, or a delete that stopped after it. The rule uses only
+    /// the clock of this node, so a writer with another clock keeps its parts for H.
     async fn delete_parts_with_no_head(&self, keys: &[String]) -> Result<usize> {
         let heads: std::collections::BTreeSet<&str> = keys
             .iter()
@@ -482,6 +501,8 @@ impl<R: Sweep + 'static> Engine<R> {
             .filter_map(|key| key.rsplit_once('/').map(|(base, _)| base))
             .filter(|base| parse_key(base).is_some() && !heads.contains(base))
             .collect();
+        let now = buffer::unix_nanos();
+        let horizon = self.config.gc_horizon.as_nanos() as u64;
 
         let expired: Vec<String> = {
             let mut seen = self
@@ -490,10 +511,11 @@ impl<R: Sweep + 'static> Engine<R> {
                 .expect("no panic while the lock is held");
             seen.retain(|base, _| bases.contains(base.as_str()));
             for base in &bases {
-                seen.entry(base.to_string()).or_insert_with(Instant::now);
+                seen.entry(base.to_string()).or_insert(now);
             }
+            write_orphans(&self.orphans_file, &seen);
             seen.iter()
-                .filter(|(_, first)| first.elapsed() >= self.config.gc_horizon)
+                .filter(|(_, first)| now >= first.saturating_add(horizon))
                 .map(|(base, _)| base.clone())
                 .collect()
         };
@@ -507,10 +529,12 @@ impl<R: Sweep + 'static> Engine<R> {
             }
             info!(base, "deleted the parts of a snapshot with no head");
         }
-        self.orphans_seen
+        let mut seen = self
+            .orphans_seen
             .lock()
-            .expect("no panic while the lock is held")
-            .retain(|base, _| !expired.contains(base));
+            .expect("no panic while the lock is held");
+        seen.retain(|base, _| !expired.contains(base));
+        write_orphans(&self.orphans_file, &seen);
         Ok(expired.len())
     }
 }

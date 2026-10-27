@@ -54,6 +54,7 @@ pub const PACKS_PREFIX: &str = "packs/";
 
 const INDEX_DIR: &str = "index";
 const BUFFER_DIR: &str = "buffer";
+const ORPHANS_FILE: &str = "snapshot-orphans";
 const CACHE_DIR: &str = "cache";
 
 /// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
@@ -208,8 +209,10 @@ pub struct Engine<R> {
     flush_wanted: Notify,
     /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
     draining: AtomicBool,
-    /// Snapshot bases with parts and no head, and when this process first listed each one.
-    orphans_seen: Mutex<BTreeMap<String, Instant>>,
+    /// Snapshot bases with parts and no head, and when this node first listed each one
+    /// (unix nanos of this node). Kept in `orphans_file`, so a restart keeps the count.
+    orphans_seen: Mutex<BTreeMap<String, u64>>,
+    orphans_file: PathBuf,
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -257,7 +260,8 @@ impl<R: Remote + 'static> Engine<R> {
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
-            orphans_seen: Mutex::new(BTreeMap::new()),
+            orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
+            orphans_file: dir.join(ORPHANS_FILE),
         };
 
         engine.check_repo_key().await?;

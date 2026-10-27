@@ -1186,3 +1186,38 @@ async fn test_part_larger_than_the_head_says_is_not_read() {
     let reads = remote.snapshot_ranges.load(Ordering::SeqCst);
     assert!(reads < 50, "{reads} ranged reads");
 }
+
+/// The first listing of orphan parts survives a restart: a GC process that lives less than H
+/// still deletes them.
+#[tokio::test]
+async fn test_orphan_count_survives_a_restart() {
+    let remote = Arc::new(TestRemote::default());
+    let config = Config {
+        gc_horizon: Duration::from_millis(300),
+        ..gc_config()
+    };
+    let a = proxy_config(&remote, 1, config.clone()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    let orphans = parts_with_no_head(&remote, now_nanos()).await;
+    a.engine.gc().await.unwrap();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await
+    .unwrap();
+    engine.gc().await.unwrap();
+
+    let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(orphans.iter().all(|key| !left.contains(key)), "{left:?}");
+}

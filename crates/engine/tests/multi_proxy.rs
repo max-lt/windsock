@@ -322,3 +322,93 @@ async fn test_chain_with_a_gap_is_broken_alone() {
         Err(EngineError::BrokenChains(_))
     ));
 }
+
+/// Puts k0..k(n-1) on a new proxy 1, in one entry each, after proxy 2 made the bucket.
+async fn chain_of(remote: &Arc<MemoryRemote>, n: usize) -> (Proxy, Proxy) {
+    let a = proxy(remote, 1).await;
+    let b = proxy(remote, 2).await;
+    b.engine.create_bucket(BUCKET, None).await.unwrap();
+    b.engine.flush().await.unwrap();
+    a.engine.sync().await.unwrap();
+    for i in 0..n {
+        put(&a.engine, &format!("k{i}"), "a").await;
+        a.engine.flush().await.unwrap();
+    }
+    (a, b)
+}
+
+/// A gap of two entries: the probe of the next seq does not see it, the listing at open does.
+#[tokio::test]
+async fn test_gap_of_two_entries_is_found_by_the_listing_at_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, _b) = chain_of(&remote, 4).await;
+    for seq in [1, 2] {
+        remote
+            .delete(&journal::entry_key(a.engine.node(), seq))
+            .await
+            .unwrap();
+    }
+
+    let c = proxy(&remote, 3).await;
+    let report = c.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, vec![a.engine.node()]);
+    assert!(matches!(
+        c.engine.gc().await,
+        Err(EngineError::BrokenChains(_))
+    ));
+}
+
+/// A gap that appears after a proxy read the chain is found at the next GC run.
+#[tokio::test]
+async fn test_gap_of_two_entries_is_found_by_the_listing_at_the_gc() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = chain_of(&remote, 1).await;
+    b.engine.sync().await.unwrap();
+    for i in 1..4 {
+        put(&a.engine, &format!("k{i}"), "a").await;
+        a.engine.flush().await.unwrap();
+    }
+    for seq in [1, 2] {
+        remote
+            .delete(&journal::entry_key(a.engine.node(), seq))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        b.engine.sync().await.unwrap().broken.is_empty(),
+        "no list at a sync"
+    );
+    let error = b.engine.gc().await.unwrap_err();
+
+    assert!(matches!(error, EngineError::BrokenChains(ref nodes) if nodes == &[a.engine.node()]));
+}
+
+/// The remote gives a changed copy of an entry that a proxy read. The GC run names the chain.
+#[tokio::test]
+async fn test_changed_copy_of_a_read_entry_is_found_at_the_gc() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = chain_of(&remote, 2).await;
+    b.engine.sync().await.unwrap();
+    let last = journal::entry_key(a.engine.node(), 1);
+    let read =
+        Entry::from_wire(&remote.get(&last).await.unwrap().unwrap(), keys().sealer()).unwrap();
+    let changed = Entry::sign(
+        &SigningKey::from_bytes(&[1; 32]),
+        1,
+        read.prev,
+        read.hlc,
+        read.seen.clone(),
+        vec![delete("k0")],
+        keys().sealer(),
+    );
+    remote
+        .put(&last, Bytes::from(changed.to_wire()))
+        .await
+        .unwrap();
+
+    let error = b.engine.gc().await.unwrap_err();
+
+    assert!(matches!(error, EngineError::BrokenChains(ref nodes) if nodes == &[a.engine.node()]));
+}

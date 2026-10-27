@@ -84,6 +84,8 @@ pub struct Journal<R> {
     /// Chains that the last sync found broken. The other chains go on.
     broken: BTreeMap<NodeId, ChainError>,
     registered: bool,
+    /// The next sync lists each chain and reads its last entry again.
+    audit: bool,
 }
 
 impl<R: Remote> Journal<R> {
@@ -109,6 +111,7 @@ impl<R: Remote> Journal<R> {
             stashed: Vec::new(),
             broken: BTreeMap::new(),
             registered: false,
+            audit: true,
         }
     }
 
@@ -237,8 +240,13 @@ impl<R: Remote> Journal<R> {
             let Some(bytes) = self.remote.get(&key).await? else {
                 // A writer creates seq n before n + 1: a later entry with no entry here is a gap,
                 // and the chain would end here for this reader only.
-                let next = entry_key(node, frontier.next_seq + 1);
-                if self.remote.get(&next).await?.is_some() {
+                let next = frontier
+                    .next_seq
+                    .checked_add(1)
+                    .map(|seq| entry_key(node, seq));
+                if let Some(next) = next
+                    && self.remote.get(&next).await?.is_some()
+                {
                     return Err(JournalError::Chain {
                         node,
                         source: ChainError::Gap {
@@ -279,6 +287,41 @@ impl<R: Remote> Journal<R> {
         &self.broken
     }
 
+    /// Makes the next sync check each chain against a listing. It finds a gap of any length and
+    /// a changed copy of the last entry read. It costs one LIST and one GET per chain.
+    pub fn audit_next_sync(&mut self) {
+        self.audit = true;
+    }
+
+    /// The highest seq in the listing of a chain, and an error when the last entry read changed.
+    async fn audit_chain(&self, node: NodeId) -> Result<Option<u64>, JournalError> {
+        let prefix = format!("{LOG_PREFIX}{node}/");
+        let highest = self
+            .remote
+            .list(&prefix)
+            .await?
+            .iter()
+            .filter_map(|key| key.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .max();
+
+        let frontier = self.frontier(node);
+        let Some(last) = frontier.next_seq.checked_sub(1) else {
+            return Ok(highest);
+        };
+        let same = match self.remote.get(&entry_key(node, last)).await? {
+            Some(bytes) => Entry::from_wire(&bytes, &self.sealer)
+                .is_ok_and(|entry| entry.hash() == frontier.last_hash),
+            None => false,
+        };
+        if !same {
+            return Err(JournalError::Chain {
+                node,
+                source: ChainError::Changed { seq: last },
+            });
+        }
+        Ok(highest)
+    }
+
     /// Reads again from `frontiers`, as after a snapshot load.
     pub fn reset(&mut self, frontiers: Frontiers) {
         self.frontiers = frontiers;
@@ -303,12 +346,32 @@ impl<R: Remote> Journal<R> {
         }
 
         let mut entries = self.take_stashed();
+        let audit = std::mem::take(&mut self.audit);
 
         for node in nodes {
-            match self.sync_node(node).await {
-                Ok(read) => {
-                    self.broken.remove(&node);
+            // The listing comes first: each entry in it exists before the reads below.
+            let highest = match audit {
+                true => self.audit_chain(node).await,
+                false => Ok(None),
+            };
+            let result = match highest {
+                Ok(highest) => self.sync_node(node).await.map(|read| (highest, read)),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((highest, read)) => {
                     entries.extend(read);
+                    let next = self.frontier(node).next_seq;
+                    match highest {
+                        Some(seq) if seq >= next => {
+                            let source = ChainError::Gap { seq: next };
+                            warn!(%node, %source, "chain is broken: the other chains go on");
+                            self.broken.insert(node, source);
+                        }
+                        _ => {
+                            self.broken.remove(&node);
+                        }
+                    }
                 }
                 // One bad chain must not stop the sync of every chain.
                 Err(JournalError::Chain { node, source }) => {

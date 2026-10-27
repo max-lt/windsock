@@ -97,8 +97,10 @@ pub enum ChainError {
     ActionsMismatch { seq: u64 },
     #[error("the actions of entry {seq} do not open: another repository key, or changed bytes")]
     Sealed { seq: u64 },
-    #[error("entry {seq} is missing and entry {} exists", seq + 1)]
+    #[error("entry {seq} is missing and a later entry exists")]
     Gap { seq: u64 },
+    #[error("entry {seq} differs from the copy that this proxy read before, or is gone")]
+    Changed { seq: u64 },
 }
 
 #[cfg(test)]

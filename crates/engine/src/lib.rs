@@ -60,6 +60,8 @@ const CACHE_DIR: &str = "cache";
 /// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
 pub const KEY_CHECK_KEY: &str = "repo/key-check";
 const KEY_CHECK: &str = "windsock repository key check";
+/// The remote format of this build: journal actions carry their ack HLC.
+const REMOTE_FORMAT: u32 = 2;
 
 pub fn pack_key(id: PackId) -> String {
     format!("{PACKS_PREFIX}{id}")
@@ -299,11 +301,8 @@ impl<R: Remote + 'static> Engine<R> {
     /// another key would write a chain that the other proxies cannot read.
     async fn check_repo_key(&self) -> Result<()> {
         let sealer = self.keys.sealer();
-        let check = sealer.seal(
-            seal::Kind::KeyCheck,
-            KEY_CHECK.as_bytes(),
-            KEY_CHECK.as_bytes(),
-        );
+        let text = format!("{KEY_CHECK}\nformat {REMOTE_FORMAT}");
+        let check = sealer.seal(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), text.as_bytes());
 
         // A journal with no key check is not encrypted, or another tool wrote it.
         if self.remote.get(KEY_CHECK_KEY).await?.is_none()
@@ -326,11 +325,26 @@ impl<R: Remote + 'static> Engine<R> {
                 "{KEY_CHECK_KEY} is gone"
             )));
         };
-        match sealer.open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored) {
-            // The AEAD tag proves the key: the text is public and needs no check.
-            Ok(_) => Ok(()),
-            Err(e) => Err(EngineError::WrongRepoKey(e.to_string())),
+        // The AEAD tag proves the key. The text gives the format.
+        let plain = sealer
+            .open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored)
+            .map_err(|e| EngineError::WrongRepoKey(e.to_string()))?;
+        let found = match std::str::from_utf8(&plain) {
+            Ok(KEY_CHECK) => 1,
+            Ok(text) => text
+                .strip_prefix(KEY_CHECK)
+                .and_then(|rest| rest.strip_prefix("\nformat "))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if found != REMOTE_FORMAT {
+            return Err(EngineError::Corrupt(format!(
+                "{KEY_CHECK_KEY}: the remote has format {found}, this build reads format \
+                 {REMOTE_FORMAT}"
+            )));
         }
+        Ok(())
     }
 
     pub fn node(&self) -> NodeId {

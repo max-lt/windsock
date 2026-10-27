@@ -31,6 +31,12 @@ pub enum IndexError {
     LinkMismatch { node: NodeId, seq: u64 },
     #[error("entry {seq} of node {node} is redacted: load a snapshot that covers it")]
     Redacted { node: NodeId, seq: u64 },
+    #[error("the {what} has format {found}, this build reads format {expected}")]
+    Format {
+        what: &'static str,
+        found: u32,
+        expected: u32,
+    },
 }
 
 type Result<T> = std::result::Result<T, IndexError>;
@@ -109,6 +115,10 @@ fn object_key(bucket: &str, key: &str) -> Vec<u8> {
     out
 }
 
+/// The state format of this build: versions ordered by their ack HLC.
+const FORMAT: u32 = 2;
+const FORMAT_KEY: &str = "format";
+
 impl Index {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::builder(path).open()?;
@@ -123,8 +133,27 @@ impl Index {
     }
 
     fn with_database(db: Database, temp: Option<tempfile::TempDir>) -> Result<Self> {
+        let meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
+        let frontiers = db.keyspace("frontiers", KeyspaceCreateOptions::default)?;
+        let found = match meta.get(FORMAT_KEY)? {
+            Some(value) => postcard::from_bytes(&value)?,
+            // An index with state and no format key comes from format 1.
+            None if !frontiers.is_empty()? => 1,
+            None => {
+                meta.insert(FORMAT_KEY, encode(&FORMAT))?;
+                FORMAT
+            }
+        };
+        if found != FORMAT {
+            return Err(IndexError::Format {
+                what: "local index",
+                found,
+                expected: FORMAT,
+            });
+        }
+
         Ok(Self {
-            frontiers: db.keyspace("frontiers", KeyspaceCreateOptions::default)?,
+            frontiers,
             entries: db.keyspace("entries", KeyspaceCreateOptions::default)?,
             objects: db.keyspace("objects", KeyspaceCreateOptions::default)?,
             buckets: db.keyspace("buckets", KeyspaceCreateOptions::default)?,
@@ -271,10 +300,13 @@ impl Index {
                     bucket,
                     key,
                     manifest_id,
+                    hlc,
                     ..
-                } => self.record_version(&mut batch, entry, bucket, key, Some(*manifest_id))?,
-                Action::Delete { bucket, key, .. } => {
-                    self.record_version(&mut batch, entry, bucket, key, None)?
+                } => {
+                    self.record_version(&mut batch, entry, *hlc, bucket, key, Some(*manifest_id))?
+                }
+                Action::Delete { bucket, key, hlc } => {
+                    self.record_version(&mut batch, entry, *hlc, bucket, key, None)?
                 }
                 Action::CreateBucket { bucket, owner } => {
                     self.record_bucket(&mut batch, entry, bucket, Some(owner.clone()))?
@@ -312,6 +344,7 @@ impl Index {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         entry: &Entry,
+        hlc: u64,
         bucket: &str,
         key: &str,
         manifest_id: Option<ObjectId>,
@@ -319,7 +352,7 @@ impl Index {
         let storage_key = object_key(bucket, key);
         let mut state = self.object(bucket, key)?.unwrap_or_default();
 
-        if state.record(entry, manifest_id) {
+        if state.record(entry, hlc, manifest_id) {
             batch.insert(&self.objects, storage_key, encode(&state));
         }
 
@@ -707,6 +740,16 @@ mod tests {
         }]
     }
 
+    fn put_at(key: &str, n: u8, hlc: u64) -> Action {
+        Action::Put {
+            bucket: "b".into(),
+            key: key.into(),
+            manifest_id: manifest(n),
+            inline_manifest: None,
+            hlc,
+        }
+    }
+
     fn create_bucket(name: &str) -> Vec<Action> {
         vec![Action::CreateBucket {
             bucket: name.into(),
@@ -917,7 +960,7 @@ mod tests {
             vec![Action::Delete {
                 bucket: "b".into(),
                 key: "k".into(),
-                hlc: 1,
+                hlc: ack(),
             }],
             Seen::new(),
         )
@@ -1179,12 +1222,12 @@ mod tests {
     fn test_prune_versions_removes_keys_deleted_long_ago() {
         let mut index = Index::open_temporary().unwrap();
         let actions = vec![
-            put("gone", 1).remove(0),
-            put("kept", 2).remove(0),
+            put_at("gone", 1, 7),
+            put_at("kept", 2, 8),
             Action::Delete {
                 bucket: "b".into(),
                 key: "gone".into(),
-                hlc: 1,
+                hlc: 9,
             },
         ];
         let first = Entry::sign(
@@ -1202,7 +1245,7 @@ mod tests {
             first.hash(),
             20,
             Seen::new(),
-            put("kept", 5),
+            vec![put_at("kept", 5, 19)],
             &test_sealer(),
         );
         index.apply(vec![first, rewrite]).unwrap();
@@ -1216,6 +1259,54 @@ mod tests {
         );
         assert_eq!(index.resolve("b", "kept").unwrap(), Some(manifest(5)));
         assert_eq!(index.prune_versions(15).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_index_of_another_format_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Database::builder(dir.path()).open().unwrap();
+            let frontiers = db
+                .keyspace("frontiers", KeyspaceCreateOptions::default)
+                .unwrap();
+            frontiers
+                .insert([1u8; 32], encode(&Frontier::GENESIS))
+                .unwrap();
+        }
+
+        let result = Index::open(dir.path());
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexError::Format {
+                    found: 1,
+                    expected: 2,
+                    ..
+                })
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_of_another_format_is_refused() {
+        let mut bytes = Snapshot {
+            frontiers: Frontiers::new(),
+            objects: Vec::new(),
+            buckets: Vec::new(),
+            condemned: Vec::new(),
+            manifests: Vec::new(),
+        }
+        .encode();
+        bytes[0] = 1;
+
+        let result = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes);
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("snapshot has format 1"), "{error}");
+        assert!(error.contains("reads format 2"), "{error}");
     }
 
     /// A redacted entry has no actions: applying it as empty would lose them silently.
@@ -1244,7 +1335,7 @@ mod tests {
         let delete = vec![Action::Delete {
             bucket: "b".into(),
             key: "x".into(),
-            hlc: 1,
+            hlc: ack(),
         }];
         entries.push(a.append(delete, Seen::new()).await.unwrap());
         let condemn = vec![Action::Condemn {
@@ -1278,7 +1369,7 @@ mod tests {
 
         assert_eq!(
             blake3::hash(&snapshot.encode()).to_string(),
-            "9c6fbf9848442f5b3fbf82aec4b65a4452a57651382f53a7ca8836475899a2b1"
+            "e977526ccc015083bdce4f0e7b7101a7b68e38f3f83f681251e6945eb4824f85"
         );
     }
 

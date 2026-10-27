@@ -1,7 +1,8 @@
 //! Per-key and per-bucket state, and the rules that merge entries into it. No I/O.
 //!
-//! One key keeps every version it received, ordered by (hlc, node): the first
-//! one is what a reader sees. The state is a function of the set of versions,
+//! One key keeps every version it received, ordered by (ack hlc, node): the
+//! first one is what a reader sees. The ack HLC is the HLC of the put or delete
+//! at its ack, not the HLC of the entry that carried it to the journal. The state is a function of the set of versions,
 //! so every proxy reaches the same state whatever the order of application.
 
 use journal::{Entry, Seen};
@@ -37,6 +38,7 @@ pub fn knew(from: EntryRef, seen: &Seen, target: EntryRef) -> bool {
 /// One write to a key. `manifest_id` is `None` for a delete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
+    /// HLC of the ack.
     pub hlc: u64,
     pub node: NodeId,
     pub seq: u64,
@@ -53,7 +55,7 @@ impl Version {
         }
     }
 
-    /// Last writer wins. The HLC rises along a chain, so (hlc, node) is unique.
+    /// Last ack wins. The acks of one node have rising HLCs, so (hlc, node) is unique.
     fn rank(&self) -> (u64, NodeId) {
         (self.hlc, self.node)
     }
@@ -77,21 +79,18 @@ impl ObjectState {
         self.head().and_then(|v| v.manifest_id)
     }
 
-    /// Records the version that `entry` writes. Returns `false` when it was already recorded.
-    pub fn record(&mut self, entry: &Entry, manifest_id: Option<ObjectId>) -> bool {
+    /// Records the version that `entry` writes, acked at `hlc`. Returns `false` when it was
+    /// already recorded. One entry can hold several writes to one key.
+    pub fn record(&mut self, entry: &Entry, hlc: u64, manifest_id: Option<ObjectId>) -> bool {
         let version = Version {
-            hlc: entry.hlc,
+            hlc,
             node: entry.node,
             seq: entry.seq,
             manifest_id,
             seen: entry.seen.clone(),
         };
 
-        if self
-            .versions
-            .iter()
-            .any(|v| v.entry_ref() == version.entry_ref())
-        {
+        if self.versions.iter().any(|v| v.rank() == version.rank()) {
             return false;
         }
 
@@ -108,8 +107,10 @@ impl ObjectState {
             return Vec::new();
         };
 
+        // The head writer knew its own earlier acks, in its entry or before it.
         self.versions[1..]
             .iter()
+            .filter(|other| other.node != head.node || other.hlc > head.hlc)
             .map(Version::entry_ref)
             .filter(|other| !knew(head.entry_ref(), &head.seen, *other))
             .collect()
@@ -257,7 +258,7 @@ mod tests {
             let mut state = ObjectState::default();
             for i in 0..entries.len() {
                 let e = &entries[(start + i) % entries.len()];
-                state.record(e, Some(manifest(e.node.as_bytes()[0])));
+                state.record(e, e.hlc, Some(manifest(e.node.as_bytes()[0])));
             }
             states.push(state);
         }
@@ -283,8 +284,8 @@ mod tests {
         let a = entry(1, 0, 10, Seen::new());
         let b = entry(2, 0, 20, Seen::new());
         let mut state = ObjectState::default();
-        state.record(&a, Some(manifest(1)));
-        state.record(&b, Some(manifest(2)));
+        state.record(&a, a.hlc, Some(manifest(1)));
+        state.record(&b, b.hlc, Some(manifest(2)));
 
         assert_eq!(state.conflicts(), vec![EntryRef::of(&a)]);
         assert_eq!(
@@ -299,8 +300,8 @@ mod tests {
         let a = entry(1, 0, 10, Seen::new());
         let b = entry(2, 0, 20, Seen::from([link(1, 0)]));
         let mut state = ObjectState::default();
-        state.record(&b, Some(manifest(2)));
-        state.record(&a, Some(manifest(1)));
+        state.record(&b, b.hlc, Some(manifest(2)));
+        state.record(&a, a.hlc, Some(manifest(1)));
 
         assert!(!state.is_conflicted());
         assert_eq!(state.current(), Some(manifest(2)));
@@ -312,11 +313,11 @@ mod tests {
         let b = entry(2, 0, 20, Seen::new());
         let resolving = entry(1, 1, 30, Seen::from([link(2, 0)]));
         let mut state = ObjectState::default();
-        state.record(&a, Some(manifest(1)));
-        state.record(&b, Some(manifest(2)));
+        state.record(&a, a.hlc, Some(manifest(1)));
+        state.record(&b, b.hlc, Some(manifest(2)));
         assert!(state.is_conflicted());
 
-        state.record(&resolving, Some(manifest(3)));
+        state.record(&resolving, resolving.hlc, Some(manifest(3)));
 
         assert!(!state.is_conflicted());
         assert_eq!(state.current(), Some(manifest(3)));
@@ -328,10 +329,10 @@ mod tests {
         let b = entry(2, 0, 20, Seen::new());
         let partial = entry(1, 1, 30, Seen::new());
         let mut state = ObjectState::default();
-        state.record(&a, Some(manifest(1)));
-        state.record(&b, Some(manifest(2)));
+        state.record(&a, a.hlc, Some(manifest(1)));
+        state.record(&b, b.hlc, Some(manifest(2)));
 
-        state.record(&partial, Some(manifest(3)));
+        state.record(&partial, partial.hlc, Some(manifest(3)));
 
         assert_eq!(state.conflicts(), vec![EntryRef::of(&b)]);
     }
@@ -341,9 +342,9 @@ mod tests {
         let put = entry(1, 0, 10, Seen::new());
         let delete = entry(1, 1, 11, Seen::new());
         let mut state = ObjectState::default();
-        state.record(&put, Some(manifest(1)));
+        state.record(&put, put.hlc, Some(manifest(1)));
 
-        state.record(&delete, None);
+        state.record(&delete, delete.hlc, None);
 
         assert_eq!(state.current(), None);
         assert_eq!(state.versions.len(), 2);
@@ -355,8 +356,8 @@ mod tests {
         let a = entry(1, 0, 10, Seen::new());
         let mut state = ObjectState::default();
 
-        assert!(state.record(&a, Some(manifest(1))));
-        assert!(!state.record(&a, Some(manifest(1))));
+        assert!(state.record(&a, a.hlc, Some(manifest(1))));
+        assert!(!state.record(&a, a.hlc, Some(manifest(1))));
         assert_eq!(state.versions.len(), 1);
     }
 
@@ -370,7 +371,7 @@ mod tests {
     fn state_of(writes: &[(Entry, Option<ObjectId>)]) -> ObjectState {
         let mut state = ObjectState::default();
         for (entry, manifest_id) in writes {
-            state.record(entry, *manifest_id);
+            state.record(entry, entry.hlc, *manifest_id);
         }
         state
     }
@@ -417,7 +418,7 @@ mod tests {
     fn test_prune_removes_a_key_deleted_long_ago() {
         let put = put_at(1, 0, 10, Seen::new());
         let mut state = state_of(&[put]);
-        state.record(&entry(1, 1, 20, Seen::new()), None);
+        state.record(&entry(1, 1, 20, Seen::new()), 20, None);
 
         assert_eq!(state.clone().prune(20), Pruned::Changed);
         assert_eq!(state.prune(21), Pruned::Gone);
@@ -427,7 +428,7 @@ mod tests {
     fn test_prune_keeps_a_conflicted_delete() {
         let put = put_at(2, 0, 10, Seen::new());
         let mut state = state_of(&[put]);
-        state.record(&entry(1, 0, 20, Seen::new()), None);
+        state.record(&entry(1, 0, 20, Seen::new()), 20, None);
 
         assert_eq!(state.prune(100), Pruned::Unchanged);
         assert!(state.is_conflicted());

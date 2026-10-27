@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BucketState, IndexError, ObjectState};
 
-const VERSION: u8 = 1;
+/// Format 2 orders the versions of a key by their ack HLC.
+const VERSION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -39,9 +40,16 @@ impl Snapshot {
             return Err(bad());
         }
 
-        let Some((&VERSION, body)) = bytes.split_first() else {
+        let Some((&version, body)) = bytes.split_first() else {
             return Err(bad());
         };
+        if version != VERSION {
+            return Err(IndexError::Format {
+                what: "snapshot",
+                found: u32::from(version),
+                expected: u32::from(VERSION),
+            });
+        }
 
         Ok(postcard::from_bytes(body)?)
     }

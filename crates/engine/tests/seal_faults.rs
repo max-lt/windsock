@@ -416,3 +416,34 @@ async fn test_remote_with_a_journal_and_no_key_check_is_refused_at_open() {
     };
     assert!(reason.contains("without encryption"), "{reason}");
 }
+
+/// A remote of format 1 has a key check with no format line. The open refuses it and names both
+/// formats: its journal actions have no ack HLC and must not decode.
+#[tokio::test]
+async fn test_remote_of_another_format_is_refused_at_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    let keys = RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    let text = b"windsock repository key check";
+    let old = keys.sealer().seal(seal::Kind::KeyCheck, text, text);
+    remote
+        .create("repo/key-check", Bytes::from(old))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        keys,
+        Config::default(),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a remote of format 1 opens");
+    };
+    let error = error.to_string();
+    assert!(error.contains("remote has format 1"), "{error}");
+    assert!(error.contains("reads format 2"), "{error}");
+}

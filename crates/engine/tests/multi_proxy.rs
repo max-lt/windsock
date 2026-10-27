@@ -590,3 +590,51 @@ async fn test_ack_after_a_restart_ranks_above_an_hlc_seen_before() {
 
     assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
 }
+/// A client writes a key on proxy a, then writes it again on proxy b after the first ack. The
+/// second write must win, also when proxy a flushes after proxy b.
+#[tokio::test]
+async fn test_later_acked_write_wins_when_the_earlier_one_flushes_last() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    put(&a.engine, "k", "first").await;
+    put(&b.engine, "k", "second").await;
+
+    b.engine.flush().await.unwrap();
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("second")]).await;
+}
+
+/// Two writes to one key in one flush: the later ack wins on every proxy.
+#[tokio::test]
+async fn test_later_write_in_the_same_flush_wins() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    put(&a.engine, "k", "first").await;
+    put(&a.engine, "k", "second").await;
+
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("second")]).await;
+}
+
+/// Last-Modified is the ack time: the same before and after the flush.
+#[tokio::test]
+async fn test_last_modified_stays_the_same_across_the_flush() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    put(&a.engine, "k", "v").await;
+    let buffered = a.engine.head(BUCKET, "k").await.unwrap().last_modified;
+
+    a.engine.flush().await.unwrap();
+    b.engine.sync().await.unwrap();
+
+    assert_eq!(
+        a.engine.head(BUCKET, "k").await.unwrap().last_modified,
+        buffered
+    );
+    assert_eq!(
+        b.engine.head(BUCKET, "k").await.unwrap().last_modified,
+        buffered
+    );
+}

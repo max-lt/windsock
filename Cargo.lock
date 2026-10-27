@@ -215,7 +215,6 @@ checksum = "0d74937895e761d5984206f82ca8ff7725d0fd8021921011921894b41ab1b9f7"
 name = "cache"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "model",
  "seal",
@@ -506,7 +505,6 @@ dependencies = [
  "remote",
  "seal",
  "serde",
- "subtle",
  "tempfile",
  "thiserror",
  "tokio",

@@ -202,17 +202,11 @@ impl BucketState {
 
 #[cfg(test)]
 mod tests {
-    fn test_sealer() -> seal::Sealer {
-        seal::RepoKey::from_hex(&"07".repeat(32))
-            .unwrap()
-            .keys()
-            .sealer()
-            .clone()
-    }
     use ed25519_dalek::SigningKey;
     use journal::{Action, Link};
 
     use super::*;
+    use crate::tests::test_sealer;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])

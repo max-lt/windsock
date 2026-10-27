@@ -7,7 +7,6 @@ publish.workspace = true
 [dependencies]
 model.workspace = true
 seal.workspace = true
-blake3.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync"] }

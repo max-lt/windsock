@@ -657,7 +657,7 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
-    fn test_sealer() -> seal::Sealer {
+    pub(crate) fn test_sealer() -> seal::Sealer {
         seal::RepoKey::from_hex(&"07".repeat(32))
             .unwrap()
             .keys()

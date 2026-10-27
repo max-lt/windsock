@@ -7,7 +7,6 @@ publish.workspace = true
 [dependencies]
 model.workspace = true
 seal.workspace = true
-subtle.workspace = true
 chunking.workspace = true
 pack.workspace = true
 remote.workspace = true

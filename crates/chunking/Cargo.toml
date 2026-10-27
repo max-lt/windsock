@@ -7,8 +7,10 @@ publish.workspace = true
 [dependencies]
 model.workspace = true
 seal.workspace = true
-blake3.workspace = true
 fastcdc.workspace = true
 ruzstd.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true

@@ -36,7 +36,6 @@ use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
-use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -276,7 +275,7 @@ impl<R: Remote + 'static> Engine<R> {
             KEY_CHECK.as_bytes(),
         );
 
-        // A journal with no key check comes from a build before the seal, or from another tool.
+        // A journal with no key check is not encrypted, or another tool wrote it.
         if self.remote.get(KEY_CHECK_KEY).await?.is_none()
             && !self.remote.list(journal::LOG_PREFIX).await?.is_empty()
         {
@@ -298,10 +297,8 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         };
         match sealer.open(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), &stored) {
-            Ok(plain) if bool::from(plain.as_slice().ct_eq(KEY_CHECK.as_bytes())) => Ok(()),
-            Ok(_) => Err(EngineError::WrongRepoKey(format!(
-                "{KEY_CHECK_KEY} is changed"
-            ))),
+            // The AEAD tag proves the key: the text is public and needs no check.
+            Ok(_) => Ok(()),
             Err(e) => Err(EngineError::WrongRepoKey(e.to_string())),
         }
     }

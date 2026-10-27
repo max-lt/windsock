@@ -37,9 +37,13 @@ pub enum Action {
     CreateBucket {
         bucket: String,
         owner: Option<String>,
+        /// HLC of the ack: the order of the writes to one bucket name.
+        hlc: u64,
     },
     DeleteBucket {
         bucket: String,
+        /// HLC of the ack: the order of the writes to one bucket name.
+        hlc: u64,
     },
     /// The GC found these objects dead. Readers stop deduping against the packs.
     Condemn {
@@ -49,10 +53,13 @@ pub enum Action {
 }
 
 impl Action {
-    /// The ack HLC of a put or a delete.
+    /// The ack HLC of a write to a key or to a bucket name.
     pub fn hlc(&self) -> Option<u64> {
         match self {
-            Action::Put { hlc, .. } | Action::Delete { hlc, .. } => Some(*hlc),
+            Action::Put { hlc, .. }
+            | Action::Delete { hlc, .. }
+            | Action::CreateBucket { hlc, .. }
+            | Action::DeleteBucket { hlc, .. } => Some(*hlc),
             _ => None,
         }
     }

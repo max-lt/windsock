@@ -181,21 +181,22 @@ pub struct BucketState {
 }
 
 impl BucketState {
-    /// Applies a create (`Some(owner)`) or a delete (`None`) from `entry`.
-    /// Returns `None` when a later write already won.
+    /// Applies a create (`Some(owner)`) or a delete (`None`) from `entry`, acked at `hlc`.
+    /// Returns `None` when a later ack already won.
     pub fn apply(
         current: Option<&Self>,
         entry: &Entry,
+        hlc: u64,
         create: Option<Option<String>>,
     ) -> Option<Self> {
-        if current.is_some_and(|c| (c.hlc, c.node) >= (entry.hlc, entry.node)) {
+        if current.is_some_and(|c| (c.hlc, c.node) >= (hlc, entry.node)) {
             return None;
         }
 
         Some(Self {
             exists: create.is_some(),
             owner: create.flatten(),
-            hlc: entry.hlc,
+            hlc,
             node: entry.node,
         })
     }
@@ -439,9 +440,9 @@ mod tests {
         let create = entry(1, 0, 10, Seen::new());
         let delete = entry(2, 0, 20, Seen::new());
 
-        let created = BucketState::apply(None, &create, Some(Some("max".into()))).unwrap();
-        let deleted = BucketState::apply(Some(&created), &delete, None).unwrap();
-        let stale = BucketState::apply(Some(&deleted), &create, Some(None));
+        let created = BucketState::apply(None, &create, 10, Some(Some("max".into()))).unwrap();
+        let deleted = BucketState::apply(Some(&created), &delete, 20, None).unwrap();
+        let stale = BucketState::apply(Some(&deleted), &create, 10, Some(None));
 
         assert!(created.exists);
         assert_eq!(created.owner.as_deref(), Some("max"));

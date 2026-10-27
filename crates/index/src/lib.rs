@@ -322,11 +322,11 @@ impl Index {
                 Action::Delete { bucket, key, hlc } => {
                     self.record_version(&mut batch, entry, *hlc, bucket, key, None)?
                 }
-                Action::CreateBucket { bucket, owner } => {
-                    self.record_bucket(&mut batch, entry, bucket, Some(owner.clone()))?
+                Action::CreateBucket { bucket, owner, hlc } => {
+                    self.record_bucket(&mut batch, entry, *hlc, bucket, Some(owner.clone()))?
                 }
-                Action::DeleteBucket { bucket } => {
-                    self.record_bucket(&mut batch, entry, bucket, None)?
+                Action::DeleteBucket { bucket, hlc } => {
+                    self.record_bucket(&mut batch, entry, *hlc, bucket, None)?
                 }
                 Action::Condemn { packs, manifests } => {
                     for pack in packs {
@@ -423,12 +423,13 @@ impl Index {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         entry: &Entry,
+        hlc: u64,
         bucket: &str,
         create: Option<Option<String>>,
     ) -> Result<()> {
         let current = self.bucket(bucket)?;
 
-        if let Some(state) = BucketState::apply(current.as_ref(), entry, create) {
+        if let Some(state) = BucketState::apply(current.as_ref(), entry, hlc, create) {
             batch.insert(&self.buckets, bucket.as_bytes(), encode(&state));
         }
 
@@ -774,6 +775,7 @@ mod tests {
         vec![Action::CreateBucket {
             bucket: name.into(),
             owner: None,
+            hlc: ack(),
         }]
     }
 
@@ -1058,28 +1060,32 @@ mod tests {
             &key(1),
             0,
             [0u8; 32],
-            1,
+            10,
             Seen::new(),
             vec![
                 Action::CreateBucket {
                     bucket: "b".into(),
                     owner: None,
+                    hlc: 1,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "k".into(),
                     manifest_id: manifest(1),
                     inline_manifest: None,
-                    hlc: 1,
+                    hlc: 2,
                 },
                 Action::Put {
                     bucket: "b".into(),
                     key: "k".into(),
                     manifest_id: manifest(2),
                     inline_manifest: None,
-                    hlc: 1,
+                    hlc: 3,
                 },
-                Action::DeleteBucket { bucket: "b".into() },
+                Action::DeleteBucket {
+                    bucket: "b".into(),
+                    hlc: 4,
+                },
             ],
             &test_sealer(),
         );

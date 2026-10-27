@@ -177,10 +177,15 @@ impl<R: Remote + 'static> Engine<R> {
                         key,
                         hlc: record.head.time,
                     }),
-                    Op::CreateBucket { bucket, owner } => {
-                        Planned::Other(Action::CreateBucket { bucket, owner })
-                    }
-                    Op::DeleteBucket { bucket } => Planned::Other(Action::DeleteBucket { bucket }),
+                    Op::CreateBucket { bucket, owner } => Planned::Other(Action::CreateBucket {
+                        bucket,
+                        owner,
+                        hlc: record.head.time,
+                    }),
+                    Op::DeleteBucket { bucket } => Planned::Other(Action::DeleteBucket {
+                        bucket,
+                        hlc: record.head.time,
+                    }),
                 };
                 planned.push(next);
             }
@@ -304,7 +309,10 @@ impl<R: Remote + 'static> Engine<R> {
                 Action::Put { bucket, key, .. } | Action::Delete { bucket, key, .. } => {
                     format!("{bucket}/{key}")
                 }
-                _ => String::new(),
+                Action::CreateBucket { bucket, .. } | Action::DeleteBucket { bucket, .. } => {
+                    bucket.clone()
+                }
+                Action::Condemn { .. } => String::new(),
             })
             .collect();
         if late.is_empty() {

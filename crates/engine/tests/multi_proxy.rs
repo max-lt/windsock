@@ -733,3 +733,35 @@ async fn test_ack_after_a_snapshot_load_ranks_above_the_snapshot() {
 
     assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
 }
+
+/// Two proxies create one bucket name, each unaware of the other. The later ack wins on every
+/// proxy, also when the earlier create flushes last.
+#[tokio::test]
+async fn test_later_acked_bucket_create_wins_when_the_earlier_one_flushes_last() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    let b = proxy(&remote, 2).await;
+    a.engine
+        .create_bucket("cbk", Some("first".into()))
+        .await
+        .unwrap();
+    b.engine
+        .create_bucket("cbk", Some("second".into()))
+        .await
+        .unwrap();
+
+    b.engine.flush().await.unwrap();
+    a.engine.flush().await.unwrap();
+
+    for proxy in [&a, &b] {
+        proxy.engine.sync().await.unwrap();
+        let buckets = proxy.engine.list_buckets().await.unwrap();
+        let owner = buckets
+            .iter()
+            .find(|bucket| bucket.name == "cbk")
+            .unwrap()
+            .owner
+            .clone();
+        assert_eq!(owner.as_deref(), Some("second"));
+    }
+}

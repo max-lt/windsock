@@ -65,6 +65,41 @@ key pair from step 4.
 - boto3: `boto3.client("s3", endpoint_url="http://127.0.0.1:9000", region_name="us-east-1",
 aws_access_key_id=AK, aws_secret_access_key=SK, config=Config(s3={"addressing_style": "path"}))`
 
+## Run it under a supervisor
+
+Run `windsockd` under a service manager that restarts it when it exits with status 1. The daemon
+exits with status 1 when its local index refuses every call after a failed write, often a full
+disk: the buffer is on disk, and the next start flushes it. With systemd:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/windsockd run /etc/windsock/windsock.toml
+Restart=on-failure
+RestartSec=5
+# Time for the buffer to upload at stop.
+TimeoutStopSec=600
+LimitNOFILE=65536
+```
+
+A start that fails, for example on a quarantine or a remote with other rules, fails again at
+each restart: read the error, act, then start again.
+
+## Time rules
+
+| Name | Setting               | Default | What it does                                                            |
+| ---- | --------------------- | ------- | ----------------------------------------------------------------------- |
+| H    | `gc.horizon_secs`     | 24 h    | The GC deletes a dead object H after its condemn                        |
+| R    | `gc.retention_secs`   | 24 h    | Old versions stay readable for R; the bound for an HLC ahead of a clock |
+| M    | `gc.late_margin_secs` | 1 h     | The clock skew that the late write rule allows                          |
+
+R and M are rules of the remote: the first proxy fixes them, and every other proxy must use the
+same values. When the remote is down for longer than R - M (23 h by default), the acked writes
+that wait in the buffer are older than the late limit. The proxy logs an ERROR with their keys,
+stops its flusher and refuses writes. At the next start, only those writes move to
+`data/engine/quarantine` and the start fails. To replay a write, write the object again through
+the S3 API after the start. To discard the late writes, move the files out of the quarantine.
+Then start the proxy: the younger writes flush.
+
 ## Encryption
 
 Windsock encrypts all data that it writes to the remote with the key in `repo.key`. Back up that

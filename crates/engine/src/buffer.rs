@@ -919,7 +919,7 @@ async fn quarantine_late_until(
             break;
         }
 
-        tokio::fs::create_dir_all(quarantine).await?;
+        create_quarantine(quarantine).await?;
         create_durable(quarantine, &format!("{seq:020}"), &late).await?;
         check(&mut step)?;
         match young.is_empty() {
@@ -975,11 +975,21 @@ pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>,
 
 /// Moves the intent file to `quarantine`: its entry never commits.
 pub(crate) async fn quarantine_intent(dir: &Path, quarantine: &Path) -> Result<(), EngineError> {
-    tokio::fs::create_dir_all(quarantine).await?;
+    create_quarantine(quarantine).await?;
     let held = free_name(quarantine, INTENT_FILE, "").await?;
     tokio::fs::rename(dir.join(INTENT_FILE), held).await?;
     sync_dir(quarantine).await?;
     sync_dir(dir).await
+}
+
+/// Makes the quarantine directory durable before a record moves there: a power loss must not
+/// lose the directory while the buffer copy is already gone.
+async fn create_quarantine(quarantine: &Path) -> Result<(), EngineError> {
+    tokio::fs::create_dir_all(quarantine).await?;
+    if let Some(parent) = quarantine.parent() {
+        sync_dir(parent).await?;
+    }
+    Ok(())
 }
 
 /// The first path `<stem><suffix>`, `<stem>.1<suffix>`, ... in `dir` that does not exist.

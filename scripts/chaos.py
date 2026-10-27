@@ -83,6 +83,34 @@ class Proxy:
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
+    def fds(self):
+        """Open files of the daemon, counted by kind."""
+        out = subprocess.run(["lsof", "-n", "-P", "-p", str(self.proc.pid)], capture_output=True, text=True)
+        kinds = {}
+        for line in out.stdout.splitlines()[1:]:
+            cols = line.split(None, 8)
+            if len(cols) < 9 or not cols[3][:1].isdigit():
+                continue
+            kind, name = cols[4], cols[8]
+            if kind in ("IPv4", "IPv6"):
+                label = "socket listen" if "LISTEN" in name else "socket tcp"
+            elif kind in ("PIPE", "KQUEUE", "unix", "systm"):
+                label = kind.lower()
+            elif "/buffer/" in name:
+                label = "buffer"
+            elif "/index/" in name:
+                label = "index"
+            elif "/cache/" in name:
+                label = "cache"
+            elif "/remote/" in name:
+                label = "remote"
+            elif "/uploads/" in name:
+                label = "uploads"
+            else:
+                label = "other " + kind
+            kinds[label] = kinds.get(label, 0) + 1
+        return kinds
+
     def usage(self):
         pid = str(self.proc.pid)
         rss = subprocess.run(["ps", "-o", "rss=", "-p", pid], capture_output=True, text=True).stdout.strip()
@@ -90,10 +118,17 @@ class Proxy:
         return int(rss or 0) // 1024, fds
 
 
+MARKER = ".windsock-chaos"
+
+
 def setup(work):
+    # Remove only a directory that this script made: the marker file proves it.
     if os.path.exists(work):
+        if os.listdir(work) and not os.path.exists(os.path.join(work, MARKER)):
+            raise SystemExit(f"{work} is not empty and has no {MARKER} file: choose another --work")
         shutil.rmtree(work)
     os.makedirs(work)
+    open(os.path.join(work, MARKER), "w").close()
     remote = os.path.join(work, "remote")
     proxies = [Proxy(n, work) for n in range(3)]
     for p in proxies:
@@ -204,10 +239,12 @@ def full_disk(p, sub, work, image_mb, seconds):
         p.wait(30)
     os.remove(target)
     os.makedirs(target)
-    for name in os.listdir(mount):
-        if name.startswith(".") and name != ".intent.tmp":
-            continue
-        shutil.move(os.path.join(mount, name), os.path.join(target, name))
+    # rsync skips the volume files, and a file that vanishes during the copy is not fatal.
+    subprocess.run(
+        ["rsync", "-a", "--exclude", ".Spotlight-V100", "--exclude", ".fseventsd", "--exclude", ".Trashes",
+         mount + "/", target + "/"],
+        capture_output=True,
+    )
     subprocess.run(["hdiutil", "detach", mount, "-force"], capture_output=True)
     p.start()
 
@@ -300,6 +337,9 @@ def monitor(proxies, stop, samples):
                 row[p.n] = p.usage()
         samples.append((time.time(), row))
         log("usage (MiB, fds):", row)
+        for p in proxies:
+            if p.running():
+                log(f"fds p{p.n}:", json.dumps(p.fds(), sort_keys=True))
 
 
 def converge(proxies, model):

@@ -851,3 +851,27 @@ async fn test_refused_connection_names_the_host_and_the_key() {
     assert!(error.contains("log/n1/7"), "{error}");
     assert!(error.to_lowercase().contains("refused"), "{error}");
 }
+
+/// The wait for a free slot does not count against the time limit of an attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wait_for_a_slot_does_not_use_up_the_attempt_time() {
+    let (slow, _) = slow_server(Duration::from_millis(500)).await;
+    let mut config = config(&slow.endpoint, "");
+    config.retry = Retry {
+        attempts: 1,
+        attempt_timeout: Duration::from_millis(800),
+        ..quick_retry()
+    };
+    let remote = Arc::new(S3Remote::new(config).unwrap());
+
+    let reads: Vec<_> = (0..s3remote::MAX_IN_FLIGHT + 1)
+        .map(|_| {
+            let remote = remote.clone();
+            tokio::spawn(async move { remote.get("packs/none").await })
+        })
+        .collect();
+
+    for read in reads {
+        assert_eq!(read.await.unwrap().unwrap(), None);
+    }
+}

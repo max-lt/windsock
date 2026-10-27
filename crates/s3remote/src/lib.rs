@@ -307,13 +307,14 @@ impl S3Remote {
             self.path(call.key)
         );
 
+        // Outside the attempt timeout: a wait for a slot is not a slow remote.
+        let _slot = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
         policy
             .run(|| async {
-                let _slot = self
-                    .in_flight
-                    .acquire()
-                    .await
-                    .expect("the semaphore is never closed");
                 let response = self
                     .client
                     .request(self.signed(&call))

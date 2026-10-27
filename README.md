@@ -128,6 +128,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   MD5, such as `rclone --checksum`, see a difference.
 - Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
 - A multipart upload must complete on the proxy that started it.
+- The proxy holds the whole body of a request in memory, up to 5 GiB per request. No limit
+  covers all requests together: 10 parallel PUTs of 5 GiB need 50 GiB of memory. Size the memory
+  for the largest objects times the parallel uploads, or put a limit in front of the proxy.
 
 ## Scale
 

@@ -443,3 +443,17 @@ fn test_run_names_a_data_dir_it_cannot_make() {
 
     assert!(stderr.contains(&data.display().to_string()), "{stderr}");
 }
+
+#[test]
+fn test_run_names_a_node_key_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, config, _) = init();
+    let key = dir.path().join("data").join("node.key");
+    std::fs::create_dir_all(&key).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stderr = run_fails_with(&config);
+
+    assert!(stderr.contains(&key.display().to_string()), "{stderr}");
+}

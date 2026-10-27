@@ -140,7 +140,10 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
     }
 
     refuse_if_others_can_read(&path)?;
-    let text = Zeroizing::new(std::fs::read_to_string(&path)?);
+    let text = Zeroizing::new(
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?,
+    );
     let mut bytes = Zeroizing::new([0u8; 32]);
     hex::decode_to_slice(text.trim(), bytes.as_mut())
         .with_context(|| format!("{} is not a hex key", path.display()))?;

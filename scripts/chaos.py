@@ -90,7 +90,7 @@ class Proxy:
         return int(rss or 0) // 1024, fds
 
 
-def setup(work, image_mb):
+def setup(work):
     if os.path.exists(work):
         shutil.rmtree(work)
     os.makedirs(work)
@@ -100,15 +100,6 @@ def setup(work, image_mb):
         subprocess.run([BIN, "init", p.dir], check=True, capture_output=True)
     shutil.copy(os.path.join(proxies[0].dir, "repo.key"), os.path.join(work, "repo.key"))
     os.chmod(os.path.join(work, "repo.key"), 0o600)
-
-    mount = os.path.join(proxies[2].dir, "data")
-    image = os.path.join(work, "small.dmg")
-    subprocess.run(
-        ["hdiutil", "create", "-size", f"{image_mb}m", "-fs", "HFS+", "-volname", "wschaos", image],
-        check=True, capture_output=True,
-    )
-    os.makedirs(mount, exist_ok=True)
-    subprocess.run(["hdiutil", "attach", image, "-mountpoint", mount, "-nobrowse"], check=True, capture_output=True)
 
     for p, port in zip(proxies, PORTS):
         text = open(p.config).read()
@@ -142,7 +133,7 @@ def setup(work, image_mb):
                 response_checksum_validation="when_required",
             ),
         )
-    return proxies, mount
+    return proxies
 
 
 class Model:
@@ -176,6 +167,49 @@ def classify(error):
 
 def digest(data):
     return hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
+def full_disk(p, sub, work, image_mb, seconds):
+    """Runs p with data/engine/<sub> on a small disk image for `seconds`, then moves it back."""
+    target = os.path.join(p.dir, "data", "engine", sub)
+    image = os.path.join(work, f"{sub}.dmg")
+    mount = os.path.join(work, f"{sub}-mnt")
+    p.signal(signal.SIGTERM)
+    p.wait(90)
+    subprocess.run(
+        ["hdiutil", "create", "-size", f"{image_mb}m", "-fs", "HFS+", "-volname", sub, "-ov", image],
+        check=True, capture_output=True,
+    )
+    os.makedirs(mount, exist_ok=True)
+    subprocess.run(["hdiutil", "attach", image, "-mountpoint", mount, "-nobrowse"], check=True, capture_output=True)
+    for name in os.listdir(target):
+        shutil.move(os.path.join(target, name), os.path.join(mount, name))
+    os.rmdir(target)
+    os.symlink(mount, target)
+    p.start()
+    filler = os.path.join(mount, "filler")
+    with open(filler, "wb") as f:
+        try:
+            while True:
+                f.write(b"\0" * (1 << 20))
+                f.flush()
+        except OSError:
+            pass
+    time.sleep(seconds)
+    os.remove(filler)
+    time.sleep(2)
+    p.signal(signal.SIGTERM)
+    if not p.wait(90):
+        p.signal(signal.SIGKILL)
+        p.wait(30)
+    os.remove(target)
+    os.makedirs(target)
+    for name in os.listdir(mount):
+        if name.startswith(".") and name != ".intent.tmp":
+            continue
+        shutil.move(os.path.join(mount, name), os.path.join(target, name))
+    subprocess.run(["hdiutil", "detach", mount, "-force"], capture_output=True)
+    p.start()
 
 
 def worker(w, proxies, model, stop, rng):
@@ -240,14 +274,22 @@ def restart(p, sig, down):
     p.start()
 
 
-def faults(proxies, stop, rng, counts):
+def faults(proxies, stop, rng, counts, pause):
     while not stop.wait(rng.uniform(8, 25)):
         p = rng.choice(proxies)
         sig = rng.choice([signal.SIGKILL, signal.SIGKILL, signal.SIGTERM])
         name = "KILL" if sig == signal.SIGKILL else "TERM"
-        log(f"fault: {name} p{p.n}")
-        restart(p, sig, rng.uniform(0.5, 4))
-        counts[name] += 1
+        with pause:
+            if not p.running():
+                continue
+            log(f"fault: {name} p{p.n}")
+            try:
+                restart(p, sig, rng.uniform(0.5, 4))
+            except RuntimeError as e:
+                log(f"restart failed: {e}")
+                counts["failed_restart"] = counts.get("failed_restart", 0) + 1
+                continue
+            counts[name] += 1
 
 
 def monitor(proxies, stop, samples):
@@ -300,12 +342,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=10)
     ap.add_argument("--work", default="/tmp/ws-chaos")
-    ap.add_argument("--image-mb", type=int, default=48)
+    ap.add_argument("--image-mb", type=int, default=64)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
-    proxies, mount = setup(args.work, args.image_mb)
+    proxies = setup(args.work)
     try:
         for p in proxies:
             p.start()
@@ -320,19 +362,28 @@ def main():
         ]
         samples = []
         counts = {"KILL": 0, "TERM": 0}
-        threads.append(threading.Thread(target=faults, args=(proxies, stop, rng, counts)))
+        pause = threading.Lock()
+        threads.append(threading.Thread(target=faults, args=(proxies, stop, rng, counts, pause)))
         threads.append(threading.Thread(target=monitor, args=(proxies, stop, samples)))
         start = time.time()
         for t in threads:
             t.start()
 
         total = args.minutes * 60
-        time.sleep(total * 0.5)
+        time.sleep(total * 0.25)
+        for sub in ["buffer", "index"]:
+            log(f"phase: p2 with a full disk under data/engine/{sub} for 10 s")
+            with pause:
+                full_disk(proxies[2], sub, args.work, args.image_mb, 10)
+            log(f"phase: p2 back from the full {sub} disk")
+        time.sleep(max(0, total * 0.5 - (time.time() - start)))
         log(f"phase: p1 stops for {2 * HORIZON} s, longer than H")
-        proxies[1].signal(signal.SIGTERM)
-        proxies[1].wait(90)
+        with pause:
+            proxies[1].signal(signal.SIGTERM)
+            proxies[1].wait(90)
         time.sleep(2 * HORIZON)
-        proxies[1].start()
+        with pause:
+            proxies[1].start()
         log("phase: p1 back")
         time.sleep(max(0, total - (time.time() - start)))
 
@@ -366,7 +417,6 @@ def main():
         for p in proxies:
             if p.proc:
                 p.wait(60)
-        subprocess.run(["hdiutil", "detach", mount, "-force"], capture_output=True)
 
 
 if __name__ == "__main__":

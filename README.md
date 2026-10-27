@@ -84,6 +84,10 @@ LimitNOFILE=65536
 A start that fails, for example on a quarantine or a remote with other rules, fails again at
 each restart: read the error, act, then start again.
 
+A start that fails with `the own chain is broken` names a key under `log/<node>/`. Check that
+key in the bucket: an object that this proxy did not write blocks the start. Remove it, then
+start again. `docs/storage.md` (Journal reads) gives the details.
+
 ## Time rules
 
 | Name | Setting               | Default | What it does                                                            |

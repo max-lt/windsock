@@ -830,3 +830,82 @@ async fn test_open_quarantines_what_the_commit_finds_late() {
     };
     assert!(error.to_string().contains("bkt/k"), "{error}");
 }
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        match entry.file_type().unwrap().is_dir() {
+            true => copy_tree(&entry.path(), &target),
+            false => {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+}
+
+/// A restored older copy of the index is behind the own chain, and the wall clock is behind its
+/// newest acks. The open syncs, so the next ack still ranks above the earlier one.
+#[tokio::test]
+async fn test_ack_after_a_restored_older_index_ranks_above_the_own_entries() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    let backup = tempfile::tempdir().unwrap();
+    copy_tree(&dir.path().join("index"), backup.path());
+    let a = open_in(&remote, 1, dir).await;
+    let ahead = now_nanos() + HORIZON.as_nanos() as u64;
+    forged_entry(&remote, 9, ahead, vec![delete("x", ahead)]).await;
+    a.engine.sync().await.unwrap();
+    put(&a.engine, "k", "one").await;
+    a.engine.flush().await.unwrap();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    std::fs::remove_dir_all(dir.path().join("index")).unwrap();
+    copy_tree(backup.path(), &dir.path().join("index"));
+
+    let a = open_in(&remote, 1, dir).await;
+    put(&a.engine, "k", "two").await;
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
+}
+
+/// An object under log/<own node>/ far past the chain, as a writer with no repo key could put
+/// there, breaks the own chain at the audit of the open. The open fails and names the key.
+#[tokio::test]
+async fn test_forged_own_entry_at_a_far_seq_fails_the_open_with_its_key() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, _b) = with_bucket(&remote).await;
+    let node = a.engine.node();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+    remote
+        .put(
+            &journal::entry_key(node, 999_999_999),
+            Bytes::from_static(b"garbage"),
+        )
+        .await
+        .unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        keys(),
+        Config {
+            gc_horizon: HORIZON,
+            ..Config::default()
+        },
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a proxy opens with a forged object in its chain");
+    };
+    let error = error.to_string();
+    assert!(error.contains(&format!("{node}")), "{error}");
+    assert!(error.contains("00000000000999999999"), "{error}");
+}

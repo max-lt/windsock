@@ -411,13 +411,21 @@ impl<R: Remote + 'static> Engine<R> {
             }
         }
 
-        // A lost index, or a new host with this node key, does not know the newest own entry:
-        // the next ack must still rank above it.
-        let tail = engine.journal.lock().await.own_tail_hlc().await?;
-        if let Some(hlc) = tail {
-            engine
-                .clock
-                .witness_at_most(hlc, engine.config.retention.as_nanos() as u64);
+        // The index is a cache: lost, behind after a power loss, or a restored copy, it can miss
+        // the newest own entries. One full sync reads every chain, the own one included, through
+        // the checks of a normal read, so the clock passes them before the first ack.
+        let report = engine.sync().await?;
+        // This sync does not count for the debounce of a sync on a miss.
+        *engine
+            .last_sync
+            .lock()
+            .expect("no panic while the lock is held") = None;
+        if report.broken.contains(&engine.node) {
+            let cause = report.broken_causes.join("; ");
+            error!(cause, "the own chain does not read: no start");
+            return Err(EngineError::Corrupt(format!(
+                "the own chain is broken, so this proxy cannot order its acks: {cause}"
+            )));
         }
 
         // Last, once the clock passed every HLC that the open found. The commit measures an ack

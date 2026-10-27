@@ -103,8 +103,8 @@ pub enum ChainError {
     ActionsMismatch { seq: u64 },
     #[error("the actions of entry {seq} do not open: another repository key, or changed bytes")]
     Sealed { seq: u64 },
-    #[error("entry {seq} is missing and a later entry exists")]
-    Gap { seq: u64 },
+    #[error("entry {seq} is missing and entry {later} exists (key log/<node>/{later:020})")]
+    Gap { seq: u64, later: u64 },
     #[error("entry {seq} has an action with an HLC above the entry HLC")]
     ActionAfterEntry { seq: u64 },
     #[error("entry {seq} has an HLC more than the retention ahead of this clock")]

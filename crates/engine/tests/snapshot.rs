@@ -172,6 +172,22 @@ async fn proxy(remote: &Arc<TestRemote>, seed: u8) -> Proxy {
     open(remote, seed, tempfile::tempdir().unwrap()).await
 }
 
+/// Opens a proxy, then syncs it. The open syncs too, so a load error shows at either step.
+async fn open_and_sync(remote: &Arc<TestRemote>, seed: u8) -> Result<Proxy, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[seed; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    engine.sync().await.map_err(|e| e.to_string())?;
+    Ok(Proxy { dir, engine })
+}
+
 async fn put(engine: &Engine<TestRemote>, key: &str, data: &str) {
     engine
         .put(
@@ -258,9 +274,12 @@ async fn test_new_proxy_starts_from_the_snapshot() {
     assert_eq!(keys(&b.engine).await, ["x", "y"]);
     assert_eq!(get(&b.engine, "y").await, "two");
     assert_eq!(keys(&b.engine).await, keys(&a.engine).await);
+    // For the one chain: the seq after the frontier, the gap probe, and the audit read of
+    // the last entry.
     assert!(
-        remote.log_gets.load(Ordering::SeqCst) <= 2,
-        "b reads only the seq after each snapshot frontier"
+        remote.log_gets.load(Ordering::SeqCst) <= 3,
+        "b reads only after each snapshot frontier: {}",
+        remote.log_gets.load(Ordering::SeqCst)
     );
 }
 
@@ -455,9 +474,9 @@ async fn test_snapshot_over_the_cap_fails_with_its_key_and_the_cap() {
     let a = history(&remote).await;
     let _ = a;
     *remote.snapshot_len.lock().unwrap() = Some(engine::MAX_SNAPSHOT + 1);
-    let b = proxy(&remote, 2).await;
-
-    let error = b.engine.sync().await.unwrap_err().to_string();
+    let Err(error) = open_and_sync(&remote, 2).await else {
+        panic!("a snapshot over the cap loads");
+    };
 
     assert!(error.contains("snapshots/"), "{error}");
     // A part is not read past the size that the head gives it.
@@ -715,11 +734,10 @@ async fn history_in_parts(remote: &Arc<TestRemote>, object: u64, keys: usize) ->
 
 /// A new proxy after a prune: the error, or `None` when it reads x and y.
 async fn load_after_prune(remote: &Arc<TestRemote>) -> Option<String> {
-    let b = proxy(remote, 2).await;
-    if let Err(e) = b.engine.sync().await {
-        assert!(b.engine.get(BUCKET, "y", None).await.is_err());
-        return Some(e.to_string());
-    }
+    let b = match open_and_sync(remote, 2).await {
+        Ok(b) => b,
+        Err(e) => return Some(e),
+    };
     assert_eq!(get(&b.engine, "x").await, "one");
     assert_eq!(get(&b.engine, "y").await, "two");
     None

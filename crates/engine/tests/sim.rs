@@ -201,6 +201,7 @@ struct Stats {
     held_restart: bool,
     crashes: BTreeSet<Point>,
     lost_index: bool,
+    stale_index: bool,
 }
 
 /// One acked write: its rank and what a reader must see if it wins.
@@ -223,6 +224,22 @@ struct Proxy {
     /// The last ack HLC that this proxy gave: the next one must be higher.
     last_ack: u64,
     outage: Arc<AtomicBool>,
+    /// An older copy of the index directory, for a crash that restores it.
+    stale_index: Option<TempDir>,
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        match entry.file_type().unwrap().is_dir() {
+            true => copy_tree(&entry.path(), &target),
+            false => {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
 }
 
 fn config() -> Config {
@@ -321,9 +338,25 @@ impl Sim {
     /// it again.
     async fn crash(&mut self, i: usize) -> Result<(), String> {
         self.proxies[i].engine = None;
-        if self.rng.chance(25) {
-            std::fs::remove_dir_all(self.proxies[i].dir.path().join("index")).unwrap();
-            self.stats.lost_index = true;
+        let index = self.proxies[i].dir.path().join("index");
+        match self.rng.below(8) {
+            0 | 1 => {
+                std::fs::remove_dir_all(&index).unwrap();
+                self.stats.lost_index = true;
+            }
+            // An older copy of the index comes back, as from a backup.
+            2 if self.proxies[i].stale_index.is_some() => {
+                let stale = self.proxies[i].stale_index.take().expect("checked above");
+                std::fs::remove_dir_all(&index).unwrap();
+                copy_tree(stale.path(), &index);
+                self.stats.stale_index = true;
+            }
+            3 => {
+                let copy = tempfile::tempdir().unwrap();
+                copy_tree(&index, copy.path());
+                self.proxies[i].stale_index = Some(copy);
+            }
+            _ => {}
         }
         self.open(i).await
     }
@@ -672,6 +705,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
             node: key.verifying_key().to_bytes(),
             last_ack: 0,
             outage: Arc::new(AtomicBool::new(false)),
+            stale_index: None,
         });
     }
     for i in 0..3 {
@@ -704,6 +738,7 @@ struct Totals {
     quarantine: u64,
     held_restart: u64,
     lost_index: u64,
+    stale_index: u64,
     crashes: BTreeMap<Point, u64>,
 }
 
@@ -713,6 +748,7 @@ impl Totals {
         self.quarantine += u64::from(stats.quarantine);
         self.held_restart += u64::from(stats.held_restart);
         self.lost_index += u64::from(stats.lost_index);
+        self.stale_index += u64::from(stats.stale_index);
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
         }
@@ -726,6 +762,10 @@ impl Totals {
             "no seed restarted on a held quarantine: {self:?}"
         );
         assert!(self.lost_index > 0, "no seed lost an index: {self:?}");
+        assert!(
+            self.stale_index > 0,
+            "no seed restored an older index: {self:?}"
+        );
         for point in POINTS {
             assert!(
                 self.crashes.contains_key(&point),

@@ -172,6 +172,15 @@ A chain is broken, and the GC refuses to run, when:
 The sync report and the log give the node, the seq and the cause. A node with no marker is found
 through the `seen` links of other entries.
 
+Each open runs one full sync, with the audit, before it serves. The index is a cache: lost,
+behind after a power loss, or a restored copy, it can miss the newest own entries, and the clock
+must pass them before the first ack. When the own chain does not read at open, the start fails
+with `ERROR the own chain does not read: no start` and the cause, for example `entry 7 is missing
+and entry 999999999 exists (key log/<node>/00000000000999999999)`. An object that a writer with
+no repo key put under the own chain gives this error. To act: read the ERROR, check the named key
+in the bucket, remove it when it is not an entry of this proxy, and start again. The remote must
+be reachable at start: a start with the remote down fails.
+
 Known limit: a remote that drops the newest entries of a chain (a cut tail) looks like a chain
 with fewer entries. No reader can tell. The next commit of the writer goes after the cut, so the
 cut becomes a gap that the readers find at the first sync after open or at the next GC run. A

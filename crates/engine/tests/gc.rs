@@ -623,6 +623,13 @@ async fn test_gc_that_dies_mid_sweep_is_finished_by_the_next_run() {
         report.condemned_packs, 0,
         "the second run condemns nothing new"
     );
+    assert!(report.deleted_packs > 0, "the second run deletes the rest");
+    let after = a.engine.gc().await.unwrap();
+    assert_eq!(
+        (after.deleted_packs, after.deleted_manifests),
+        (0, 0),
+        "nothing was left for a third run"
+    );
     let fresh = proxy(&remote, 2).await;
     assert_eq!(get(&fresh.engine, "live").await.unwrap(), b"kept");
     assert_eq!(keys(&fresh.engine).await, ["live"]);

@@ -188,26 +188,52 @@ async fn test_journal_entry_moved_to_another_seq_breaks_the_chain() {
     assert_eq!(reader.engine.sync().await.unwrap().broken.len(), 1);
 }
 
+/// How a test changes the key check.
+#[derive(Clone, Copy, Debug)]
+enum KeyCheckChange {
+    FirstByte,
+    LastByte,
+    /// Another sealed object of the remote takes its place.
+    Moved,
+}
+
 #[tokio::test]
 async fn test_key_check_moved_or_changed_refuses_the_open() {
-    let remote = Arc::new(MemoryRemote::default());
-    written(&remote).await;
-    flip(&remote, "repo/key-check", |len| len - 1).await;
+    for change in [
+        KeyCheckChange::FirstByte,
+        KeyCheckChange::LastByte,
+        KeyCheckChange::Moved,
+    ] {
+        let remote = Arc::new(MemoryRemote::default());
+        written(&remote).await;
+        match change {
+            KeyCheckChange::FirstByte => flip(&remote, "repo/key-check", |_| 0).await,
+            KeyCheckChange::LastByte => flip(&remote, "repo/key-check", |len| len - 1).await,
+            KeyCheckChange::Moved => {
+                let pack = keys(&remote, "packs/").await.remove(0);
+                let other = remote.get(&pack).await.unwrap().unwrap();
+                remote.put("repo/key-check", other).await.unwrap();
+            }
+        }
 
-    let dir = tempfile::tempdir().unwrap();
-    let result = Engine::open(
-        dir.path(),
-        remote.clone(),
-        SigningKey::from_bytes(&[2; 32]),
-        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
-        Config::default(),
-    )
-    .await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[2; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            Config::default(),
+        )
+        .await;
 
-    let Err(error) = result else {
-        panic!("a changed key check opens");
-    };
-    assert!(matches!(error, EngineError::WrongRepoKey(_)));
+        let Err(error) = result else {
+            panic!("a key check with {change:?} opens");
+        };
+        assert!(
+            matches!(error, EngineError::WrongRepoKey(_)),
+            "{change:?}: {error}"
+        );
+    }
 }
 
 #[test]

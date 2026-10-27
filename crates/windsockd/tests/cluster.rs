@@ -529,7 +529,21 @@ async fn test_second_signal_stops_at_once_and_keeps_the_buffer() {
         Some(true),
         "the second signal stops the daemon at once"
     );
-    assert!(a.logged("second signal") || a.count_after("second signal", Duration::ZERO) == 1);
+    // The drain message names the second signal too: match the stop message only.
+    assert!(
+        a.wait_for(
+            "second signal: stopped before the remote has the buffer",
+            Duration::from_secs(5)
+        )
+        .is_some()
+    );
+    let b = start(&cluster.config("b", 100, false), "info");
+    assert_eq!(
+        get(&b, "/shared/kept").await.status,
+        StatusCode::NOT_FOUND,
+        "the write is only in the buffer of a"
+    );
+    assert!(b.stop());
     let a = start(&config, "info");
     eventually(&a, "/shared/kept", b"buffered", Duration::from_secs(30)).await;
     assert!(a.stop());

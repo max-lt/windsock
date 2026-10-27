@@ -789,6 +789,11 @@ async fn test_slow_remote_with_a_full_cap_still_acknowledges_puts() {
         peak.load(Ordering::SeqCst) as usize,
         s3remote::MAX_IN_FLIGHT
     );
+    engine.flush().await.unwrap();
+    assert!(
+        !remote.list("log/").await.unwrap().is_empty(),
+        "the put reached the remote"
+    );
 }
 
 /// A range past the end reports the object size: the snapshot load uses it as a size probe.

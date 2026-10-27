@@ -457,3 +457,15 @@ fn test_run_names_a_node_key_it_cannot_read() {
 
     assert!(stderr.contains(&key.display().to_string()), "{stderr}");
 }
+
+#[test]
+fn test_run_names_an_engine_dir_it_cannot_open() {
+    let (dir, config, _) = init();
+    let engine = dir.path().join("data").join("engine");
+    std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
+    std::fs::write(&engine, "a file").unwrap();
+
+    let stderr = run_fails_with(&config);
+
+    assert!(stderr.contains(&engine.display().to_string()), "{stderr}");
+}

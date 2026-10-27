@@ -282,14 +282,16 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         ),
     }
 
+    let engine_dir = config.data_dir.join("engine");
     let engine = Engine::open(
-        config.data_dir.join("engine"),
+        &engine_dir,
         remote,
         key,
         repo_key(&config.repo_key)?.keys(),
         config.engine(),
     )
-    .await?;
+    .await
+    .with_context(|| format!("cannot open the engine in {}", engine_dir.display()))?;
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");
 

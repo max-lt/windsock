@@ -592,14 +592,15 @@ async fn test_corrupted_part_skips_the_snapshot_and_replays_the_journal() {
 async fn test_corrupted_part_with_a_pruned_journal_fails_the_sync() {
     let remote = Arc::new(TestRemote::default());
     let _a = history(&remote).await;
-    let (_, len) = latest(&remote).await;
+    let (key, len) = latest(&remote).await;
     *remote.tamper.lock().unwrap() = Some(Tamper::FlippedBit);
 
     let error = assert_full_or_error(&remote, len.div_ceil(3))
         .await
         .unwrap();
 
-    assert!(error.contains("no snapshot"), "{error}");
+    assert!(error.contains(&key), "{error}");
+    assert!(error.contains("do not match the key hash"), "{error}");
 }
 
 #[tokio::test]
@@ -616,14 +617,15 @@ async fn test_short_ranged_read_with_the_journal_falls_back_to_the_replay() {
 async fn test_snapshot_that_shrinks_after_the_size_probe_fails_the_load() {
     let remote = Arc::new(TestRemote::default());
     let _a = history(&remote).await;
-    let (_, len) = latest(&remote).await;
+    let (key, len) = latest(&remote).await;
     *remote.tamper.lock().unwrap() = Some(Tamper::Resize(len as usize / 2));
 
     let error = assert_full_or_error(&remote, len.div_ceil(3))
         .await
         .unwrap();
 
-    assert!(error.contains("no snapshot"), "{error}");
+    assert!(error.contains(&key), "{error}");
+    assert!(error.contains("do not match the key hash"), "{error}");
 }
 
 #[tokio::test]

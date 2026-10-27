@@ -261,10 +261,8 @@ impl<R: Remote + 'static> Engine<R> {
 
         // Another process with this identity wrote entries that a prune redacted.
         if entries.iter().any(|stashed| stashed.actions.is_none()) {
-            if !self.bootstrap(journal).await? {
-                return Err(EngineError::Corrupt(
-                    "redacted entries and no snapshot".to_string(),
-                ));
+            if let Err(none) = self.bootstrap(journal).await? {
+                return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
             }
             entries.clear();
         }

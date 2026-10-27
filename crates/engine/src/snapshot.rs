@@ -21,6 +21,19 @@ pub const SNAPSHOTS_PREFIX: &str = "snapshots/";
 /// The largest snapshot a proxy loads. The remote is not trusted with the size of the buffer.
 pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Why no snapshot loads: each skipped key with its cause.
+#[derive(Debug, Default)]
+pub(crate) struct NoSnapshot(Vec<String>);
+
+impl std::fmt::Display for NoSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("no snapshot in the remote");
+        }
+        write!(f, "no snapshot loads: {}", self.0.join("; "))
+    }
+}
+
 /// The write time and the hash in a snapshot key.
 fn parse_key(key: &str) -> Option<(u64, [u8; 32])> {
     let (time, hash) = key.strip_prefix(SNAPSHOTS_PREFIX)?.split_once('-')?;
@@ -59,16 +72,27 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     /// The newest snapshot that reads back intact.
-    pub(crate) async fn latest_snapshot(&self) -> Result<Option<Snapshot>> {
+    pub(crate) async fn latest_snapshot(
+        &self,
+    ) -> Result<std::result::Result<Snapshot, NoSnapshot>> {
+        let mut skipped = NoSnapshot::default();
         for key in self.remote.list(SNAPSHOTS_PREFIX).await?.iter().rev() {
             let Some((time, hash)) = parse_key(key) else {
                 continue;
             };
+            let mut skip = |cause: String| {
+                warn!(key, cause, "skipped a snapshot");
+                skipped.0.push(format!("{key}: {cause}"));
+            };
             let Some(sealed) = self.read_snapshot(key).await? else {
+                skip("it is gone".to_string());
                 continue;
             };
             if blake3::hash(&sealed).as_bytes() != &hash {
-                warn!(key, "skipped a snapshot that does not match its key");
+                skip(format!(
+                    "{} bytes that do not match the key hash",
+                    sealed.len()
+                ));
                 continue;
             }
             let plain =
@@ -79,18 +103,18 @@ impl<R: Remote + 'static> Engine<R> {
                 {
                     Ok(plain) => plain,
                     Err(e) => {
-                        warn!(key, %e, "skipped a snapshot that does not open");
+                        skip(format!("it does not open: {e}"));
                         continue;
                     }
                 };
 
             match Snapshot::decode(blake3::hash(&plain).as_bytes(), &plain) {
-                Ok(snapshot) => return Ok(Some(snapshot)),
-                Err(e) => warn!(key, %e, "skipped a bad snapshot"),
+                Ok(snapshot) => return Ok(Ok(snapshot)),
+                Err(e) => skip(format!("it does not decode: {e}")),
             }
         }
 
-        Ok(None)
+        Ok(Err(skipped))
     }
 
     /// The whole snapshot at `key`, read in ranges of `snapshot_part`. `None` if it is gone.
@@ -135,10 +159,14 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(Some(sealed))
     }
 
-    /// Replaces the index with the latest snapshot. Returns `false` when there is none.
-    pub(crate) async fn bootstrap(&self, journal: &mut Journal<R>) -> Result<bool> {
-        let Some(snapshot) = self.latest_snapshot().await? else {
-            return Ok(false);
+    /// Replaces the index with the latest snapshot. Returns why when none loads.
+    pub(crate) async fn bootstrap(
+        &self,
+        journal: &mut Journal<R>,
+    ) -> Result<std::result::Result<(), NoSnapshot>> {
+        let snapshot = match self.latest_snapshot().await? {
+            Ok(snapshot) => snapshot,
+            Err(none) => return Ok(Err(none)),
         };
 
         self.index().load(&snapshot)?;
@@ -153,13 +181,13 @@ impl<R: Remote + 'static> Engine<R> {
         self.index().persist()?;
         journal.reset(self.index().frontiers()?);
         info!(chains = snapshot.frontiers.len(), "loaded a snapshot");
-        Ok(true)
+        Ok(Ok(()))
     }
 
     /// Replaces every entry under the frontier of the latest snapshot with its
     /// redacted form. Returns the number of entries replaced.
     pub(crate) async fn prune_journal(&self) -> Result<usize> {
-        let Some(snapshot) = self.latest_snapshot().await? else {
+        let Ok(snapshot) = self.latest_snapshot().await? else {
             return Ok(0);
         };
 

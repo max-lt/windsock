@@ -23,10 +23,8 @@ impl<R: Remote + 'static> Engine<R> {
 
         // Entries under the latest snapshot can be redacted: read from the snapshot instead.
         if entries.iter().any(|entry| entry.actions.is_none()) {
-            if !self.bootstrap(journal).await? {
-                return Err(EngineError::Corrupt(
-                    "redacted entries and no snapshot".to_string(),
-                ));
+            if let Err(none) = self.bootstrap(journal).await? {
+                return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
             }
             entries = journal.sync_all().await?;
         }

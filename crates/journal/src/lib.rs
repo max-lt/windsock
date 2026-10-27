@@ -235,6 +235,17 @@ impl<R: Remote> Journal<R> {
         loop {
             let key = entry_key(node, frontier.next_seq);
             let Some(bytes) = self.remote.get(&key).await? else {
+                // A writer creates seq n before n + 1: a later entry with no entry here is a gap,
+                // and the chain would end here for this reader only.
+                let next = entry_key(node, frontier.next_seq + 1);
+                if self.remote.get(&next).await?.is_some() {
+                    return Err(JournalError::Chain {
+                        node,
+                        source: ChainError::Gap {
+                            seq: frontier.next_seq,
+                        },
+                    });
+                }
                 break;
             };
 
@@ -668,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reader_stops_at_a_gap() {
+    async fn test_reader_names_a_gap_as_a_broken_chain() {
         let remote = Arc::new(MemoryRemote::default());
         let a = journal(&remote, 1);
         let orphan = Entry::sign(
@@ -684,7 +695,18 @@ mod tests {
 
         let mut b = journal(&remote, 2);
 
-        assert!(b.sync_node(a.node()).await.unwrap().is_empty());
+        let result = b.sync_node(a.node()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(JournalError::Chain {
+                    source: ChainError::Gap { seq: 0 },
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
         assert_eq!(b.frontier(a.node()), Frontier::GENESIS);
     }
 

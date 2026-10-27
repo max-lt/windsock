@@ -9,7 +9,7 @@ use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::{Config, Engine, EngineError, WriteMode};
 use journal::{Action, Entry};
-use remote::{MemoryRemote, Remote};
+use remote::{MemoryRemote, Remote, Sweep};
 use tempfile::TempDir;
 
 const BUCKET: &str = "bkt";
@@ -287,4 +287,38 @@ async fn test_proxy_offline_past_a_prune_keeps_its_buffered_write() {
     let keys = ["early", "offline", "late0", "late2"];
     let all = [Some("a"), Some("b"), Some("a"), Some("a")];
     assert_all_see(&[&a, &b, &c], &keys, &all).await;
+}
+
+/// A reader of a chain with a gap names the chain as broken, applies nothing after the gap,
+/// and reads the other chains.
+#[tokio::test]
+async fn test_chain_with_a_gap_is_broken_alone() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    let b = proxy(&remote, 2).await;
+    b.engine.create_bucket(BUCKET, None).await.unwrap();
+    b.engine.flush().await.unwrap();
+    a.engine.sync().await.unwrap();
+    for key in ["k0", "k1", "k2"] {
+        put(&a.engine, key, "a").await;
+        a.engine.flush().await.unwrap();
+    }
+    put(&b.engine, "from-b", "b").await;
+    b.engine.flush().await.unwrap();
+    // Seqs 0 to 2 of a put k0 to k2: seq 1 is k1.
+    let gap = journal::entry_key(a.engine.node(), 1);
+    remote.delete(&gap).await.unwrap();
+
+    let c = proxy(&remote, 3).await;
+    let report = c.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, vec![a.engine.node()]);
+    assert_eq!(
+        view(&c.engine, &["k0", "k1", "k2", "from-b"]).await,
+        [None, None, None, Some("b".into())]
+    );
+    assert!(matches!(
+        c.engine.gc().await,
+        Err(EngineError::BrokenChains(_))
+    ));
 }

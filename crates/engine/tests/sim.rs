@@ -530,12 +530,15 @@ fn run_seeds(seeds: Range<u64>) {
 /// seeds take 26 minutes there: the ignored test runs 20,000.
 const NORMAL_SEEDS: u64 = 64;
 
-/// One seed from SIM_SEED, else the normal seeds.
+/// One seed from SIM_SEED, else SIM_SEEDS seeds from 0, else the normal seeds.
 #[test]
 fn test_simulation_of_three_proxies() {
     match std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok()) {
         Some(seed) => run_seeds(seed..seed + 1),
-        None => run_seeds(0..NORMAL_SEEDS),
+        None => {
+            let count = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok());
+            run_seeds(0..count.unwrap_or(NORMAL_SEEDS))
+        }
     }
 }
 

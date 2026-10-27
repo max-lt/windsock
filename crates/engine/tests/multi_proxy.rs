@@ -638,3 +638,65 @@ async fn test_last_modified_stays_the_same_across_the_flush() {
         buffered
     );
 }
+
+async fn open_config(remote: &Arc<MemoryRemote>, seed: u8, dir: TempDir, config: Config) -> Proxy {
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[seed; 32]),
+        keys(),
+        config,
+    )
+    .await
+    .unwrap();
+    Proxy { dir, engine }
+}
+
+/// A new proxy, with no chain yet, acks a put and stays away. Another proxy deletes the key,
+/// and after R the GC prunes the tombstone. The late put has a lower ack HLC than the delete:
+/// a commit would bring the key back. The proxy must refuse it and keep the record aside.
+#[tokio::test]
+async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
+    let remote = Arc::new(MemoryRemote::default());
+    let retention = Duration::from_millis(300);
+    let config = Config {
+        gc_horizon: retention,
+        retention,
+        ..Config::default()
+    };
+    let (a, _b) = with_bucket(&remote).await;
+    let late = open_config(&remote, 5, tempfile::tempdir().unwrap(), config.clone()).await;
+    put(&late.engine, "k", "late").await;
+    let gc = open_config(&remote, 6, tempfile::tempdir().unwrap(), config.clone()).await;
+    gc.engine.sync().await.unwrap();
+    a.engine.delete(BUCKET, "k").await.unwrap();
+    a.engine.flush().await.unwrap();
+    tokio::time::sleep(retention * 2).await;
+    put(&a.engine, "other", "x").await;
+    a.engine.flush().await.unwrap();
+    let report = gc.engine.gc().await.unwrap();
+    assert!(report.pruned_keys > 0, "{report:?}");
+
+    let flushed = late.engine.flush().await;
+
+    let Err(error) = flushed else {
+        panic!("a put older than R is committed");
+    };
+    assert!(error.to_string().contains("bkt/k"), "{error}");
+    assert_all_see(&[&a, &gc], &["k"], &[None]).await;
+    let Proxy { dir, engine } = late;
+    drop(engine);
+    let reopened = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[5; 32]),
+        keys(),
+        config,
+    )
+    .await;
+    let Err(error) = reopened else {
+        panic!("a proxy with a quarantine opens");
+    };
+    assert!(error.to_string().contains("quarantine"), "{error}");
+    assert!(dir.path().join("quarantine").exists());
+}

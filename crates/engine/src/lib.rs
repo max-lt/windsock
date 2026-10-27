@@ -38,7 +38,7 @@ use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use buffer::{Buffer, BufferedObject, BufferedPut, Durability, Head, Intent, Op, SegmentReader};
 use plan::{Fetch, Nonces, Planner};
@@ -55,6 +55,7 @@ pub const PACKS_PREFIX: &str = "packs/";
 const INDEX_DIR: &str = "index";
 const BUFFER_DIR: &str = "buffer";
 const ORPHANS_FILE: &str = "snapshot-orphans";
+const QUARANTINE_DIR: &str = "quarantine";
 const CACHE_DIR: &str = "cache";
 
 /// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
@@ -89,6 +90,8 @@ pub enum EngineError {
     Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error("buffered writes older than the late limit are in quarantine: {0}")]
+    Quarantined(String),
     #[error("the object has {size} bytes, over the limit of {limit} bytes")]
     ObjectTooLarge { size: u64, limit: u64 },
     #[error("the key and metadata take {size} bytes, over the limit of {limit} bytes")]
@@ -215,12 +218,51 @@ pub struct Engine<R> {
     flush_wanted: Notify,
     /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
     draining: AtomicBool,
+    /// A buffered write is older than R at flush: no write and no flush until a restart.
+    quarantined: AtomicBool,
     /// Snapshot bases with parts and no head, and when this node first listed each one
     /// (unix nanos of this node). Kept in `orphans_file`, so a restart keeps the count.
     orphans_seen: Mutex<BTreeMap<String, u64>>,
     orphans_file: PathBuf,
     /// Another node that wrote a condemn in the last H: a second GC runner.
     other_gc_node: Mutex<Option<NodeId>>,
+}
+
+/// Refuses to open with a quarantine, and puts there a buffer with a write older than the
+/// late limit, max(R, H).
+/// A commit of such a write could rank under a delete that a prune already removed, and bring
+/// the key back: the operator decides what to do with it.
+async fn quarantine_at_open(
+    dir: &Path,
+    buffer_dir: &Path,
+    buffer: &Buffer,
+    late_limit: Duration,
+) -> Result<()> {
+    let quarantine = dir.join(QUARANTINE_DIR);
+    let held = match std::fs::read_dir(&quarantine) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    };
+    if held {
+        return Err(EngineError::Quarantined(format!(
+            "{} holds writes that were never committed. Move it away to drop them, then start",
+            quarantine.display()
+        )));
+    }
+
+    let now = buffer::unix_nanos();
+    let late = buffer
+        .oldest_time()
+        .is_some_and(|oldest| oldest.saturating_add(late_limit.as_nanos() as u64) < now);
+    if !late {
+        return Ok(());
+    }
+    std::fs::rename(buffer_dir, &quarantine)?;
+    error!(path = %quarantine.display(), "buffered writes older than the late limit: moved to quarantine");
+    Err(EngineError::Quarantined(format!(
+        "{} holds writes that were never committed. Move it away to drop them, then start",
+        quarantine.display()
+    )))
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -257,6 +299,7 @@ impl<R: Remote + 'static> Engine<R> {
         if !buffer.is_empty() {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
         }
+        quarantine_at_open(dir, &buffer_dir, &buffer, config.late_limit()).await?;
 
         let engine = Self {
             node: journal.node(),
@@ -275,6 +318,7 @@ impl<R: Remote + 'static> Engine<R> {
             fresh_sync: Mutex::new(None),
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
+            quarantined: AtomicBool::new(false),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),
             other_gc_node: Mutex::new(None),

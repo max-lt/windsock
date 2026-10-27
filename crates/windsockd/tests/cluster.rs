@@ -464,7 +464,9 @@ async fn test_stop_waits_until_the_remote_has_the_buffer() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cluster = Cluster::new();
     let data = random_bytes(7, 200_000);
-    let mut a = start(&cluster.config("a", 600_000, false), "info");
+    // The outage lasts longer than 3 s: a shorter horizon would quarantine the buffered write.
+    let gc = "enabled = false\nhorizon_secs = 120\nretention_secs = 0";
+    let mut a = start(&cluster.config_with("a", 600_000, gc), "info");
     assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
     assert_eq!(put(&a, "/shared/kept", &data).await.status, StatusCode::OK);
 

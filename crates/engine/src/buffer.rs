@@ -244,6 +244,16 @@ pub(crate) struct BufferedPut {
     pub time: u64,
 }
 
+impl Op {
+    /// `bucket/key`, or the bucket name: what the record writes.
+    pub(crate) fn target(&self) -> String {
+        match self {
+            Op::Put { bucket, key, .. } | Op::Delete { bucket, key } => format!("{bucket}/{key}"),
+            Op::CreateBucket { bucket, .. } | Op::DeleteBucket { bucket } => bucket.clone(),
+        }
+    }
+}
+
 /// The last buffered write to one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BufferedObject {
@@ -339,6 +349,8 @@ pub(crate) struct Buffer {
     sealed: BTreeMap<u64, u64>,
     objects: BTreeMap<(String, String), BufferedObject>,
     buckets: BTreeMap<String, BufferedBucket>,
+    /// The lowest ack HLC of the records read or written since open.
+    oldest: Option<u64>,
     written: u64,
     durable: u64,
     lost: Vec<Range<u64>>,
@@ -367,6 +379,7 @@ impl Buffer {
             objects: BTreeMap::new(),
             buckets: BTreeMap::new(),
             written: 0,
+            oldest: None,
             durable: 0,
             lost: Vec::new(),
             broken: false,
@@ -387,6 +400,11 @@ impl Buffer {
 
         Ok(buffer)
     }
+    /// The lowest ack HLC of the records that this buffer replayed or took since open.
+    pub fn oldest_time(&self) -> Option<u64> {
+        self.oldest
+    }
+
     /// The latest ack HLC of the buffered writes. Zero for an empty buffer.
     pub fn latest_time(&self) -> u64 {
         let objects = self.objects.values().map(|object| match object {
@@ -585,6 +603,10 @@ impl Buffer {
     }
 
     fn track(&mut self, segment: u64, head: &Head, data_offset: u64, size: u64) {
+        self.oldest = Some(
+            self.oldest
+                .map_or(head.time, |oldest| oldest.min(head.time)),
+        );
         match &head.op {
             Op::Put {
                 bucket,

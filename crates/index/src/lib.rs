@@ -661,7 +661,11 @@ impl Index {
     pub fn stable_hlc(&self) -> Result<u64> {
         let frontiers = self.frontiers()?;
         let applied = frontiers.values().map(|f| f.last_hlc);
-        let pending = self.pending.iter().map(|e| e.hlc);
+        // A waiting entry can carry acks far under its own HLC.
+        let pending = self.pending.iter().map(|e| {
+            let acks = e.actions.iter().flatten().filter_map(Action::hlc);
+            acks.min().unwrap_or(e.hlc).min(e.hlc)
+        });
 
         Ok(applied.chain(pending).min().unwrap_or(0))
     }

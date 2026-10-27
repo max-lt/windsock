@@ -105,6 +105,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// A buffered write older than this at flush is not committed: a prune may have removed a
+    /// newer delete of its key. A prune keeps every version younger than R, and a GC never acts
+    /// on what is younger than H, so the limit is the larger of the two.
+    pub fn late_limit(&self) -> Duration {
+        self.retention.max(self.gc_horizon)
+    }
+
     pub fn policy(&self, bucket: &str, key: &str) -> Policy {
         self.policies
             .iter()

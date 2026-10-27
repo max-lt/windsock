@@ -127,12 +127,20 @@ impl<R: Remote + 'static> Engine<R> {
         );
         let mut planned = Vec::new();
         let mut objects = 0;
+        let mut late = Vec::new();
+        let oldest_allowed =
+            buffer::unix_nanos().saturating_sub(self.config.late_limit().as_nanos() as u64);
 
         for &seq in segments {
             let path = buffer::segment_path(&self.buffer_dir, seq);
             let mut reader = SegmentReader::open(&path).await?;
 
             while let Some(record) = reader.next(&path).await? {
+                // A commit could rank under a delete that a prune already removed.
+                if record.head.time < oldest_allowed {
+                    late.push(record.head.op.target());
+                    continue;
+                }
                 let next = match record.head.op {
                     Op::Put {
                         bucket,
@@ -172,6 +180,15 @@ impl<R: Remote + 'static> Engine<R> {
                 };
                 planned.push(next);
             }
+        }
+
+        if !late.is_empty() {
+            self.quarantined.store(true, Ordering::SeqCst);
+            let keys = late.join(", ");
+            error!(keys, "buffered writes older than the late limit: no commit");
+            return Err(EngineError::Quarantined(format!(
+                "{keys}. Restart the proxy to move them to quarantine"
+            )));
         }
 
         let (last, manifests) = planner.finish();

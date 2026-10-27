@@ -140,6 +140,11 @@ impl<R: Remote + 'static> Engine<R> {
         if self.draining.load(Ordering::SeqCst) {
             return Err(EngineError::Draining);
         }
+        if self.quarantined.load(Ordering::SeqCst) {
+            return Err(EngineError::Quarantined(
+                "restart the proxy to move the buffer to quarantine".to_string(),
+            ));
+        }
 
         let limit = self.config.buffer_limit;
 

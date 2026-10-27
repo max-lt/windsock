@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -425,4 +425,21 @@ fn test_init_does_not_overwrite_a_configuration() {
         .unwrap();
 
     assert!(!again.status.success());
+}
+
+fn run_fails_with(config: &Path) -> String {
+    let output = Command::new(BIN).arg("run").arg(config).output().unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn test_run_names_a_data_dir_it_cannot_make() {
+    let (dir, config, _) = init();
+    let data = dir.path().join("data");
+    std::fs::write(&data, "a file").unwrap();
+
+    let stderr = run_fails_with(&config);
+
+    assert!(stderr.contains(&data.display().to_string()), "{stderr}");
 }

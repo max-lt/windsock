@@ -261,7 +261,8 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
              half of it fails with StalePlan and never commits"
         );
     }
-    std::fs::create_dir_all(&config.data_dir)?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("cannot make {}", config.data_dir.display()))?;
     let key = node_key(&config.data_dir)?;
 
     match remote::check_before_serving(&*remote).await {

@@ -96,7 +96,7 @@ start again. `docs/storage.md` (Journal reads) gives the details.
 | R    | `gc.retention_secs`   | 24 h    | Old versions stay readable for R; the bound for an HLC ahead of a clock |
 | M    | `gc.late_margin_secs` | 1 h     | The clock skew that the late write rule allows                          |
 
-R and M are rules of the remote: the first proxy fixes them, and every other proxy must use the
+H, R and M are rules of the remote: the first proxy fixes them, and every other proxy must use the
 same values. When the remote is down for longer than R - M (23 h by default), the acked writes
 that wait in the buffer are older than the late limit. The proxy logs an ERROR with their keys,
 stops its flusher and refuses writes. At the next start, only those writes move to

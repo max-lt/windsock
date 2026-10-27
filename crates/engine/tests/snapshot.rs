@@ -154,6 +154,24 @@ struct Proxy {
     engine: Engine<TestRemote>,
 }
 
+thread_local! {
+    /// H, R and M of the first proxy with its own configuration in this test: every proxy of a
+    /// remote must use the same, so the default proxies of the test take them too.
+    static RULES: std::cell::Cell<Option<(Duration, Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The default configuration, with the rules of the remote of this test.
+fn default_config() -> Config {
+    let mut config = Config::default();
+    if let Some((horizon, retention, margin)) = RULES.with(std::cell::Cell::get) {
+        config.gc_horizon = horizon;
+        config.retention = retention;
+        config.late_margin = margin;
+    }
+    config
+}
+
 async fn open(remote: &Arc<TestRemote>, seed: u8, dir: TempDir) -> Proxy {
     let key = SigningKey::from_bytes(&[seed; 32]);
     let engine = Engine::open(
@@ -161,7 +179,7 @@ async fn open(remote: &Arc<TestRemote>, seed: u8, dir: TempDir) -> Proxy {
         remote.clone(),
         key,
         engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
-        Config::default(),
+        default_config(),
     )
     .await
     .unwrap();
@@ -690,6 +708,15 @@ async fn test_empty_snapshot_is_skipped_for_the_older_one() {
 }
 
 async fn proxy_config(remote: &Arc<TestRemote>, seed: u8, config: Config) -> Proxy {
+    RULES.with(|rules| {
+        if rules.get().is_none() {
+            rules.set(Some((
+                config.gc_horizon,
+                config.retention,
+                config.late_margin,
+            )));
+        }
+    });
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(
         dir.path(),

@@ -484,12 +484,103 @@ async fn test_proxy_with_another_retention_refuses_to_open() {
         panic!("a proxy with another retention opens");
     };
     let error = error.to_string();
+    let (held, ours) = error.split_once("this proxy has").unwrap();
+    assert!(held.contains("retention_ns 7200000000000"), "{error}");
+    assert!(ours.contains("retention_ns 9000000000000"), "{error}");
+}
+
+/// H is a rule of the remote too: a writer with a longer H could commit a plan that names a pack
+/// that the GC already deleted. A proxy with another H refuses to open.
+#[tokio::test]
+async fn test_proxy_with_another_horizon_refuses_to_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    let keys = || RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    let open = |seed: u8, horizon: u64| {
+        let remote = remote.clone();
+        async move {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                gc_horizon: std::time::Duration::from_secs(horizon),
+                ..Config::default()
+            };
+            let result = Engine::open(
+                dir.path(),
+                remote,
+                SigningKey::from_bytes(&[seed; 32]),
+                keys(),
+                config,
+            )
+            .await;
+            (dir, result)
+        }
+    };
+    let (_a, first) = open(1, 86_400).await;
+    first.unwrap();
+
+    let (_b, other) = open(2, 172_800).await;
+
+    let Err(error) = other else {
+        panic!("a proxy with another horizon opens");
+    };
     assert!(
-        error.contains("remote holds retention_ns 7200000000000"),
+        error.to_string().contains("horizon_ns 86400000000000"),
         "{error}"
     );
+}
+
+/// A key check of format 2 with no rules comes from an older build: the open says so.
+#[tokio::test]
+async fn test_key_check_with_no_rules_names_an_older_build() {
+    let remote = Arc::new(MemoryRemote::default());
+    let keys = RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    let context = b"windsock repository key check";
+    let old = keys.sealer().seal(
+        seal::Kind::KeyCheck,
+        context,
+        b"windsock repository key check\nformat 2",
+    );
+    remote
+        .create("repo/key-check", Bytes::from(old))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        keys,
+        Config::default(),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a key check with no rules opens");
+    };
     assert!(
-        error.contains("this proxy has retention_ns 9000000000000"),
+        error
+            .to_string()
+            .contains("written by an older build; create a new remote"),
         "{error}"
     );
+}
+
+/// A reader takes at most 1 GiB in one reply. A writer setting above the shared cap would write
+/// entries that other proxies cannot read: the open refuses it.
+#[tokio::test]
+async fn test_entry_cap_above_the_shared_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::open(
+        dir.path(),
+        Arc::new(MemoryRemote::default()),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config {
+            max_entry_actions: 2 << 30,
+            ..Config::default()
+        },
+    )
+    .await;
+
+    assert!(result.is_err(), "an entry cap of 2 GiB opens");
 }

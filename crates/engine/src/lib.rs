@@ -64,6 +64,9 @@ const CACHE_DIR: &str = "cache";
 /// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
 pub const KEY_CHECK_KEY: &str = "repo/key-check";
 const KEY_CHECK: &str = "windsock repository key check";
+/// The largest actions of one entry that a proxy writes. Half of the 1 GiB that a reader takes in
+/// one reply, so every proxy reads every entry whatever its own setting.
+pub const MAX_ENTRY_ACTIONS: u64 = 512 * 1024 * 1024;
 /// The remote format of this build: journal actions carry their ack HLC.
 const REMOTE_FORMAT: u32 = 2;
 
@@ -294,6 +297,7 @@ fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
 /// The rules that every proxy of one remote must share, kept in the key check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RepoRules {
+    horizon_ns: u64,
     retention_ns: u64,
     late_margin_ns: u64,
 }
@@ -301,8 +305,8 @@ struct RepoRules {
 impl RepoRules {
     fn text(&self) -> String {
         format!(
-            "retention_ns {}\nlate_margin_ns {}",
-            self.retention_ns, self.late_margin_ns
+            "horizon_ns {}\nretention_ns {}\nlate_margin_ns {}",
+            self.horizon_ns, self.retention_ns, self.late_margin_ns
         )
     }
 
@@ -315,9 +319,11 @@ impl RepoRules {
                 .parse()
                 .ok()
         };
+        let horizon_ns = value("horizon_ns")?;
         let retention_ns = value("retention_ns")?;
         let late_margin_ns = value("late_margin_ns")?;
         Some(Self {
+            horizon_ns,
             retention_ns,
             late_margin_ns,
         })
@@ -334,6 +340,13 @@ impl<R: Remote + 'static> Engine<R> {
         keys: Keys,
         config: Config,
     ) -> Result<Self> {
+        if config.max_entry_actions > MAX_ENTRY_ACTIONS {
+            return Err(EngineError::Config(format!(
+                "max_entry_actions ({}) is above {MAX_ENTRY_ACTIONS}: other proxies could not read \
+                 the entries",
+                config.max_entry_actions
+            )));
+        }
         if config.retention <= config.late_margin {
             return Err(EngineError::Config(format!(
                 "the retention ({:?}) must be above the late margin ({:?})",
@@ -462,6 +475,7 @@ impl<R: Remote + 'static> Engine<R> {
     async fn check_repo_key(&self) -> Result<()> {
         let sealer = self.keys.sealer();
         let ours = RepoRules {
+            horizon_ns: self.config.gc_horizon.as_nanos() as u64,
             retention_ns: self.config.retention.as_nanos() as u64,
             late_margin_ns: self.config.late_margin.as_nanos() as u64,
         };
@@ -511,13 +525,16 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
 
-        let theirs = RepoRules::parse(lines);
-        if theirs != Some(ours) {
-            let held = theirs.map_or("no rules".to_string(), |rules| rules.text());
+        let Some(theirs) = RepoRules::parse(lines) else {
+            return Err(EngineError::Config(format!(
+                "{KEY_CHECK_KEY}: this remote was written by an older build; create a new remote"
+            )));
+        };
+        if theirs != ours {
             return Err(EngineError::Config(format!(
                 "the remote holds {}; this proxy has {}. Every proxy of a remote needs the \
-                 same gc.retention_secs and gc.late_margin_secs",
-                held.replace('\n', ", "),
+                 same gc.horizon_secs, gc.retention_secs and gc.late_margin_secs",
+                theirs.text().replace('\n', ", "),
                 ours.text().replace('\n', ", ")
             )));
         }

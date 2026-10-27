@@ -120,6 +120,11 @@ impl<R: Remote + 'static> Engine<R> {
         self.config.buffer_limit.min(buffer::MAX_DATA_LEN)
     }
 
+    /// True when the local index refuses every call until a restart, as after a full disk.
+    pub fn index_is_poisoned(&self) -> bool {
+        self.index().is_poisoned()
+    }
+
     /// Bytes in the buffer that are not in the remote yet.
     pub async fn buffered_bytes(&self) -> u64 {
         self.buffer.lock().await.bytes()

@@ -23,7 +23,7 @@ use s3remote::{Retry, S3Config, S3Remote};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
@@ -305,6 +305,20 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
             async move { engine.sync().await.map(|_| ()).map_err(|e| e.to_string()) }
         },
     ));
+    // A failed index write poisons the store: only a restart opens it again.
+    let watched = engine.clone();
+    background.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if watched.index_is_poisoned() {
+                error!(
+                    "the local index refuses every call after a failed write, often a full \
+                     disk: stopping. The buffer is on disk and flushes at the next start"
+                );
+                std::process::exit(1);
+            }
+        }
+    }));
     if config.gc.enabled {
         info!(
             interval_secs = config.gc.interval_secs,

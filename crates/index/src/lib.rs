@@ -168,6 +168,14 @@ impl Index {
         })
     }
 
+    /// True when a failed write made the store refuse every call until a restart.
+    pub fn is_poisoned(&self) -> bool {
+        matches!(
+            self.db.persist(PersistMode::Buffer),
+            Err(fjall::Error::Poisoned)
+        )
+    }
+
     /// Flushes every applied entry to disk.
     pub fn persist(&self) -> Result<()> {
         self.db.persist(PersistMode::SyncAll)?;

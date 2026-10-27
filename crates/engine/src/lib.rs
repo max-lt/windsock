@@ -238,6 +238,7 @@ async fn quarantine_at_open(
     dir: &Path,
     buffer_dir: &Path,
     buffer: &Buffer,
+    now: u64,
     late_limit: Duration,
 ) -> Result<()> {
     let quarantine = dir.join(QUARANTINE_DIR);
@@ -249,7 +250,7 @@ async fn quarantine_at_open(
         )))
     };
 
-    let limit = buffer::unix_nanos().saturating_sub(late_limit.as_nanos() as u64);
+    let limit = now.saturating_sub(late_limit.as_nanos() as u64);
     if buffer.oldest_time().is_some_and(|oldest| oldest < limit) {
         let moved = buffer::quarantine_late(buffer_dir, &quarantine, limit).await?;
         let keys = moved.join(", ");
@@ -348,7 +349,9 @@ impl<R: Remote + 'static> Engine<R> {
         if !buffer.is_empty() {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
         }
-        quarantine_at_open(dir, &buffer_dir, &buffer, config.late_limit()).await?;
+        // The commit measures an ack against its entry HLC: the clock, not the wall clock.
+        let now = clock.last().max(buffer::unix_nanos());
+        quarantine_at_open(dir, &buffer_dir, &buffer, now, config.late_limit()).await?;
 
         let engine = Self {
             node: journal.node(),

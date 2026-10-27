@@ -122,7 +122,8 @@ impl<R: Remote + 'static> Engine<R> {
 
     pub(crate) async fn flush_segments(&self, segments: &[u64]) -> Result<Flushed> {
         // A late record stops the flush before any plan or upload: it can never commit.
-        let limit = buffer::unix_nanos().saturating_sub(self.config.late_limit().as_nanos() as u64);
+        let now = self.clock.last().max(buffer::unix_nanos());
+        let limit = now.saturating_sub(self.config.late_limit().as_nanos() as u64);
         let late = {
             let buffer = self.buffer.lock().await;
             match buffer.oldest_in(segments) {

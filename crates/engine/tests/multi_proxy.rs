@@ -789,3 +789,44 @@ async fn test_ack_after_a_lost_index_ranks_above_the_own_entries_after_the_snaps
 
     assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
 }
+
+/// After an ack, the clock of the proxy moves ahead of its wall clock: the commit finds the ack
+/// late by its entry HLC. The next open must apply the same rule and quarantine the write, or the
+/// proxy refuses the commit at every start.
+#[tokio::test]
+async fn test_open_quarantines_what_the_commit_finds_late() {
+    let remote = Arc::new(MemoryRemote::default());
+    let config = Config {
+        gc_horizon: HORIZON,
+        retention: Duration::from_secs(3),
+        late_margin: Duration::from_secs(1),
+        ..Config::default()
+    };
+    let a = open_config(&remote, 1, tempfile::tempdir().unwrap(), config.clone()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    put(&a.engine, "k", "late").await;
+    let ahead = now_nanos() + 2_500_000_000;
+    forged_entry(&remote, 9, ahead, vec![delete("x", ahead)]).await;
+    a.engine.sync().await.unwrap();
+    assert!(matches!(
+        a.engine.flush().await,
+        Err(EngineError::Quarantined(_))
+    ));
+    let Proxy { dir, engine } = a;
+    drop(engine);
+
+    let reopened = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        keys(),
+        config,
+    )
+    .await;
+
+    let Err(error) = reopened else {
+        panic!("the open does not quarantine what the commit refuses");
+    };
+    assert!(error.to_string().contains("bkt/k"), "{error}");
+}

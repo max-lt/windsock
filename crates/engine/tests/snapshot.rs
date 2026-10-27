@@ -947,3 +947,74 @@ async fn test_parts_left_by_a_gc_that_died_are_deleted_by_the_next_run() {
     let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
     assert!(old.iter().all(|key| !left.contains(key)), "{left:?}");
 }
+
+/// Replaces a snapshot in parts with the same snapshot in one object.
+async fn to_one_object(remote: &TestRemote, head: &str) {
+    let base = head.strip_suffix("/head").unwrap();
+    let mut whole = Vec::new();
+    for key in remote.list(&format!("{base}/")).await.unwrap() {
+        if !key.ends_with("/head") {
+            whole.extend_from_slice(&remote.inner.get(&key).await.unwrap().unwrap());
+        }
+        remote.inner.delete(&key).await.unwrap();
+    }
+    remote.inner.put(base, Bytes::from(whole)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_newest_snapshot_in_parts_that_fails_falls_back_to_an_older_single_object() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    let older = a.engine.snapshot().await.unwrap();
+    to_one_object(&remote, &older).await;
+    put(&a.engine, "y", "two").await;
+    a.engine.flush().await.unwrap();
+    let newer = a.engine.snapshot().await.unwrap();
+    let part = format!("{}/000000", newer.strip_suffix("/head").unwrap());
+    remote
+        .inner
+        .put(&part, Bytes::from_static(b"bad"))
+        .await
+        .unwrap();
+    remote.snapshot_ranges.store(0, Ordering::SeqCst);
+
+    let b = proxy(&remote, 2).await;
+
+    let older = older.strip_suffix("/head").unwrap().to_string();
+    assert!(remote.inner.get(&older).await.unwrap().is_some());
+    assert!(
+        remote.snapshot_ranges.load(Ordering::SeqCst) >= 4,
+        "the newest parts, then the older object"
+    );
+    assert_eq!(get(&b.engine, "x").await, "one");
+    assert_eq!(get(&b.engine, "y").await, "two");
+}
+
+#[tokio::test]
+async fn test_two_proxies_that_write_a_snapshot_at_once_get_two_keys_that_load() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    let b = proxy_config(&remote, 2, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    b.engine.sync().await.unwrap();
+
+    let (first, second) = tokio::join!(a.engine.snapshot(), b.engine.snapshot());
+    let (first, second) = (first.unwrap(), second.unwrap());
+
+    assert_ne!(first, second);
+    assert_eq!(heads(&remote).await, 2);
+    for head in [&first, &second] {
+        let fresh = proxy(&remote, 3).await;
+        assert_eq!(get(&fresh.engine, "x").await, "one");
+        drop(fresh);
+        let base = head.strip_suffix("/head").unwrap();
+        for key in remote.list(&format!("{base}/")).await.unwrap() {
+            remote.inner.delete(&key).await.unwrap();
+        }
+    }
+}

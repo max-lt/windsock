@@ -25,7 +25,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use cache::{CacheError, ChunkCache};
@@ -221,9 +221,12 @@ pub struct Engine<R> {
     flushing: tokio::sync::Mutex<()>,
     /// One buffer fsync at a time. The writes that arrive during an fsync share the next one.
     syncing: tokio::sync::Mutex<()>,
-    last_sync: Mutex<Option<Instant>>,
+    /// Monotonic nanoseconds at the start of the last sync.
+    last_sync: Mutex<Option<u64>>,
     /// Start of the last sync that succeeded: GC rule 1 for dedup.
-    fresh_sync: Mutex<Option<Instant>>,
+    fresh_sync: Mutex<Option<u64>>,
+    /// The plan time of the last intent that this process wrote.
+    own_plan: Mutex<Option<u64>>,
     flush_wanted: Notify,
     /// Set at shutdown: the buffer takes no new write, so a last flush empties it.
     draining: AtomicBool,
@@ -377,6 +380,7 @@ impl<R: Remote + 'static> Engine<R> {
             syncing: tokio::sync::Mutex::new(()),
             last_sync: Mutex::new(None),
             fresh_sync: Mutex::new(None),
+            own_plan: Mutex::new(None),
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),

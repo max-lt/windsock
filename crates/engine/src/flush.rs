@@ -100,7 +100,13 @@ impl<R: Remote + 'static> Engine<R> {
         if !journal.is_written(&intent.entry).await? {
             self.refuse_late(&entry, buffer::unix_nanos().max(entry.hlc))?;
         }
-        let written = if self.plan_is_stale(intent.planned_at) {
+        // An intent of an earlier process has a plan of unknown age: look it up, never commit it.
+        let ours = *self
+            .own_plan
+            .lock()
+            .expect("no panic while the lock is held")
+            == Some(intent.planned_at);
+        let written = if !ours || self.plan_is_stale(intent.planned_at) {
             journal.is_written(&intent.entry).await?
         } else {
             journal.commit(&intent.entry).await? == Commit::Written
@@ -139,7 +145,8 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
         let dedup = self.ensure_fresh_sync().await?;
-        let planned_at = buffer::unix_nanos();
+        // A local elapsed time: a wall clock step must not make an old plan look young.
+        let planned_at = journal::monotonic_nanos();
         let seed = blake3::Hasher::new()
             .update(self.node.as_bytes())
             .update(&buffer::unix_nanos().to_le_bytes())
@@ -362,6 +369,10 @@ impl<R: Remote + 'static> Engine<R> {
                 planned_at,
             };
             self.refuse_late(&intent.entry, intent.entry.hlc)?;
+            *self
+                .own_plan
+                .lock()
+                .expect("no panic while the lock is held") = Some(planned_at);
             buffer::write_intent(&self.buffer_dir, &intent).await?;
             crate::sim::crash_point(crate::sim::Point::Intent)?;
 

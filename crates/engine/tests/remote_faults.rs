@@ -640,3 +640,50 @@ async fn test_first_entry_with_a_lost_answer_is_visible_to_other_proxies() {
     let object = reader.engine.get(BUCKET, "k", None).await.unwrap();
     assert_eq!(object.data, data());
 }
+
+/// GC rule 2 measures the age of a plan on a clock that never steps back. A wall clock that runs
+/// H ahead and then steps back must not make an old plan look young: the flush plans again.
+#[tokio::test]
+async fn test_wall_clock_step_back_does_not_make_an_old_plan_young() {
+    let horizon = Duration::from_secs(600);
+    let start = 1_900_000_000_000_000_000;
+    journal::set_manual_wall(Some(start));
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config {
+            gc_horizon: horizon,
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = engine.put(
+        BUCKET,
+        "k",
+        Bytes::from(data()),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    remote.fail_next("log/", Fault::Refuse);
+    assert!(engine.flush().await.is_err());
+    assert_eq!(remote.inner.list("packs/").await.unwrap().len(), 1);
+
+    journal::set_manual_wall(Some(start + horizon.as_nanos() as u64));
+    journal::set_manual_wall(Some(start));
+    engine.flush().await.unwrap();
+
+    assert_eq!(
+        remote.inner.list("packs/").await.unwrap().len(),
+        2,
+        "the old plan is stale: the flush planned and uploaded again"
+    );
+    journal::set_manual_wall(None);
+}

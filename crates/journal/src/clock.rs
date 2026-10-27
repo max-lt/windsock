@@ -7,6 +7,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 thread_local! {
     /// A wall clock that a test sets on its thread. Zero: the system clock.
     static MANUAL_WALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The highest manual wall clock so far: a monotonic clock that never steps back.
+    static MANUAL_MONOTONIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Nanoseconds on a clock that never steps back, from an arbitrary start: for elapsed times.
+pub fn monotonic_nanos() -> u64 {
+    #[cfg(feature = "sim")]
+    if MANUAL_WALL.with(std::cell::Cell::get) != 0 {
+        return MANUAL_MONOTONIC.with(std::cell::Cell::get);
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 fn system_nanos() -> u64 {
@@ -35,6 +50,8 @@ pub fn wall_clock_nanos() -> u64 {
 #[cfg(feature = "sim")]
 pub fn set_manual_wall(nanos: Option<u64>) {
     MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
+    let nanos = nanos.unwrap_or(0);
+    MANUAL_MONOTONIC.with(|mono| mono.set(mono.get().max(nanos)));
 }
 
 /// The highest HLC that a reader takes now, `ahead` past its wall clock.

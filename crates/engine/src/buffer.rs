@@ -288,7 +288,8 @@ pub(crate) struct BufferedBucket {
 pub(crate) struct Intent {
     pub entry: Entry,
     pub segments: Vec<u64>,
-    /// Unix nanoseconds when the flush started its plan. An old plan is never committed.
+    /// Monotonic nanoseconds of this process when the flush started its plan. A plan older
+    /// than H/2 is never committed; an intent of another process is never committed either.
     pub planned_at: u64,
 }
 

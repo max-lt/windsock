@@ -13,7 +13,7 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     pub(crate) async fn sync_locked(&self, journal: &mut Journal<R>) -> Result<SyncReport> {
-        let started = Instant::now();
+        let started = journal::monotonic_nanos();
         *self
             .last_sync
             .lock()
@@ -89,7 +89,10 @@ impl<R: Remote + 'static> Engine<R> {
             self.fresh_sync
                 .lock()
                 .expect("no panic while the lock is held")
-                .is_some_and(|started| started.elapsed() < self.config.gc_horizon / 2)
+                .is_some_and(|started| {
+                    let elapsed = journal::monotonic_nanos().saturating_sub(started);
+                    elapsed < (self.config.gc_horizon / 2).as_nanos() as u64
+                })
         };
 
         if fresh() {
@@ -106,7 +109,7 @@ impl<R: Remote + 'static> Engine<R> {
 
     pub(crate) fn plan_is_stale(&self, planned_at: u64) -> bool {
         let half = (self.config.gc_horizon / 2).as_nanos() as u64;
-        buffer::unix_nanos() >= planned_at.saturating_add(half)
+        journal::monotonic_nanos() >= planned_at.saturating_add(half)
     }
 
     /// Runs `op`. On a missing bucket or key, syncs once and runs it again,
@@ -132,7 +135,9 @@ impl<R: Remote + 'static> Engine<R> {
             .last_sync
             .lock()
             .expect("no panic while the lock is held")
-            .is_none_or(|last| last.elapsed() >= SYNC_DEBOUNCE);
+            .is_none_or(|last| {
+                journal::monotonic_nanos().saturating_sub(last) >= SYNC_DEBOUNCE.as_nanos() as u64
+            });
 
         if !due {
             return Ok(false);

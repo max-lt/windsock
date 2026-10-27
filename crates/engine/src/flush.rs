@@ -8,6 +8,13 @@ const SEGMENTS_PER_ENTRY: usize = 16;
 /// Commits that lose the seq to another process before a flush gives up.
 const MAX_COMMIT_ATTEMPTS: u32 = 8;
 
+#[derive(PartialEq)]
+pub(crate) enum Flushed {
+    Committed,
+    /// The actions are over `max_entry_actions`: flush fewer segments. Nothing is committed.
+    TooLarge,
+}
+
 /// A flushed record, in buffer order.
 enum Planned {
     /// The n-th object given to the planner.
@@ -28,7 +35,14 @@ impl<R: Remote + 'static> Engine<R> {
         let sealed = self.buffer.lock().await.seal().await?;
 
         for batch in sealed.chunks(SEGMENTS_PER_ENTRY) {
-            self.flush_segments(batch).await?;
+            let mut todo = vec![batch.to_vec()];
+            while let Some(segments) = todo.pop() {
+                if self.flush_segments(&segments).await? == Flushed::TooLarge {
+                    let (first, rest) = segments.split_at(segments.len() / 2);
+                    todo.push(rest.to_vec());
+                    todo.push(first.to_vec());
+                }
+            }
         }
 
         Ok(())
@@ -83,7 +97,7 @@ impl<R: Remote + 'static> Engine<R> {
         buffer::remove_intent(&self.buffer_dir).await
     }
 
-    pub(crate) async fn flush_segments(&self, segments: &[u64]) -> Result<()> {
+    pub(crate) async fn flush_segments(&self, segments: &[u64]) -> Result<Flushed> {
         let dedup = self.ensure_fresh_sync().await?;
         let planned_at = buffer::unix_nanos();
         let seed = blake3::Hasher::new()
@@ -159,6 +173,18 @@ impl<R: Remote + 'static> Engine<R> {
             });
         }
 
+        let size = postcard::to_allocvec(&actions)
+            .expect("actions always serialize")
+            .len() as u64;
+        if size > self.config.max_entry_actions && segments.len() > 1 {
+            debug!(
+                size,
+                segments = segments.len(),
+                "entry too large: split the segments"
+            );
+            return Ok(Flushed::TooLarge);
+        }
+
         let mut journal = self.journal.lock().await;
         let entry = self
             .commit(&mut journal, actions, segments, planned_at)
@@ -168,7 +194,8 @@ impl<R: Remote + 'static> Engine<R> {
         drop(journal);
 
         self.buffer.lock().await.release(segments).await?;
-        buffer::remove_intent(&self.buffer_dir).await
+        buffer::remove_intent(&self.buffer_dir).await?;
+        Ok(Flushed::Committed)
     }
 
     pub(crate) fn stored_chunk(&self, id: ChunkId) -> Result<Option<ChunkRef>> {

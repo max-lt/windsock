@@ -882,3 +882,31 @@ async fn test_flusher_uploads_within_the_delay() {
     flusher.abort();
     drop(a.dir);
 }
+
+#[tokio::test]
+async fn test_flush_splits_actions_over_the_entry_cap_into_more_entries() {
+    let remote = Arc::new(MemoryRemote::default());
+    let config = Config {
+        pack_target: 4 * 1024,
+        max_entry_actions: 2 * 1024,
+        ..Config::default()
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let keys: Vec<String> = (0..64).map(|n| format!("key-{n:03}")).collect();
+    for key in &keys {
+        put(&a.engine, key, &[7u8; 200]).await;
+    }
+
+    a.engine.flush().await.unwrap();
+
+    let entries = remote.list(journal::LOG_PREFIX).await.unwrap();
+    assert!(entries.len() > 3, "{} entries", entries.len());
+    let b = proxy(&remote, 2).await;
+    b.engine.sync().await.unwrap();
+    for key in &keys {
+        let object = b.engine.get(BUCKET, key, None).await.unwrap();
+        assert_eq!(&object.data[..], &[7u8; 200]);
+    }
+}

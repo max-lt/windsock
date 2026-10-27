@@ -257,8 +257,11 @@ impl<R: Remote + 'static> Engine<R> {
         // On failure, the first sync that meets a redacted entry loads it.
         if engine.index().frontiers()?.is_empty() {
             let mut journal = engine.journal.lock().await;
-            if let Err(e) = engine.bootstrap(&mut journal).await {
-                warn!(%e, "no snapshot loaded at open");
+            match engine.bootstrap(&mut journal).await {
+                Ok(Ok(())) => {}
+                Ok(Err(none)) if none.is_empty() => {}
+                Ok(Err(none)) => warn!(%none, "no snapshot loaded at open"),
+                Err(e) => warn!(%e, "no snapshot loaded at open"),
             }
         }
 

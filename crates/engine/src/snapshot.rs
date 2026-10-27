@@ -104,6 +104,13 @@ pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub(crate) struct NoSnapshot(Vec<String>);
 
+impl NoSnapshot {
+    /// True when the remote has no snapshot at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl std::fmt::Display for NoSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.is_empty() {

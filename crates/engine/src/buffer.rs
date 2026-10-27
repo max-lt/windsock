@@ -36,8 +36,35 @@ const MAX_HEAD_LEN: u32 = 64 * 1024;
 pub(crate) const MAX_DATA_LEN: u64 = 5 << 30;
 
 const SEGMENT_SUFFIX: &str = ".log";
+
+/// The record format of this build. Segments of another format must not decode.
+const FORMAT: u32 = 2;
+const FORMAT_FILE: &str = "format";
 const INTENT_FILE: &str = "intent";
 const INTENT_TEMP: &str = ".intent.tmp";
+
+/// Refuses a buffer directory of another record format. A buffer with segments and no format
+/// file comes from format 1. An empty directory gets the format of this build.
+async fn check_format(dir: &Path, has_segments: bool) -> Result<(), EngineError> {
+    let path = dir.join(FORMAT_FILE);
+    let found = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text.trim().parse::<u32>().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && has_segments => 1,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::write(&path, format!("{FORMAT}\n")).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if found != FORMAT {
+        return Err(EngineError::Corrupt(format!(
+            "{}: the buffer has record format {found}, this build reads format {FORMAT}. \
+             Flush it with the build that wrote it",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
 
 pub(crate) fn unix_nanos() -> u64 {
     SystemTime::now()
@@ -48,7 +75,7 @@ pub(crate) fn unix_nanos() -> u64 {
 /// The fixed part of a record. The data of a put follows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Head {
-    /// Unix nanoseconds at acknowledgement.
+    /// HLC of the ack, in unix nanoseconds: never under an earlier ack of this proxy.
     pub time: u64,
     pub op: Op,
 }
@@ -331,6 +358,7 @@ impl Buffer {
         tokio::fs::create_dir_all(&dir).await?;
 
         let existing = list_segments(&dir).await?;
+        check_format(&dir, !existing.is_empty()).await?;
         let mut buffer = Self {
             active: create_segment(&dir, existing.last().map_or(0, |last| last + 1)).await?,
             dir,
@@ -358,6 +386,15 @@ impl Buffer {
         }
 
         Ok(buffer)
+    }
+    /// The latest ack HLC of the buffered writes. Zero for an empty buffer.
+    pub fn latest_time(&self) -> u64 {
+        let objects = self.objects.values().map(|object| match object {
+            BufferedObject::Put(put) => put.time,
+            BufferedObject::Delete { time, .. } => *time,
+        });
+        let buckets = self.buckets.values().map(|bucket| bucket.time);
+        objects.chain(buckets).max().unwrap_or(0)
     }
 
     async fn replay(&mut self, seq: u64, on_invalid: OnInvalid) -> Result<(), EngineError> {
@@ -799,6 +836,11 @@ mod tests {
         }
     }
 
+    /// A buffer directory of the format of this build, for segments that a test writes.
+    fn formatted(dir: &Path) {
+        std::fs::write(dir.join(FORMAT_FILE), format!("{FORMAT}\n")).unwrap();
+    }
+
     async fn records(buffer: &Buffer, seq: u64) -> Vec<Record> {
         let path = buffer.segment_path(seq);
         let mut reader = SegmentReader::open(&path).await.unwrap();
@@ -817,6 +859,24 @@ mod tests {
             blake3::hash(&bytes).to_string(),
             "16160308b47a1cbf772609dd37102a41263dad1f0d306352d659a7f905102949"
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_of_another_format_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+            buffer.append(put("k", b"v"), b"v").await.unwrap();
+        }
+        std::fs::remove_file(dir.path().join(FORMAT_FILE)).unwrap();
+
+        let Err(error) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("a buffer with no format file opens");
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("record format 1"), "{text}");
+        assert!(text.contains("format 2"), "{text}");
     }
 
     #[tokio::test]
@@ -916,6 +976,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_segment_file_is_removed_at_open() {
         let dir = tempfile::tempdir().unwrap();
+        formatted(dir.path());
         std::fs::write(segment_path(dir.path(), 4), b"").unwrap();
 
         let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
@@ -939,6 +1000,7 @@ mod tests {
     #[tokio::test]
     async fn test_huge_record_length_in_the_last_segment_is_a_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
+        formatted(dir.path());
         segment_with_a_huge_length(dir.path(), 0).await;
 
         let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
@@ -949,6 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn test_huge_record_length_in_an_older_segment_names_the_file_and_offset() {
         let dir = tempfile::tempdir().unwrap();
+        formatted(dir.path());
         segment_with_a_huge_length(dir.path(), 0).await;
         tokio::fs::write(
             segment_path(dir.path(), 1),
@@ -986,6 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn test_gap_in_segment_numbers_replays_every_segment() {
         let dir = tempfile::tempdir().unwrap();
+        formatted(dir.path());
         for (seq, key) in [(0, "a"), (2, "b")] {
             let record = encode_record(&put(key, b"v"), b"v");
             tokio::fs::write(segment_path(dir.path(), seq), record)
@@ -1002,6 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_of_2000_small_segments_takes_seconds_at_most() {
         let dir = tempfile::tempdir().unwrap();
+        formatted(dir.path());
         for seq in 0..2000u64 {
             let key = format!("k{seq}");
             let record = encode_record(&put(&key, b"v"), b"v");

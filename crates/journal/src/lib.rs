@@ -30,7 +30,7 @@ pub use entry::{
     redact_wire,
 };
 
-use clock::HybridClock;
+pub use clock::HybridClock;
 
 /// Appends that lose the seq to another process before `append` gives up.
 const MAX_ATTEMPTS: u32 = 8;
@@ -77,7 +77,7 @@ pub struct Journal<R> {
     signing_key: SigningKey,
     sealer: Sealer,
     node: NodeId,
-    clock: HybridClock,
+    clock: Arc<HybridClock>,
     frontiers: Frontiers,
     /// Own-chain entries read while a commit resolved a taken seq, not yet returned.
     stashed: Vec<Entry>,
@@ -106,7 +106,7 @@ impl<R: Remote> Journal<R> {
             signing_key,
             sealer,
             node,
-            clock: HybridClock::default(),
+            clock: Arc::new(HybridClock::default()),
             frontiers,
             stashed: Vec::new(),
             broken: BTreeMap::new(),
@@ -117,6 +117,11 @@ impl<R: Remote> Journal<R> {
 
     pub fn node(&self) -> NodeId {
         self.node
+    }
+
+    /// The clock of this node: the entries and the acks of its writes take their HLC from it.
+    pub fn clock(&self) -> Arc<HybridClock> {
+        self.clock.clone()
     }
 
     pub fn frontiers(&self) -> &Frontiers {

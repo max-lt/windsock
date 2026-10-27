@@ -569,3 +569,24 @@ async fn test_extreme_and_duplicate_seqs_break_the_chain_with_no_panic() {
         assert_eq!(report.broken, vec![node], "seq {seq}");
     }
 }
+
+/// A proxy saw an HLC 1 h ahead of its wall clock, then restarts. Its next ack must still rank
+/// above what it saw: the clock never goes down across a restart.
+#[tokio::test]
+async fn test_ack_after_a_restart_ranks_above_an_hlc_seen_before() {
+    let remote = Arc::new(MemoryRemote::default());
+    let (a, b) = with_bucket(&remote).await;
+    put(&a.engine, "k", "one").await;
+    a.engine.flush().await.unwrap();
+    let ahead = now_nanos() + HORIZON.as_nanos() as u64;
+    forged_entry(&remote, 9, ahead, vec![delete("k", ahead)]).await;
+    a.engine.sync().await.unwrap();
+    let Proxy { dir, engine } = a;
+    drop(engine);
+
+    let a = open_in(&remote, 1, dir).await;
+    put(&a.engine, "k", "two").await;
+    a.engine.flush().await.unwrap();
+
+    assert_all_see(&[&a, &b], &["k"], &[Some("two")]).await;
+}

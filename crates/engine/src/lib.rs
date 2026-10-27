@@ -30,7 +30,7 @@ use bytes::Bytes;
 use cache::{CacheError, ChunkCache};
 use ed25519_dalek::SigningKey;
 use index::{ChunkLocation, Index, IndexError};
-use journal::{Action, Commit, Entry, Journal, JournalError};
+use journal::{Action, Commit, Entry, HybridClock, Journal, JournalError};
 pub use list::{ListAfter, ListEntry, ListPage, ListQuery};
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
@@ -196,6 +196,8 @@ pub struct Engine<R> {
     node: NodeId,
     buffer_dir: PathBuf,
     journal: tokio::sync::Mutex<Journal<R>>,
+    /// The HLC of acks and entries: max(wall clock, last one issued or seen) + 1.
+    clock: Arc<HybridClock>,
     index: Mutex<Index>,
     buffer: tokio::sync::Mutex<Buffer>,
     cache: Option<ChunkCache>,
@@ -239,6 +241,12 @@ impl<R: Remote + 'static> Engine<R> {
         );
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
+        // The wall clock can step back across a restart: an ack never goes under an earlier one.
+        let clock = journal.clock();
+        for frontier in index.frontiers()?.values() {
+            clock.witness(frontier.last_hlc);
+        }
+        clock.witness(buffer.latest_time());
         let cache = match config.cache_bytes {
             0 => None,
             bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),
@@ -255,6 +263,7 @@ impl<R: Remote + 'static> Engine<R> {
             config,
             buffer_dir,
             journal: tokio::sync::Mutex::new(journal),
+            clock,
             index: Mutex::new(index),
             buffer: tokio::sync::Mutex::new(buffer),
             cache,

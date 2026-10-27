@@ -39,7 +39,7 @@ impl<R: Remote + 'static> Engine<R> {
                     });
                 }
 
-                let time = buffer::unix_nanos();
+                let time = self.clock.tick();
                 let op = Op::Put {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -127,7 +127,7 @@ impl<R: Remote + 'static> Engine<R> {
 
     /// Appends a record. Returns its number for [`Engine::acknowledge`].
     pub(crate) async fn append(&self, buffer: &mut Buffer, op: Op, data: &[u8]) -> Result<u64> {
-        self.append_at(buffer, buffer::unix_nanos(), op, data).await
+        self.append_at(buffer, self.clock.tick(), op, data).await
     }
 
     pub(crate) async fn append_at(

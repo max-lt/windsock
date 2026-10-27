@@ -249,24 +249,10 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(Ok(sealed))
     }
 
-    /// Frontiers of the newest snapshot. A head gives them with no read of the parts.
-    async fn latest_frontiers(&self) -> Result<Option<Frontiers>> {
-        let keys = self.remote.list(SNAPSHOTS_PREFIX).await?;
-        let Some(newest) = stored(&keys).pop() else {
-            return Ok(None);
-        };
-        if newest.form == Form::Parts
-            && let Ok(head) = self.read_head(&newest.base).await?
-        {
-            return Ok(Some(head.frontiers));
-        }
-        Ok(self.latest_snapshot().await?.ok().map(|s| s.frontiers))
-    }
-
-    /// The newest snapshot that reads back intact.
+    /// The newest snapshot that reads back intact, with its write time.
     pub(crate) async fn latest_snapshot(
         &self,
-    ) -> Result<std::result::Result<Snapshot, NoSnapshot>> {
+    ) -> Result<std::result::Result<(Snapshot, u64), NoSnapshot>> {
         let mut skipped = NoSnapshot::default();
         let keys = self.remote.list(SNAPSHOTS_PREFIX).await?;
         for snapshot in stored(&keys).iter().rev() {
@@ -311,7 +297,7 @@ impl<R: Remote + 'static> Engine<R> {
                 };
 
             match Snapshot::decode(blake3::hash(&plain).as_bytes(), &plain) {
-                Ok(snapshot) => return Ok(Ok(snapshot)),
+                Ok(snapshot) => return Ok(Ok((snapshot, time))),
                 Err(e) => skip(format!("it does not decode: {e}")),
             }
         }
@@ -376,7 +362,7 @@ impl<R: Remote + 'static> Engine<R> {
         journal: &mut Journal<R>,
     ) -> Result<std::result::Result<(), NoSnapshot>> {
         let snapshot = match self.latest_snapshot().await? {
-            Ok(snapshot) => snapshot,
+            Ok((snapshot, _)) => snapshot,
             Err(none) => return Ok(Err(none)),
         };
 
@@ -395,12 +381,14 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(Ok(()))
     }
 
-    /// Replaces every entry under the frontier of the latest snapshot with its
-    /// redacted form. Returns the number of entries replaced.
-    pub(crate) async fn prune_journal(&self) -> Result<usize> {
-        let Some(frontiers) = self.latest_frontiers().await? else {
-            return Ok(0);
+    /// Replaces every entry under the frontier of the newest snapshot that loads in full with its
+    /// redacted form. Returns the number of entries replaced, and the write time of that snapshot.
+    pub(crate) async fn prune_journal(&self) -> Result<(usize, Option<u64>)> {
+        // A head can name parts that no longer read back: only a full load proves the snapshot.
+        let Ok((snapshot, time)) = self.latest_snapshot().await? else {
+            return Ok((0, None));
         };
+        let frontiers = snapshot.frontiers;
 
         let mut redacted = 0;
 
@@ -425,14 +413,15 @@ impl<R: Remote + 'static> Engine<R> {
             self.index().set_redacted_below(*node, frontier.next_seq)?;
         }
 
-        Ok(redacted)
+        Ok((redacted, Some(time)))
     }
 }
 
 impl<R: Sweep + 'static> Engine<R> {
-    /// Deletes each snapshot that a newer snapshot older than H replaces: a load that
-    /// started before that newer snapshot had H to finish. Returns the number deleted.
-    pub(crate) async fn delete_old_snapshots(&self) -> Result<usize> {
+    /// Deletes each snapshot older than `loaded`, the snapshot that this run loaded in full,
+    /// when a newer snapshot is older than H: a load that started before had H to finish.
+    /// Returns the number deleted.
+    pub(crate) async fn delete_old_snapshots(&self, loaded: Option<u64>) -> Result<usize> {
         let keys = self.remote.list(SNAPSHOTS_PREFIX).await?;
         let snapshots = stored(&keys);
         let horizon = self.config.gc_horizon.as_nanos() as u64;
@@ -441,7 +430,9 @@ impl<R: Sweep + 'static> Engine<R> {
 
         for pair in snapshots.windows(2) {
             let (old, newer) = (&pair[0], &pair[1]);
-            if now < newer.time.saturating_add(horizon) {
+            if loaded.is_none_or(|loaded| old.time >= loaded)
+                || now < newer.time.saturating_add(horizon)
+            {
                 break;
             }
             // The head goes first: a listing never shows a head with missing parts.

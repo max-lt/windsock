@@ -114,13 +114,14 @@ The load:
   key, and opens the blob.
 - A snapshot that does not load is skipped, and the next older snapshot loads. If none loads,
   the proxy replays the journal.
-- The journal prune reads only the head of the newest snapshot. If the head does not load, the
-  prune uses the newest snapshot that loads. It never prunes under a snapshot that does not load.
+- The journal prune loads the newest snapshot in full first: every part, every hash, the open
+  and the decode. It prunes under the newest snapshot that loads, never under one that does not
+  load.
 
 The GC:
 
-- The GC deletes a snapshot when a newer snapshot is older than the GC horizon. It deletes the
-  head first, then the parts.
+- The GC deletes a snapshot when it is older than the snapshot that the same run loaded in full,
+  and a newer snapshot is older than the GC horizon. It deletes the head first, then the parts.
 - Parts with no head come from a write that stopped before its head, or from a delete that
   stopped after it. A load ignores them. The GC deletes them when their write time is older than
   the GC horizon. Each writer leaves at most one such snapshot in one horizon.

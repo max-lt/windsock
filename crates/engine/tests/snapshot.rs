@@ -833,7 +833,7 @@ async fn test_snapshot_in_one_object_still_loads() {
 }
 
 #[tokio::test]
-async fn test_gc_prune_reads_the_head_and_no_part() {
+async fn test_gc_prune_loads_the_snapshot_in_full() {
     let remote = Arc::new(TestRemote::default());
     let a = history(&remote).await;
     put(&a.engine, "after", "the snapshot").await;
@@ -843,7 +843,11 @@ async fn test_gc_prune_reads_the_head_and_no_part() {
     let report = a.engine.gc().await.unwrap();
 
     assert!(!report.snapshot_written);
-    assert_eq!(remote.snapshot_ranges.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        remote.snapshot_ranges.load(Ordering::SeqCst),
+        2,
+        "one size probe and one part"
+    );
 }
 
 #[tokio::test]
@@ -1017,4 +1021,59 @@ async fn test_two_proxies_that_write_a_snapshot_at_once_get_two_keys_that_load()
             remote.inner.delete(&key).await.unwrap();
         }
     }
+}
+
+/// Flips one byte of a part and keeps its key.
+async fn flip_part(remote: &TestRemote, head: &str, n: usize) {
+    let part = format!("{}/{n:06}", head.strip_suffix("/head").unwrap());
+    let mut bytes = remote.inner.get(&part).await.unwrap().unwrap().to_vec();
+    bytes[0] ^= 1;
+    remote.inner.put(&part, Bytes::from(bytes)).await.unwrap();
+}
+
+/// A part with flipped bytes keeps its key and the head stays whole. The prune must not redact
+/// under that snapshot, or no snapshot loads and the redacted writes are lost.
+#[tokio::test]
+async fn test_prune_does_not_redact_under_a_snapshot_with_a_bad_part() {
+    let remote = Arc::new(TestRemote::default());
+    let a = proxy_config(&remote, 1, gc_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    let head = a.engine.snapshot().await.unwrap();
+    flip_part(&remote, &head, 0).await;
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(!report.snapshot_written);
+    assert_eq!(report.redacted_entries, 0);
+    let b = proxy(&remote, 2).await;
+    assert_eq!(get(&b.engine, "x").await, "one");
+}
+
+/// A newer snapshot that does not load must not cause the delete of an older one that loads.
+#[tokio::test]
+async fn test_gc_keeps_the_older_snapshot_when_the_newer_does_not_load() {
+    let remote = Arc::new(TestRemote::default());
+    let config = Config {
+        gc_horizon: Duration::from_millis(200),
+        ..gc_config()
+    };
+    let a = proxy_config(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", "one").await;
+    a.engine.flush().await.unwrap();
+    let older = a.engine.snapshot().await.unwrap();
+    let newer = a.engine.snapshot().await.unwrap();
+    flip_part(&remote, &newer, 0).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    a.engine.gc().await.unwrap();
+
+    assert!(
+        remote.inner.get(&older).await.unwrap().is_some(),
+        "the older head stays"
+    );
+    let b = proxy(&remote, 2).await;
+    assert_eq!(get(&b.engine, "x").await, "one");
 }

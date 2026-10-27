@@ -114,8 +114,9 @@ impl<R: Sweep + 'static> Engine<R> {
             self.snapshot().await?;
             report.snapshot_written = true;
         }
-        report.redacted_entries = self.prune_journal().await?;
-        report.deleted_snapshots = self.delete_old_snapshots().await?;
+        let (redacted, loaded) = self.prune_journal().await?;
+        report.redacted_entries = redacted;
+        report.deleted_snapshots = self.delete_old_snapshots(loaded).await?;
 
         info!(?report, "gc run");
         Ok(report)

@@ -186,7 +186,6 @@ async fn dead_object(engine: &Engine<TestRemote>, data: &[u8]) {
     past_retention().await;
 }
 
-/// Past the short retention: a GC can prune the versions written before.
 thread_local! {
     /// The manual wall clock of the test on this thread: time moves only when the test says so,
     /// so a slow machine does not change what the GC rules see.
@@ -213,6 +212,7 @@ fn advance(by: Duration) {
     hold_clock();
 }
 
+/// Past the short retention: a GC can prune the versions written before.
 async fn past_retention() {
     advance(SHORT_RETENTION + Duration::from_millis(20));
 }

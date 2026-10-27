@@ -233,6 +233,37 @@ mod tests {
             .map(|object| object.data)
     }
 
+    /// The late write rule moves a prefix of the buffer: acks must rise in buffer order, also
+    /// for parallel puts and across a restart.
+    #[tokio::test]
+    async fn test_ack_times_rise_in_buffer_order_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open(dir.path()).await;
+        engine.create_bucket("demo", None).await.unwrap();
+        let tasks: Vec<_> = (0..20)
+            .map(|n| spawn_put(&engine, &format!("k{n}")))
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        drop(engine);
+        let engine = open(dir.path()).await;
+        put(&engine, "after", b"v").await.unwrap();
+
+        let buffer_dir = dir.path().join(crate::BUFFER_DIR);
+        let mut times = Vec::new();
+        for seq in buffer::segment_seqs(&buffer_dir).await {
+            let path = buffer::segment_path(&buffer_dir, seq);
+            let mut reader = buffer::SegmentReader::open(&path).await.unwrap();
+            while let Some(record) = reader.next(&path).await.unwrap() {
+                times.push(record.head.time);
+            }
+        }
+
+        assert_eq!(times.len(), 22);
+        assert!(times.windows(2).all(|w| w[0] < w[1]), "{times:?}");
+    }
+
     fn spawn_put(engine: &Arc<Engine<MemoryRemote>>, key: &str) -> JoinHandle<Result<()>> {
         let (engine, key) = (Arc::clone(engine), key.to_string());
         tokio::spawn(async move { put(&engine, &key, b"new").await })

@@ -120,12 +120,25 @@ than the late limit, R - M at the commit: R is `gc.retention_secs` (24 h by defa
 `gc.late_margin_secs` (1 h), the clock skew that the rule allows. The check uses the HLC of the
 entry that the proxy commits, also when it commits an intent after a restart.
 
-- At a flush, such a write stops the flush. The proxy logs `ERROR buffered writes older than the
-late limit` with each key, and refuses writes until a restart.
-- At open, the proxy moves a buffer with such a write to `data/engine/quarantine`, and the open
-  fails. While that directory holds files, the proxy does not start.
-- The operator decides. To drop the writes, move the directory away. To keep them, read the
-  records with the build that wrote them, and write the objects again through the S3 API.
+- At a flush, such a write stops the flush before any plan or upload. The proxy logs
+  `ERROR buffered writes older than the late limit` with the keys, refuses writes, and stops its
+  flusher until a restart.
+- At open, the proxy moves only the late writes to `data/engine/quarantine/<segment>.log`, and
+  the open fails with the keys. The young writes stay in the buffer. The move survives a crash
+  at each step: a record is in the buffer, in the quarantine, or in both, and the next open ends
+  the move. A record in the quarantine never applies.
+- While the quarantine holds files, the proxy does not start.
+
+What the operator does:
+
+1. Read the keys in the ERROR line, or in the error of the failed start.
+2. For each key, decide. To drop the late write, do nothing more for that key: the delete or the
+   newer write that the remote holds stays. To keep the late write, read the record with the
+   build that wrote it, and write the object again through the S3 API after the start. That new
+   write gets a new ack HLC, so it wins over the delete.
+3. Empty `data/engine/quarantine` (move its files away), then start the proxy. The young writes
+   in the buffer flush at this start. Emptying the quarantine drops every late write in it that
+   step 2 did not write again.
 
 ## Journal reads
 

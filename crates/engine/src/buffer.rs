@@ -244,6 +244,16 @@ pub(crate) struct BufferedPut {
     pub time: u64,
 }
 
+impl Op {
+    /// `bucket/key`, or the bucket name: what the record writes.
+    pub(crate) fn target(&self) -> String {
+        match self {
+            Op::Put { bucket, key, .. } | Op::Delete { bucket, key } => format!("{bucket}/{key}"),
+            Op::CreateBucket { bucket, .. } | Op::DeleteBucket { bucket } => bucket.clone(),
+        }
+    }
+}
+
 /// The last buffered write to one key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BufferedObject {
@@ -795,6 +805,12 @@ pub(crate) fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{seq:020}{SEGMENT_SUFFIX}"))
 }
 
+/// The segment numbers in `dir`, in order. Empty when the directory does not read.
+#[cfg(test)]
+pub(crate) async fn segment_seqs(dir: &Path) -> Vec<u64> {
+    list_segments(dir).await.unwrap_or_default()
+}
+
 async fn list_segments(dir: &Path) -> Result<Vec<u64>, EngineError> {
     let mut entries = tokio::fs::read_dir(dir).await?;
     let mut seqs = Vec::new();
@@ -844,6 +860,85 @@ async fn create_segment(dir: &Path, seq: u64) -> Result<Active, EngineError> {
     })
 }
 
+/// Moves every record with an ack HLC under `limit` from the buffer in `dir` to `quarantine`,
+/// and keeps the other records in the buffer. Returns the keys and bucket names moved.
+///
+/// Acks rise in buffer order, so the late records are a prefix. Each step is durable before
+/// the next, and a crash between two steps leaves each record in the buffer, in the quarantine,
+/// or in both: a second call ends the move. A record in the quarantine never applies.
+pub(crate) async fn quarantine_late(
+    dir: &Path,
+    quarantine: &Path,
+    limit: u64,
+) -> Result<Vec<String>, EngineError> {
+    quarantine_late_until(dir, quarantine, limit, &mut |_| false).await
+}
+
+/// [`quarantine_late`], with `stop` called after each durable step: `true` fails the call there.
+async fn quarantine_late_until(
+    dir: &Path,
+    quarantine: &Path,
+    limit: u64,
+    stop: &mut dyn FnMut(u32) -> bool,
+) -> Result<Vec<String>, EngineError> {
+    let mut step = 0;
+    let mut check = |step: &mut u32| {
+        *step += 1;
+        match stop(*step) {
+            true => Err(EngineError::Corrupt(format!("stopped after step {step}"))),
+            false => Ok(()),
+        }
+    };
+    let mut moved = Vec::new();
+
+    for seq in list_segments(dir).await? {
+        let path = segment_path(dir, seq);
+        let mut reader = SegmentReader::open(&path).await?;
+        let (mut late, mut young) = (Vec::new(), Vec::new());
+        // A torn tail of the last segment is cut at open, as in a replay.
+        while let Ok(Some(record)) = reader.next(&path).await {
+            let bytes = encode_record(&record.head, &record.data);
+            match record.head.time < limit && young.is_empty() {
+                true => {
+                    moved.push(record.head.op.target());
+                    late.extend(bytes);
+                }
+                false => young.extend(bytes),
+            }
+        }
+        if late.is_empty() {
+            break;
+        }
+
+        tokio::fs::create_dir_all(quarantine).await?;
+        write_durable(quarantine, &segment_path(quarantine, seq), &late).await?;
+        check(&mut step)?;
+        match young.is_empty() {
+            true => {
+                remove_if_present(&path).await?;
+                sync_dir(dir).await?;
+            }
+            false => write_durable(dir, &path, &young).await?,
+        }
+        check(&mut step)?;
+        if !young.is_empty() {
+            break;
+        }
+    }
+
+    Ok(moved)
+}
+
+/// Writes `bytes` to `path` through a fsynced temporary file and a rename, then fsyncs `dir`.
+async fn write_durable(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
+    let tmp = path.with_extension("tmp");
+    let mut file = File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&tmp, path).await?;
+    sync_dir(dir).await
+}
+
 async fn sync_dir(dir: &Path) -> Result<(), EngineError> {
     File::open(dir).await?.sync_all().await?;
     Ok(())
@@ -886,6 +981,78 @@ mod tests {
             out.push(record);
         }
         out
+    }
+
+    fn put_at(key: &str, time: u64) -> Head {
+        Head {
+            time,
+            ..put(key, key.as_bytes())
+        }
+    }
+
+    /// The (time, key) of each record in the segments of `dir`, in order.
+    async fn times(dir: &Path) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        let Ok(seqs) = list_segments(dir).await else {
+            return out;
+        };
+        for seq in seqs {
+            let path = segment_path(dir, seq);
+            let mut reader = SegmentReader::open(&path).await.unwrap();
+            while let Some(record) = reader.next(&path).await.unwrap() {
+                out.push((record.head.time, record.head.op.target()));
+            }
+        }
+        out
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// Times 1 to 3 are late and 10, 11 are young, with `segment_target` bytes per segment. A
+    /// failure after each step, then a second call, gives the same split as one call.
+    async fn check_split_survives_a_stop_at_each_step(segment_target: u64) {
+        let source = tempfile::tempdir().unwrap();
+        {
+            let mut buffer = Buffer::open(source.path(), segment_target).await.unwrap();
+            for (key, time) in [("a", 1), ("b", 2), ("c", 3), ("d", 10), ("e", 11)] {
+                buffer
+                    .append(put_at(key, time), key.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            buffer.sync_job().run().await.unwrap();
+        }
+        let late = vec![(1, "b/a".to_string()), (2, "b/b".into()), (3, "b/c".into())];
+        let young = vec![(10, "b/d".to_string()), (11, "b/e".into())];
+
+        for stop_at in 1..=8 {
+            let run = tempfile::tempdir().unwrap();
+            let (dir, quarantine) = (run.path().join("buffer"), run.path().join("quarantine"));
+            copy_dir(source.path(), &dir);
+
+            let stopped =
+                quarantine_late_until(&dir, &quarantine, 5, &mut |step| step == stop_at).await;
+            let moved = quarantine_late(&dir, &quarantine, 5).await.unwrap();
+
+            assert_eq!(times(&dir).await, young, "stop at {stop_at}: {stopped:?}");
+            assert_eq!(times(&quarantine).await, late, "stop at {stop_at}");
+            assert!(moved.len() <= 3, "stop at {stop_at}: {moved:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_split_survives_a_stop_after_each_step() {
+        // One segment that holds late and young records, then one segment for each record.
+        check_split_survives_a_stop_at_each_step(1 << 20).await;
+        check_split_survives_a_stop_at_each_step(1).await;
     }
 
     #[test]

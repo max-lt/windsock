@@ -502,23 +502,24 @@ async fn test_audit_runs_again_after_a_sync_that_failed() {
 /// A late record stops the flush before any plan or upload, also of the young records next to
 /// it, and the engine stays quarantined until a restart.
 #[tokio::test]
-async fn test_flush_with_a_late_record_uploads_nothing() {
+async fn test_late_record_stops_the_flush_and_only_it_goes_to_quarantine() {
     let remote = Arc::new(FaultRemote::default());
     let config = Config {
-        retention: Duration::from_millis(300),
-        late_margin: Duration::from_millis(100),
+        retention: Duration::from_millis(3000),
+        late_margin: Duration::from_millis(1000),
         ..Config::default()
     };
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(
-        dir.path(),
-        remote.clone(),
-        SigningKey::from_bytes(&[1; 32]),
-        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
-        config,
-    )
-    .await
-    .unwrap();
+    let open = || {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config.clone(),
+        )
+    };
+    let engine = open().await.unwrap();
     engine.create_bucket(BUCKET, None).await.unwrap();
     engine.flush().await.unwrap();
     let put = |key: &'static str| {
@@ -531,7 +532,7 @@ async fn test_flush_with_a_late_record_uploads_nothing() {
         )
     };
     put("late").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
     put("young").await.unwrap();
 
     let result = engine.flush().await;
@@ -542,4 +543,22 @@ async fn test_flush_with_a_late_record_uploads_nothing() {
     );
     assert!(remote.inner.list("packs/").await.unwrap().is_empty());
     assert!(engine.is_quarantined());
+    drop(engine);
+
+    // At open, only the late write moves to the quarantine, and the open fails.
+    let Err(error) = open().await else {
+        panic!("a proxy with a late write opens");
+    };
+    let error = error.to_string();
+    assert!(error.contains("bkt/late"), "{error}");
+    assert!(!error.contains("bkt/young"), "{error}");
+    // The operator drops the late write: the young one flushes at the next start.
+    std::fs::remove_dir_all(dir.path().join("quarantine")).unwrap();
+    let engine = open().await.unwrap();
+    engine.flush().await.unwrap();
+    assert_eq!(
+        engine.get(BUCKET, "young", None).await.unwrap().data,
+        data()
+    );
+    assert!(engine.get(BUCKET, "late", None).await.is_err());
 }

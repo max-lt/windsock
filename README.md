@@ -82,9 +82,16 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 because the proxy deletes empty segments.
 
 If a buffered write is older than `gc.retention_secs - gc.late_margin_secs` when it reaches the
-remote, the proxy does not commit it: a newer delete of the key can be gone. At the next start
-the buffer moves to `data/engine/quarantine` and the start fails. Move that directory away to
-drop those writes. `docs/storage.md` (Order of writes) gives the details.
+remote, the proxy does not commit it: a newer delete of the key can be gone. The proxy logs an
+ERROR with the keys and stops its flusher. At the next start, only those writes move to
+`data/engine/quarantine`, and the start fails. The other buffered writes stay.
+
+1. Read the keys in the ERROR line.
+2. For each key that must keep the late value, write the object again through the S3 API after
+   step 3. The other late writes are dropped.
+3. Move the files out of `data/engine/quarantine`, then start the proxy. The young writes flush.
+
+`docs/storage.md` (Order of writes) gives the details.
 
 If the chunk cache disk is full or cannot be written, the proxy logs `cache writes fail, reads go to
 the remote` once, and `cache writes work again` when a write works. Reads go on from the remote.

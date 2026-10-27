@@ -231,10 +231,9 @@ pub struct Engine<R> {
     other_gc_node: Mutex<Option<NodeId>>,
 }
 
-/// Refuses to open with a quarantine, and puts there a buffer with a write older than the
-/// late limit, R - M.
-/// A commit of such a write could rank under a delete that a prune already removed, and bring
-/// the key back: the operator decides what to do with it.
+/// Refuses to open with a quarantine. A buffered write older than the late limit, R - M, moves
+/// to the quarantine, and the open fails: its commit could rank under a delete that a prune
+/// already removed, and bring the key back. The young writes stay in the buffer.
 async fn quarantine_at_open(
     dir: &Path,
     buffer_dir: &Path,
@@ -242,30 +241,30 @@ async fn quarantine_at_open(
     late_limit: Duration,
 ) -> Result<()> {
     let quarantine = dir.join(QUARANTINE_DIR);
+    let refuse = |what: String| {
+        Err(EngineError::Quarantined(format!(
+            "{what}{} holds writes that were never committed. Decide for each key, then empty \
+             the directory and start again",
+            quarantine.display()
+        )))
+    };
+
+    let limit = buffer::unix_nanos().saturating_sub(late_limit.as_nanos() as u64);
+    if buffer.oldest_time().is_some_and(|oldest| oldest < limit) {
+        let moved = buffer::quarantine_late(buffer_dir, &quarantine, limit).await?;
+        let keys = moved.join(", ");
+        error!(keys, path = %quarantine.display(), "buffered writes older than the late limit: moved to quarantine");
+        return refuse(format!("{keys}: "));
+    }
+
     let held = match std::fs::read_dir(&quarantine) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => false,
     };
     if held {
-        return Err(EngineError::Quarantined(format!(
-            "{} holds writes that were never committed. Move it away to drop them, then start",
-            quarantine.display()
-        )));
+        return refuse(String::new());
     }
-
-    let now = buffer::unix_nanos();
-    let late = buffer
-        .oldest_time()
-        .is_some_and(|oldest| oldest.saturating_add(late_limit.as_nanos() as u64) < now);
-    if !late {
-        return Ok(());
-    }
-    std::fs::rename(buffer_dir, &quarantine)?;
-    error!(path = %quarantine.display(), "buffered writes older than the late limit: moved to quarantine");
-    Err(EngineError::Quarantined(format!(
-        "{} holds writes that were never committed. Move it away to drop them, then start",
-        quarantine.display()
-    )))
+    Ok(())
 }
 
 /// The rules that every proxy of one remote must share, kept in the key check.

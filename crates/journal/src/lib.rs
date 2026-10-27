@@ -30,7 +30,7 @@ pub use entry::{
     redact_wire,
 };
 
-pub use clock::HybridClock;
+pub use clock::{HybridClock, set_manual_wall, wall_clock_nanos};
 
 /// Appends that lose the seq to another process before `append` gives up.
 const MAX_ATTEMPTS: u32 = 8;

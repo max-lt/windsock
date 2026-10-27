@@ -17,7 +17,6 @@ use std::io::{ErrorKind, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use journal::Entry;
 use serde::{Deserialize, Serialize};
@@ -74,9 +73,7 @@ async fn check_format(dir: &Path, has_segments: bool) -> Result<(), EngineError>
 }
 
 pub(crate) fn unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
+    journal::wall_clock_nanos()
 }
 
 /// The fixed part of a record. The data of a put follows it.

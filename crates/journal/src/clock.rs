@@ -3,10 +3,25 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn wall_clock_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
+thread_local! {
+    /// A wall clock that a test sets on its thread. Zero: the system clock.
+    static MANUAL_WALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The wall clock in unix nanoseconds: the system clock, or the value of [`set_manual_wall`].
+pub fn wall_clock_nanos() -> u64 {
+    match MANUAL_WALL.with(std::cell::Cell::get) {
+        0 => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64),
+        manual => manual,
+    }
+}
+
+/// Replaces the wall clock of this thread with `nanos`, or gives back the system clock for
+/// `None`. For deterministic tests only, with all their engines on one thread.
+pub fn set_manual_wall(nanos: Option<u64>) {
+    MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
 }
 
 /// The highest HLC that a reader takes now, `ahead` past its wall clock.
@@ -43,6 +58,11 @@ impl HybridClock {
                 return Some(next);
             }
         }
+    }
+
+    /// The last HLC that this clock issued or saw.
+    pub fn last(&self) -> u64 {
+        self.last.load(Ordering::SeqCst)
     }
 
     /// Moves the clock past a timestamp seen from another node.

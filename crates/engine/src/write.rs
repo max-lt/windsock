@@ -120,6 +120,11 @@ impl<R: Remote + 'static> Engine<R> {
         self.config.buffer_limit.min(buffer::MAX_DATA_LEN)
     }
 
+    /// The last HLC that this proxy issued or saw. Right after an ack, its HLC.
+    pub fn last_hlc(&self) -> u64 {
+        self.clock.last()
+    }
+
     /// True when a buffered write is older than the late limit: no flush until a restart.
     pub fn is_quarantined(&self) -> bool {
         self.quarantined.load(Ordering::SeqCst)

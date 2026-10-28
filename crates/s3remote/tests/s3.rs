@@ -913,3 +913,46 @@ async fn test_wait_for_a_slot_ends_at_the_call_time_limit() {
         let _ = call.await;
     }
 }
+
+/// The open descriptors of this process.
+fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd").unwrap().count()
+}
+
+/// A remote that accepts connections and never answers. Each attempt times out. The client must
+/// close the connection of an attempt that timed out, or the daemon runs out of descriptors.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_attempts_that_time_out_do_not_keep_their_connections() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server_held = held.clone();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            server_held.lock().unwrap().push(socket);
+        }
+    });
+    let mut config = config(&format!("http://{address}"), "");
+    config.retry = Retry {
+        attempts: 1,
+        first_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        attempt_timeout: Duration::from_millis(50),
+        total: Duration::from_secs(5),
+    };
+    let remote = S3Remote::new(config).unwrap();
+    let before = open_fds();
+
+    for n in 0..200 {
+        assert!(remote.get(&format!("packs/{n}")).await.is_err());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let server = held.lock().unwrap().len();
+    let client = open_fds().saturating_sub(before + server);
+    assert!(
+        client <= 64,
+        "{client} client connections stay open after 200 timeouts"
+    );
+}

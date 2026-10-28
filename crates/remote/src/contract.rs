@@ -21,6 +21,7 @@ where
     get_range_returns_slice(&fresh().await).await;
     get_range_outside_object_is_rejected(&fresh().await).await;
     list_returns_sorted_keys_under_prefix(&fresh().await).await;
+    list_after_returns_the_next_keys_under_prefix(&fresh().await).await;
     create_writes_a_new_key(&fresh().await).await;
     create_keeps_the_existing_object(&fresh().await).await;
     concurrent_creates_have_one_winner(Arc::new(fresh().await)).await;
@@ -87,6 +88,24 @@ pub async fn list_returns_sorted_keys_under_prefix(remote: &impl Sweep) {
         ["heads/a", "heads/b", "headsx", "log/a/b", "packs/x"]
     );
     assert!(remote.list("snapshots/").await.unwrap().is_empty());
+}
+
+pub async fn list_after_returns_the_next_keys_under_prefix(remote: &impl Sweep) {
+    for key in ["log/n/01", "log/n/02", "log/n/03", "log/nx", "packs/x"] {
+        remote.put(key, Bytes::from(key)).await.unwrap();
+    }
+
+    let after = |after: &'static str, limit: usize| remote.list_after("log/n/", after, limit);
+    assert_eq!(
+        after("log/n/01", 10).await.unwrap(),
+        ["log/n/02", "log/n/03"]
+    );
+    assert_eq!(after("log/n/01", 1).await.unwrap(), ["log/n/02"]);
+    assert_eq!(
+        after("", 10).await.unwrap(),
+        ["log/n/01", "log/n/02", "log/n/03"]
+    );
+    assert!(after("log/n/03", 10).await.unwrap().is_empty());
 }
 
 pub async fn create_writes_a_new_key(remote: &impl Sweep) {

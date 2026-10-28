@@ -173,25 +173,27 @@ first entry. Its content is never read: a marker that holds data, for example on
 with no repository key put there, gives one WARN with the key in each process, and the commits go
 on.
 
-| When                                                              | For each chain                                             | Once          |
-| ----------------------------------------------------------------- | ---------------------------------------------------------- | ------------- |
-| Each sync, no new entry                                           | 2 GET (the next seq, and the seq after it)                 | 1 LIST nodes/ |
-| Each sync, k new entries                                          | k + 2 GET                                                  | 1 LIST nodes/ |
-| First sync, each GC run, each sync while a chain is marked broken | also 1 LIST `log/<node>/` and 1 GET of the last entry read |               |
+| When                                                                             | For each chain                                                                          | Once          |
+| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------- |
+| Each sync, no new entry                                                          | 2 GET (the next seq, and the seq after it)                                              | 1 LIST nodes/ |
+| Each sync, k new entries                                                         | k + 2 GET                                                                               | 1 LIST nodes/ |
+| First sync and each GC run: every chain. Each other sync: the marked chains only | also 1 LIST `log/<node>/` after the key of the last entry read, and 1 GET of that entry |               |
 
 With the default sync interval (10 s), an idle chain costs 720 GET in one hour, and the node
-markers cost 360 LIST. The GC run (1 h by default) adds 1 LIST and 1 GET for each chain.
+markers cost 360 LIST. The GC run (1 h by default) adds 1 LIST and 1 GET for each chain. The
+audit LIST starts after the last entry read (`start-after`), so it returns the new entries only,
+in pages of 1000, also for a chain with millions of entries.
 
 A chain is broken, and the GC refuses to run, when:
 
 - an entry does not verify: signature, hash, node, seq, link, or actions;
 - seq n is missing and seq n + 1 exists (each sync);
-- the listing holds a seq at or above the next seq after the read (the audit: first sync, each GC run, each sync while a chain is marked):
+- the listing holds a seq at or above the next seq after the read (the audit):
   a gap of any length;
 - the last entry read differs from the copy read before, or is gone (the audit).
 
 A broken mark stays until an audit reads the chain with no fault. While a chain is marked, every
-sync runs the audit, so the sync report stops showing the chain at the first sync after the
+sync audits that chain, so the sync report stops showing the chain at the first sync after the
 remote is fixed, also on a proxy that does not run the GC.
 
 The sync report and the log give the node, the seq and the cause. A node with no marker is found

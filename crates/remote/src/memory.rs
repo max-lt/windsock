@@ -70,6 +70,31 @@ impl Remote for MemoryRemote {
             .cloned()
             .collect())
     }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, RemoteError> {
+        check_prefix(prefix)?;
+        let objects = self
+            .objects
+            .read()
+            .expect("no panic while the lock is held");
+        let start = match after < prefix {
+            true => std::ops::Bound::Included(prefix.to_string()),
+            false => std::ops::Bound::Excluded(after.to_string()),
+        };
+
+        Ok(objects
+            .range((start, std::ops::Bound::Unbounded))
+            .map(|(key, _)| key)
+            .take_while(|key| key.starts_with(prefix))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]

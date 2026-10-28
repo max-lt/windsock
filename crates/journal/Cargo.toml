@@ -21,4 +21,5 @@ tracing.workspace = true
 sim = []
 
 [dev-dependencies]
+async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

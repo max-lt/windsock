@@ -532,6 +532,54 @@ impl Remote for S3Remote {
             }
         }
     }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, RemoteError> {
+        check_prefix(prefix)?;
+        let full_prefix = format!("{}{prefix}", self.config.prefix);
+        let mut keys: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+
+        while keys.len() < limit {
+            let mut call = Call::new(Method::GET, None);
+            match &token {
+                Some(token) => call.query.push(("continuation-token", token.clone())),
+                None => call
+                    .query
+                    .push(("start-after", format!("{}{after}", self.config.prefix))),
+            }
+            call.query.push(("list-type", "2".to_string()));
+            call.query.push(("prefix", full_prefix.clone()));
+            let page_size = (limit - keys.len()).min(1000);
+            call.query.push(("max-keys", page_size.to_string()));
+
+            let reply = self.send(call).await?;
+            if !reply.status.is_success() {
+                return Err(reply.error());
+            }
+            let page = xml::list_page(&reply.body).ok_or_else(|| RemoteError::Service {
+                status: reply.status.as_u16(),
+                code: "MalformedResponse".to_string(),
+                message: "the list response does not parse".to_string(),
+            })?;
+            keys.extend(
+                page.keys
+                    .iter()
+                    .filter_map(|k| k.strip_prefix(&self.config.prefix).map(str::to_string))
+                    .filter(|key| key.as_str() > after),
+            );
+            match page.next_token {
+                Some(next) if page.truncated => token = Some(next),
+                _ => break,
+            }
+        }
+        keys.truncate(limit);
+        Ok(keys)
+    }
 }
 
 #[async_trait::async_trait]

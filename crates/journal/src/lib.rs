@@ -337,16 +337,9 @@ impl<R: Remote> Journal<R> {
 
     /// The highest seq in the listing of a chain, and an error when the last entry read changed.
     async fn audit_chain(&self, node: NodeId) -> Result<Option<u64>, JournalError> {
-        let prefix = format!("{LOG_PREFIX}{node}/");
-        let mut highest = None;
-        for key in self.remote.list(&prefix).await? {
-            match seq_of(&prefix, &key) {
-                Some(seq) => highest = highest.max(Some(seq)),
-                None => warn!(key, "a key under the log is not an entry: ignored"),
-            }
-        }
-
         let frontier = self.frontier(node);
+        let highest = self.highest_after(node, frontier.next_seq).await?;
+
         let Some(last) = frontier.next_seq.checked_sub(1) else {
             return Ok(highest);
         };
@@ -362,6 +355,31 @@ impl<R: Remote> Journal<R> {
             });
         }
         Ok(highest)
+    }
+
+    /// The highest seq at or above `next` in the listing of a chain. The listing starts after
+    /// the key of `next - 1`, so its cost is the new entries only.
+    async fn highest_after(&self, node: NodeId, next: u64) -> Result<Option<u64>, JournalError> {
+        const PAGE: usize = 1000;
+        let prefix = format!("{LOG_PREFIX}{node}/");
+        let mut after = match next.checked_sub(1) {
+            Some(last) => entry_key(node, last),
+            None => prefix.clone(),
+        };
+        let mut highest = None;
+        loop {
+            let keys = self.remote.list_after(&prefix, &after, PAGE).await?;
+            for key in &keys {
+                match seq_of(&prefix, key) {
+                    Some(seq) => highest = highest.max(Some(seq)),
+                    None => warn!(key, "a key under the log is not an entry: ignored"),
+                }
+            }
+            match keys.last() {
+                Some(last) if keys.len() == PAGE => after = last.clone(),
+                _ => return Ok(highest),
+            }
+        }
     }
 
     /// Reads again from `frontiers`, as after a snapshot load.
@@ -395,11 +413,12 @@ impl<R: Remote> Journal<R> {
         let mut entries = self.take_stashed();
         // The flag stays set until a whole audit runs: a remote error must not skip it. A marked
         // chain is audited at each sync, so a proxy with no GC run clears the mark too.
-        let audit = self.audit || !self.broken.is_empty();
         let mut queue: Vec<NodeId> = nodes.iter().copied().collect();
         let mut known = nodes;
 
         while let Some(node) = queue.pop() {
+            // Between the open and GC audits, a sync audits only the marked chains.
+            let audit = self.audit || self.broken.contains_key(&node);
             // The listing comes first: each entry in it exists before the reads below.
             let highest = match audit {
                 true => self.audit_chain(node).await,
@@ -813,6 +832,136 @@ mod tests {
             [c.node()]
         );
         assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
+    }
+
+    /// A remote that counts the log keys that its listings return, and the log listings.
+    #[derive(Default)]
+    struct Counting {
+        inner: MemoryRemote,
+        keys: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counting {
+        fn count(&self, prefix: &str, keys: &[String]) {
+            if prefix.starts_with(LOG_PREFIX) {
+                let ordering = std::sync::atomic::Ordering::SeqCst;
+                self.lists.fetch_add(1, ordering);
+                self.keys.fetch_add(keys.len(), ordering);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Remote for Counting {
+        async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+            self.inner.put(key, data).await
+        }
+
+        async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+            self.inner.create(key, data).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+            self.inner.get(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<Option<Bytes>, RemoteError> {
+            self.inner.get_range(key, range).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+            let keys = self.inner.list(prefix).await?;
+            self.count(prefix, &keys);
+            Ok(keys)
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            after: &str,
+            limit: usize,
+        ) -> Result<Vec<String>, RemoteError> {
+            let keys = self.inner.list_after(prefix, after, limit).await?;
+            self.count(prefix, &keys);
+            Ok(keys)
+        }
+    }
+
+    /// An audit of a long chain lists the keys after the frontier, not the whole chain.
+    #[tokio::test]
+    async fn test_audit_lists_only_the_keys_after_the_frontier() {
+        let remote = Arc::new(Counting::default());
+        let mut writer = Journal::new(
+            remote.clone(),
+            key(1),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        for n in 0..30 {
+            writer
+                .append(vec![put(&format!("k{n}"))], Seen::new())
+                .await
+                .unwrap();
+        }
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        reader.sync_all().await.unwrap();
+        writer.append(vec![put("new")], Seen::new()).await.unwrap();
+        remote.keys.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        reader.audit_next_sync();
+        reader.sync_all().await.unwrap();
+
+        assert!(remote.keys.load(std::sync::atomic::Ordering::SeqCst) <= 1);
+    }
+
+    /// A sync with one marked chain audits that chain only. The full audit is for the open and
+    /// the GC.
+    #[tokio::test]
+    async fn test_sync_audits_only_the_marked_chains() {
+        let remote = Arc::new(Counting::default());
+        let mut chains = Vec::new();
+        for seed in 1..=3 {
+            let mut chain = Journal::new(
+                remote.clone(),
+                key(seed),
+                entry::test_sealer(),
+                Frontiers::new(),
+            );
+            chain.append(vec![put("a")], Seen::new()).await.unwrap();
+            chains.push(chain);
+        }
+        let marked = chains[0].node();
+        remote
+            .inner
+            .put(&entry_key(marked, 5), Bytes::from_static(b"not an entry"))
+            .await
+            .unwrap();
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        reader.sync_all().await.unwrap();
+        assert_eq!(
+            reader.broken().keys().copied().collect::<Vec<_>>(),
+            vec![marked]
+        );
+        remote.lists.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        reader.sync_all().await.unwrap();
+
+        assert_eq!(remote.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A key under log/<node>/ that is not 20 digits is not an entry: it breaks no chain, and no

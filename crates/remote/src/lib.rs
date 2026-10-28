@@ -61,6 +61,20 @@ pub trait Remote: Send + Sync {
 
     /// Returns the keys that start with `prefix`, in lexicographic order.
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError>;
+
+    /// Returns at most `limit` keys that start with `prefix` and sort after `after`, in
+    /// lexicographic order. Fewer than `limit` keys means that no more follow.
+    async fn list_after(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, RemoteError> {
+        let mut keys = self.list(prefix).await?;
+        keys.retain(|key| key.as_str() > after);
+        keys.truncate(limit);
+        Ok(keys)
+    }
 }
 
 /// A remote that can delete. Only the GC takes this bound: the write path uses [`Remote`].

@@ -31,6 +31,9 @@ struct TestRemote {
     tamper: std::sync::Mutex<Option<Tamper>>,
     /// The put of a snapshot head first deletes part 0, as a GC on another proxy can.
     drop_part_at_head: AtomicBool,
+    /// The next listing of the snapshots misses the newest one, as when a GC writes it just
+    /// after the listing.
+    hide_newest_snapshot: AtomicBool,
 }
 
 /// What the remote does to a ranged read of a snapshot part.
@@ -113,7 +116,16 @@ impl Remote for TestRemote {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
-        self.inner.list(prefix).await
+        let mut keys = self.inner.list(prefix).await?;
+        if prefix.starts_with(engine::SNAPSHOTS_PREFIX)
+            && self.hide_newest_snapshot.swap(false, Ordering::SeqCst)
+        {
+            let newest = keys.last().cloned().unwrap_or_default();
+            let rest = &newest[engine::SNAPSHOTS_PREFIX.len()..];
+            let base = rest.split('/').next().unwrap_or_default().to_string();
+            keys.retain(|key| !key[engine::SNAPSHOTS_PREFIX.len()..].starts_with(&base));
+        }
+        Ok(keys)
     }
 }
 
@@ -1298,4 +1310,24 @@ async fn test_snapshot_fails_when_a_part_is_gone_after_its_head() {
     let error = result.unwrap_err().to_string();
     assert!(error.contains("listed after the head"), "{error}");
     drop(a);
+}
+
+/// A GC writes a newer snapshot and redacts up to it between the snapshot listing of a proxy and
+/// its read of the chains. The proxy must load the newer snapshot, not mark the chains broken.
+#[tokio::test]
+async fn test_sync_that_races_a_new_snapshot_loads_it() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history(&remote).await;
+    let b = proxy(&remote, 2).await;
+    put(&a.engine, "w", "four").await;
+    a.engine.flush().await.unwrap();
+    a.engine.snapshot().await.unwrap();
+    let report = a.engine.gc().await.unwrap();
+    assert!(report.redacted_entries > 0, "{report:?}");
+    remote.hide_newest_snapshot.store(true, Ordering::SeqCst);
+
+    let report = b.engine.sync().await.unwrap();
+
+    assert!(report.broken.is_empty(), "{:?}", report.broken_causes);
+    assert_eq!(keys(&b.engine).await, ["w", "x", "y"]);
 }

@@ -68,15 +68,19 @@ impl<R: Remote + 'static> Engine<R> {
     async fn read_entries(&self, journal: &mut Journal<R>) -> Result<Vec<Entry>> {
         let mut entries = journal.sync_all().await?;
 
-        // Entries under the latest snapshot can be redacted: read from the snapshot instead.
-        if entries.iter().any(|entry| entry.actions.is_none()) {
+        // Entries under the latest snapshot can be redacted: read from the snapshot instead. A GC
+        // can write a newer snapshot and redact up to it during the load: load again then.
+        for _ in 0..3 {
+            if !entries.iter().any(|entry| entry.actions.is_none()) {
+                break;
+            }
             match self.bootstrap(journal).await? {
                 Ok(()) => entries = journal.sync_all().await?,
                 // A snapshot that does not load: the error names its keys for the operator.
                 Err(none) if !none.is_empty() => {
                     return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
                 }
-                Err(_) => {}
+                Err(_) => break,
             }
         }
         // A redacted entry that no snapshot covers breaks its chain only.

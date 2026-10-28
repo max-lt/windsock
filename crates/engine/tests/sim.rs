@@ -288,8 +288,9 @@ struct Sim {
     buckets: BTreeMap<String, Vec<Acked>>,
     log: Vec<String>,
     stats: Stats,
-    /// A clock ran more than R ahead: a GC or a snapshot may then fail on a broken chain.
-    faulty: bool,
+    /// The latest HLC that a clock more than R ahead gave: until the clock of proxy 0 is
+    /// within R of it, its chain is broken there and a GC or a snapshot may fail.
+    far_until: u64,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
     /// Real time since the start: it never steps back, unlike the wall clocks.
@@ -301,6 +302,21 @@ impl Sim {
     fn pass(&mut self, by: u64) {
         self.now += by;
         self.elapsed += by;
+        let r = config().retention.as_nanos() as u64;
+        for proxy in &self.proxies {
+            if proxy.offset > r {
+                self.far_until = self.far_until.max(self.now + proxy.offset);
+            }
+        }
+    }
+
+    /// A GC or snapshot error that a chain more than R ahead of proxy 0 explains.
+    fn far_ahead_explains(&self, e: &EngineError) -> bool {
+        let r = config().retention.as_nanos() as u64;
+        let clock = self.now + self.proxies[0].offset;
+        let ahead = clock.saturating_add(r) < self.far_until;
+        ahead && e.to_string().contains("more than the retention ahead")
+            || ahead && matches!(e, EngineError::BrokenChains(_))
     }
 
     /// The wall and the monotonic clock of proxy `i`. Each host has its own monotonic clock:
@@ -478,7 +494,7 @@ impl Sim {
                 Ok(())
             }
             Err(EngineError::Quarantined(_)) => Ok(()),
-            Err(_) if self.faulty || hit => Ok(()),
+            Err(e) if hit || self.far_ahead_explains(&e) => Ok(()),
             Err(e) => Err(format!("gc: {e}")),
         }
     }
@@ -670,7 +686,7 @@ impl Sim {
                 let hit = armed && self.remote.next.lock().unwrap().is_none();
                 match r {
                     Ok(_) | Err(EngineError::Quarantined(_)) => {}
-                    Err(_) if self.faulty || hit => {}
+                    Err(e) if hit || self.far_ahead_explains(&e) => {}
                     Err(e) => return Err(format!("snapshot: {e}")),
                 }
             }
@@ -691,7 +707,6 @@ impl Sim {
                 self.proxies[i].offset = match self.rng.chance(20) {
                     true => {
                         self.stats.far_ahead = true;
-                        self.faulty = true;
                         r + self.rng.below(m)
                     }
                     false => m + self.rng.below(m),
@@ -934,7 +949,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         buckets: BTreeMap::new(),
         log: Vec::new(),
         stats: Stats::default(),
-        faulty: false,
+        far_until: 0,
         max_offset: 0,
         elapsed: SECOND,
     };

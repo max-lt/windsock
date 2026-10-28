@@ -13,6 +13,8 @@
 //! the frontiers, sealed. The GC writes the head last. A snapshot in one object
 //! at `snapshots/<time>-<hash>` still loads.
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 use index::Snapshot;
 use journal::{Frontiers, Journal, entry_key};
@@ -29,6 +31,12 @@ pub const SNAPSHOTS_PREFIX: &str = "snapshots/";
 pub const MAX_SNAPSHOT_PARTS: usize = 4096;
 
 const HEAD: &str = "/head";
+/// The tag of a base with no head in [`crate::gc::Waits`]: apart from the snapshot keys.
+const ORPHAN_WAIT: &str = "orphan:";
+
+fn orphan_wait(base: &str) -> String {
+    format!("{ORPHAN_WAIT}{base}")
+}
 
 /// The size and the hash of one part.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,11 +479,17 @@ impl<R: Sweep + 'static> Engine<R> {
         let horizon = self.config.gc_horizon.as_nanos() as u64;
         let now = buffer::unix_nanos();
         let mut deleted = 0;
+        let heads: BTreeSet<String> = snapshots.iter().map(Stored::key).collect();
+        for key in &heads {
+            self.gc_waits.elapsed(key);
+        }
+        self.gc_waits.keep(SNAPSHOTS_PREFIX, &heads);
 
         for pair in snapshots.windows(2) {
             let (old, newer) = (&pair[0], &pair[1]);
             if loaded.is_none_or(|loaded| old.time >= loaded)
                 || now < newer.time.saturating_add(horizon)
+                || self.gc_waits.elapsed(&newer.key()) < horizon
             {
                 break;
             }
@@ -520,8 +534,13 @@ impl<R: Sweep + 'static> Engine<R> {
                 seen.entry(base.to_string()).or_insert(now);
             }
             write_orphans(&self.orphans_file, &seen);
+            let orphans: BTreeSet<String> = bases.iter().map(|base| orphan_wait(base)).collect();
+            self.gc_waits.keep(ORPHAN_WAIT, &orphans);
             seen.iter()
-                .filter(|(_, first)| now >= first.saturating_add(horizon))
+                .filter(|(base, first)| {
+                    let waited = self.gc_waits.elapsed(&orphan_wait(base));
+                    now >= first.saturating_add(horizon) && waited >= horizon
+                })
                 .map(|(base, _)| base.clone())
                 .collect()
         };

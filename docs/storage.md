@@ -233,6 +233,25 @@ A daemon keeps these descriptors open. Each count has a cap.
 The daemon keeps 256 descriptors out of the S3 connection limit for the first four kinds. In a
 chaos soak on macOS, the index tables grew from 2 to 22 in 7 minutes.
 
+## GC deletes and the clock of the GC host
+
+The GC deletes a pack or a manifest H after its condemn, an old snapshot H after a newer one,
+and the parts of a snapshot with no head H after it first listed them. Each delete needs two
+conditions:
+
+- H passed on the wall clock: the condemn HLC, the snapshot time or the first listing, plus H.
+- H passed on the monotonic clock of the GC process since it condemned or first saw the object.
+
+A forward step of the wall clock of the GC host, for example an NTP step of 23 h, therefore
+deletes nothing early. A writer can commit a plan up to H after the condemn, and the rules of
+the writer cannot see a clock step on another host.
+
+The monotonic wait lives in the process. After a restart it starts again, so a step while the
+GC host was down does not count either. The cost: a GC runner that restarts more often than once
+per H deletes nothing. Each GC run logs `deletes that wait for H on the monotonic clock` with the
+number of objects that wait and the longest wait. Known limit: a monotonic clock that runs fast
+is not detected.
+
 ## One GC runner
 
 One process per remote runs the GC (`gc.enabled = true`). No lock enforces this, and the model

@@ -746,3 +746,69 @@ async fn test_condemn_of_another_node_names_a_second_gc_runner() {
 
     assert_eq!(b.engine.other_gc_node(), Some(a.engine.node()));
 }
+
+/// A forward step of the wall clock of the GC host: the monotonic clock does not move.
+fn wall_step(by: Duration) {
+    hold_clock();
+    journal::suspend_manual(by.as_nanos() as u64);
+    NOW.with(|now| now.set(now.get() + by.as_nanos() as u64));
+}
+
+/// A wall clock that steps H ahead on the GC host must not count as H: a writer can still commit
+/// a plan that names the pack. The delete also waits H on the monotonic clock.
+#[tokio::test]
+async fn test_wall_step_on_the_gc_host_deletes_nothing() {
+    let remote = Arc::new(TestRemote::new());
+    let a = proxy(&remote, 1).await;
+    dead_object(&a.engine, &random_bytes(1, 100_000)).await;
+    assert_eq!(a.engine.gc().await.unwrap().condemned_packs, 1);
+
+    wall_step(HORIZON + Duration::from_millis(100));
+    let stepped = a.engine.gc().await.unwrap();
+    assert_eq!(stepped.deleted_packs, 0, "the wall step counted as H");
+    assert_eq!(count(&remote, "packs/").await, 1);
+
+    past_horizon().await;
+    let late = a.engine.gc().await.unwrap();
+
+    assert_eq!(late.deleted_packs, 1);
+}
+
+/// The monotonic wait lives in the process: after a restart it starts again, so a wall step
+/// while the GC host was down cannot count either.
+#[tokio::test]
+async fn test_restart_of_the_gc_runner_starts_the_wait_again() {
+    let remote = Arc::new(TestRemote::new());
+    let dir = tempfile::tempdir().unwrap();
+    let open = || async {
+        hold_clock();
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config(Duration::ZERO),
+        )
+        .await
+        .unwrap()
+    };
+    let first = open().await;
+    dead_object(&first, &random_bytes(1, 100_000)).await;
+    assert_eq!(first.gc().await.unwrap().condemned_packs, 1);
+    advance(HORIZON / 2);
+    drop(first);
+
+    let second = open().await;
+    second.gc().await.unwrap();
+    advance(HORIZON / 2 + Duration::from_millis(100));
+    let early = second.gc().await.unwrap();
+    assert_eq!(
+        early.deleted_packs, 0,
+        "the wait counted time from before the restart"
+    );
+
+    advance(HORIZON / 2 + Duration::from_millis(100));
+    let late = second.gc().await.unwrap();
+
+    assert_eq!(late.deleted_packs, 1);
+}

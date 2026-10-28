@@ -1270,6 +1270,13 @@ async fn test_orphan_count_survives_a_restart() {
     .await
     .unwrap();
     engine.gc().await.unwrap();
+    let kept = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
+    assert!(
+        orphans.iter().all(|key| kept.contains(key)),
+        "a restart starts the monotonic wait again"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    engine.gc().await.unwrap();
 
     let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
     assert!(orphans.iter().all(|key| !left.contains(key)), "{left:?}");

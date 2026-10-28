@@ -81,6 +81,11 @@ TimeoutStopSec=600
 LimitNOFILE=65536
 ```
 
+The proxy with `gc.enabled` deletes an object only after H (24 h by default) of uptime since it
+condemned or first saw it. A GC runner that restarts every day, or more often, never deletes:
+give it an uptime of H between restarts. `docs/storage.md` (GC deletes and the clock of the GC
+host) gives the reason.
+
 A start that fails, for example on a quarantine or a remote with other rules, fails again at
 each restart: read the error, act, then start again.
 

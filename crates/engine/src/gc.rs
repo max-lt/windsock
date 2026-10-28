@@ -4,7 +4,8 @@
 //! here: an object is deleted only when a sync that started at least H after
 //! its condemn still finds it dead. Rules 1 and 2 live in the flush.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use journal::Action;
 use model::{ObjectId, PackId};
@@ -14,6 +15,41 @@ use tracing::{error, info, warn};
 use crate::{
     Engine, EngineError, MANIFESTS_PREFIX, PACKS_PREFIX, Result, buffer, manifest_key, pack_key,
 };
+
+/// The monotonic time at which this process first saw each object that waits for a delete. The
+/// wall clock of the GC host alone can step ahead: a delete also waits H on this clock.
+#[derive(Default)]
+pub(crate) struct Waits {
+    first: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Waits {
+    /// Monotonic nanoseconds since this process first saw `key`.
+    pub(crate) fn elapsed(&self, key: &str) -> u64 {
+        let now = journal::monotonic_nanos();
+        let mut first = self.first.lock().expect("no panic while the lock is held");
+        now.saturating_sub(*first.entry(key.to_string()).or_insert(now))
+    }
+
+    /// Forgets the keys under `prefix` that are not in `kept`.
+    pub(crate) fn keep(&self, prefix: &str, kept: &BTreeSet<String>) {
+        let mut first = self.first.lock().expect("no panic while the lock is held");
+        first.retain(|key, _| !key.starts_with(prefix) || kept.contains(key));
+    }
+
+    /// The objects that still wait for `horizon`, and the longest wait so far.
+    fn waiting(&self, horizon: u64) -> (usize, u64) {
+        let now = journal::monotonic_nanos();
+        let first = self.first.lock().expect("no panic while the lock is held");
+        let waits = first
+            .values()
+            .map(|at| now.saturating_sub(*at))
+            .filter(|waited| *waited < horizon);
+        waits.fold((0, 0), |(count, oldest), waited| {
+            (count + 1, oldest.max(waited))
+        })
+    }
+}
 
 /// What one GC run did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -83,6 +119,12 @@ impl<R: Sweep + 'static> Engine<R> {
         };
 
         if !packs.to_condemn.is_empty() || !manifests.to_condemn.is_empty() {
+            // The monotonic wait starts at the condemn.
+            let keys = packs.to_condemn.iter().map(|id| pack_key(*id));
+            let keys = keys.chain(manifests.to_condemn.iter().map(|id| manifest_key(*id)));
+            for key in keys {
+                self.gc_waits.elapsed(&key);
+            }
             self.condemn(packs.to_condemn, manifests.to_condemn).await?;
         }
 
@@ -129,6 +171,12 @@ impl<R: Sweep + 'static> Engine<R> {
         report.redacted_entries = redacted;
         report.deleted_snapshots = self.delete_old_snapshots(loaded).await?;
 
+        let (waiting, oldest) = self.gc_waits.waiting(horizon);
+        info!(
+            waiting,
+            oldest_secs = oldest / 1_000_000_000,
+            "deletes that wait for H on the monotonic clock"
+        );
         info!(?report, "gc run");
         Ok(report)
     }
@@ -166,6 +214,7 @@ impl<R: Sweep + 'static> Engine<R> {
             to_delete: Vec::new(),
         };
 
+        let mut condemned = BTreeSet::new();
         for key in self.remote.list(prefix).await? {
             let Some(id) = key.strip_prefix(prefix).and_then(|s| s.parse::<T>().ok()) else {
                 continue;
@@ -175,12 +224,17 @@ impl<R: Sweep + 'static> Engine<R> {
                 continue;
             }
 
-            match condemned_at(&self.index(), id)? {
-                None => dead.to_condemn.push(id),
-                Some(at) if started >= at.saturating_add(horizon) => dead.to_delete.push(id),
-                Some(_) => {}
+            let Some(at) = condemned_at(&self.index(), id)? else {
+                dead.to_condemn.push(id);
+                continue;
+            };
+            let waited = self.gc_waits.elapsed(&key);
+            if started >= at.saturating_add(horizon) && waited >= horizon {
+                dead.to_delete.push(id);
             }
+            condemned.insert(key);
         }
+        self.gc_waits.keep(prefix, &condemned);
 
         Ok(dead)
     }

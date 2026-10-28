@@ -99,7 +99,8 @@ start again. `docs/storage.md` (Journal reads) gives the details.
 H, R and M are rules of the remote: the first proxy fixes them, and every other proxy must use the
 same values. When the remote is down for longer than R - M (23 h by default), the acked writes
 that wait in the buffer are older than the late limit. The proxy logs an ERROR with their keys,
-stops its flusher and refuses writes. At the next start, only those writes move to
+stops its flusher and refuses writes. A stop then exits with status 1 and names the bytes
+that stay in the buffer. At the next start, only those writes move to
 `data/engine/quarantine` and the start fails. To replay a write, write the object again through
 the S3 API after the start, from the copy that the client holds: no tool reads the quarantine. To discard the late writes, move the files out of the quarantine.
 Then start the proxy: the younger writes flush.

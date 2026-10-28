@@ -378,6 +378,13 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     tokio::select! {
         result = server => {
             result?;
+            let bytes = engine.buffered_bytes().await;
+            if bytes > 0 {
+                bail!(
+                    "stopped with {bytes} buffered bytes that are not in the remote: the next \
+                     start moves the late writes to quarantine"
+                );
+            }
             info!("buffer flushed: stopped");
         }
         () = second_signal => {

@@ -469,3 +469,40 @@ fn test_run_names_an_engine_dir_it_cannot_open() {
 
     assert!(stderr.contains(&engine.display().to_string()), "{stderr}");
 }
+
+/// A stop with late writes in the buffer cannot flush them: it must not report a flushed buffer,
+/// and it exits with a failure so that the supervisor and the operator see it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stop_with_late_writes_exits_with_a_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, config, keys) = init();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("retention_secs = 86400", "retention_secs = 3")
+        .replace("late_margin_secs = 3600", "late_margin_secs = 1");
+    std::fs::write(&config, text).unwrap();
+    let daemon = start(&config, "info");
+    assert_eq!(
+        call(&daemon, &keys, "PUT", "/demo", b"").await.status,
+        StatusCode::OK
+    );
+    let log = dir.path().join("remote").join("log");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let read_only = std::fs::Permissions::from_mode(0o555);
+    for entry in std::fs::read_dir(&log).unwrap() {
+        std::fs::set_permissions(entry.unwrap().path(), read_only.clone()).unwrap();
+    }
+    call(&daemon, &keys, "PUT", "/demo/late", b"late").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let flushed = daemon.stop();
+
+    for entry in std::fs::read_dir(&log).unwrap() {
+        let writable = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(entry.unwrap().path(), writable).unwrap();
+    }
+    assert!(
+        !flushed,
+        "a stop that left late writes in the buffer exits with success"
+    );
+}

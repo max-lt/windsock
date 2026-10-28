@@ -1008,18 +1008,17 @@ async fn free_name(dir: &Path, stem: &str, suffix: &str) -> Result<PathBuf, Engi
     }
 }
 
-/// Writes `bytes` to a new quarantine file `<stem>.log`, or to `<stem>.<n>.log` when that name
-/// is taken. A file that already holds the same bytes, from a move that stopped, is kept as is.
-/// A quarantine file is never replaced.
+/// Writes `bytes` to a new quarantine file `<stem>.log`. A move starts only with no segment in
+/// the quarantine, so the name is free; a taken name fails, as a quarantine file is never
+/// replaced.
 async fn create_durable(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(), EngineError> {
-    let first = dir.join(format!("{stem}{SEGMENT_SUFFIX}"));
-    if tokio::fs::read(&first)
-        .await
-        .is_ok_and(|held| held == bytes)
-    {
-        return Ok(());
+    let path = dir.join(format!("{stem}{SEGMENT_SUFFIX}"));
+    if tokio::fs::try_exists(&path).await? {
+        return Err(EngineError::Corrupt(format!(
+            "{}: a quarantine file is never replaced",
+            path.display()
+        )));
     }
-    let path = free_name(dir, stem, SEGMENT_SUFFIX).await?;
     write_durable(dir, &path, bytes).await
 }
 
@@ -1111,7 +1110,9 @@ mod tests {
     }
 
     /// Times 1 to 3 are late and 10, 11 are young, with `segment_target` bytes per segment. A
-    /// failure after each step, then a second call, gives the same split as one call.
+    /// stop after each step, then the starts of the operator procedure: a start that finds a
+    /// segment in the quarantine is refused, the operator reads and empties it, and the next
+    /// start moves the rest. The operator sees every late write, and the young ones stay.
     async fn check_split_survives_a_stop_at_each_step(segment_target: u64) {
         let source = tempfile::tempdir().unwrap();
         {
@@ -1134,11 +1135,23 @@ mod tests {
 
             let stopped =
                 quarantine_late_until(&dir, &quarantine, 5, &mut |step| step == stop_at).await;
-            let moved = quarantine_late(&dir, &quarantine, 5).await.unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            for _start in 0..4 {
+                let held = times(&quarantine).await;
+                if held.is_empty() {
+                    quarantine_late(&dir, &quarantine, 5).await.unwrap();
+                    continue;
+                }
+                seen.extend(held);
+                std::fs::remove_dir_all(&quarantine).unwrap();
+            }
 
             assert_eq!(times(&dir).await, young, "stop at {stop_at}: {stopped:?}");
-            assert_eq!(times(&quarantine).await, late, "stop at {stop_at}");
-            assert!(moved.len() <= 3, "stop at {stop_at}: {moved:?}");
+            assert_eq!(
+                seen.into_iter().collect::<Vec<_>>(),
+                late,
+                "stop at {stop_at}"
+            );
         }
     }
 

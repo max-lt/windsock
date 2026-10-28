@@ -137,20 +137,31 @@ to the quarantine with the other late writes. Else the next flush plans those wr
 - At a flush, such a write stops the flush before any plan or upload. The proxy logs
   `ERROR buffered writes older than the late limit` with the keys, refuses writes, and stops its
   flusher until a restart.
-- At open, the proxy moves only the late writes to `data/engine/quarantine/<segment>.log` (or `<segment>.<n>.log`: a quarantine file is never replaced), and
-  the open fails with the keys. The young writes stay in the buffer. The move survives a crash
-  at each step: a record is in the buffer, in the quarantine, or in both, and the next open ends
-  the move. A record in the quarantine never applies.
-- While the quarantine holds files, the proxy does not start, and a start moves nothing more
-  there.
+- At open, the proxy moves only the late writes to `data/engine/quarantine/<segment>.log`, and
+  the open fails with the keys. The young writes stay in the buffer. A record in the quarantine
+  never applies. A quarantine file is never replaced.
+- While the quarantine holds a segment (`*.log`), the proxy does not start, and a start moves
+  nothing more there. Another file in the quarantine, such as a `<segment>.tmp` left by a crash,
+  gives a WARN with its path and does not stop the start. A quarantine that does not read stops
+  the start with its path.
 - A quarantine file holds the records with their data, or an intent with its plan only. No tool
   reads them: the ERROR line of the move, and the error of every start that the quarantine
   stops, give each key as `bucket/key (ack HLC n)`. The flush ERROR before a restart gives the
   keys only.
   `engine::quarantined_writes` gives the same list from the segment files, with no data.
 
-The open runs in this order: the snapshot load, one full sync with the audit, a stop on a held
-quarantine, the recover of an intent, then the move of the late writes to the quarantine.
+The open runs in this order: a stop on a held quarantine (before any remote call), the key check
+(`repo/key-check`), the snapshot load when the index is empty, one full sync with the audit, the
+recover of an intent, then the move of the late writes to the quarantine.
+
+A crash or a power loss during the move can leave a record in the buffer and in the quarantine.
+The starts that follow are:
+
+1. The start after the crash finds a segment in the quarantine and is refused with its keys.
+2. The operator decides, and empties the quarantine.
+3. The next start moves the late records that are still in the buffer, and is refused again with
+   their keys. Some keys can show again.
+4. The operator empties the quarantine again. The next start works.
 
 What the operator does:
 
@@ -162,6 +173,27 @@ What the operator does:
 3. Empty `data/engine/quarantine` (move its files away), then start the proxy. The young writes
    in the buffer flush at this start. Emptying the quarantine drops every late write in it that
    step 2 did not write again.
+
+## Open refusals
+
+Each refusal stops the start with exit status 1. A supervisor restart gives the same refusal
+until the operator acts.
+
+| Error text (start)                                                                                           | Cause                                                                                   | Operator action                                                                                                                                                                                                                               |
+| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `... holds writes that were never committed`, with `bucket/key (ack HLC n)`                                  | Buffered writes older than the late limit R - M, now or at an earlier start             | See "What the operator does" above                                                                                                                                                                                                            |
+| `quarantine ... does not read`                                                                               | The quarantine path is not a readable directory                                         | Fix the path or its rights. It can hold writes: do not remove it unread                                                                                                                                                                       |
+| `the remote holds gc.horizon_secs = ...; this proxy has ...`                                                 | H, R or M differs from the rules that the first proxy wrote                             | Set the values of the remote in this configuration                                                                                                                                                                                            |
+| `repo/key-check: this remote was written by an older build`                                                  | The key check has no rules                                                              | Create a new remote and copy the objects through the S3 API                                                                                                                                                                                   |
+| `repo/key-check: the rules are not in the form that this build writes`                                       | A later build wrote the key check                                                       | Run that build                                                                                                                                                                                                                                |
+| `the remote has format n, this build reads format m`                                                         | Another build wrote the remote                                                          | Run a build of that format                                                                                                                                                                                                                    |
+| A repository key error on `repo/key-check`                                                                   | This `repo.key` is not the key of the remote                                            | Give this proxy the `repo.key` of the other proxies                                                                                                                                                                                           |
+| `the own chain is broken`, `entry n is missing and entry m exists (key ...)` (Gap)                           | An object that is not an entry of this node, under its own log                          | Check the named key in the bucket, remove it when this node did not write it, start again                                                                                                                                                     |
+| `the own chain is broken`, `entry n has an HLC more than the retention ahead of this clock` (FutureHlc)      | The clock of this host is more than R behind the HLC of its own entry                   | Fix the clock of this host. Do not remove the entry: it holds acked writes                                                                                                                                                                    |
+| `the own chain is broken`, `entry n differs from the copy that this proxy read before, or is gone` (Changed) | The remote lost or changed own entries, for example a restored older copy of the bucket | The writes of the missing entries are lost from the remote. Restore those objects from a copy of the bucket. With no copy: stop the proxy, move `data/` away, start with a new node key and an empty buffer, and write the lost objects again |
+| An io error with the URL of `repo/key-check`                                                                 | The remote does not answer                                                              | Fix the remote or the network, start again                                                                                                                                                                                                    |
+
+A key named in an error is the key as it is in the bucket.
 
 ## Journal reads
 

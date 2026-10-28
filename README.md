@@ -89,9 +89,10 @@ host) gives the reason.
 A start that fails, for example on a quarantine or a remote with other rules, fails again at
 each restart: read the error, act, then start again.
 
-A start that fails with `the own chain is broken` names a key under `log/<node>/`. Check that
-key in the bucket: an object that this proxy did not write blocks the start. Remove it, then
-start again. `docs/storage.md` (Journal reads) gives the details.
+A start that fails with `the own chain is broken` gives a cause. Only a gap names a key: check
+that key in the bucket, and remove it when this proxy did not write it. Do not remove an entry
+for an HLC ahead of the clock: fix the clock. `docs/storage.md` (Open refusals) gives each
+refusal, its cause and the action.
 
 ## Time rules
 

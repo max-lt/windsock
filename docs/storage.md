@@ -61,8 +61,10 @@ Each node also runs this test before it serves:
 - A violation stops the node.
 - Another error, such as a network fault or a refused credential, is ambiguous. The node runs
   the complete test again with new objects, 3 times at most.
-- After 3 ambiguous errors, the node starts with a warning, because an outage can end after the
-  start.
+- After 3 ambiguous errors, the probe stops with the warning `could not check the storage
+contract: starting anyway`, because an outage can end after the start. The engine open then
+  reads the remote: when the remote is still down, the start fails with exit status 1 and the
+  URL of the call that failed.
 
 ## Probe objects
 

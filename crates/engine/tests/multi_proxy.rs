@@ -663,6 +663,8 @@ async fn open_config(remote: &Arc<MemoryRemote>, seed: u8, dir: TempDir, config:
 /// a commit would bring the key back. The proxy must refuse it and keep the record aside.
 #[tokio::test]
 async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
+    let start = 1_900_000_000_000_000_000;
+    journal::set_manual_wall(Some(start));
     let remote = Arc::new(MemoryRemote::default());
     let retention = Duration::from_millis(300);
     // H far above R: the late limit is R - M, not a value that grows with H.
@@ -681,7 +683,7 @@ async fn test_late_put_after_a_tombstone_prune_is_quarantined() {
     gc.engine.sync().await.unwrap();
     a.engine.delete(BUCKET, "k").await.unwrap();
     a.engine.flush().await.unwrap();
-    tokio::time::sleep(retention * 2).await;
+    journal::set_manual_wall(Some(start + (retention * 2).as_nanos() as u64));
     put(&a.engine, "other", "x").await;
     a.engine.flush().await.unwrap();
     let report = gc.engine.gc().await.unwrap();

@@ -31,7 +31,7 @@ pub use entry::{
 };
 
 pub use clock::{HybridClock, monotonic_nanos, wall_clock_nanos};
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 pub use clock::{reset_manual_clock, set_manual_wall, suspend_manual};
 
 /// Appends that lose the seq to another process before `append` gives up.
@@ -843,10 +843,7 @@ mod tests {
     }
 
     fn wall() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64
+        crate::wall_clock_nanos()
     }
 
     async fn entry_at(remote: &MemoryRemote, seed: u8, hlc: u64) {
@@ -866,6 +863,7 @@ mod tests {
     /// of the reader passes it, and the clock never takes it.
     #[tokio::test]
     async fn test_entry_more_than_r_ahead_breaks_the_chain_until_the_clock_passes_it() {
+        set_manual_wall(Some(1_900_000_000_000_000_000));
         let remote = Arc::new(MemoryRemote::default());
         let r = std::time::Duration::from_secs(2);
         let near = wall() + r.as_nanos() as u64 - 200_000_000;
@@ -892,7 +890,7 @@ mod tests {
             "the clock does not take it"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        set_manual_wall(Some(wall() + 1_500_000_000));
 
         assert_eq!(reader.sync_node(node_of(2)).await.unwrap().len(), 1);
     }

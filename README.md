@@ -206,3 +206,7 @@ Measured with 200,000 small objects in one bucket:
 ## Development
 
 See `CLAUDE.md` for the build, test and code rules, and `../windsock-todo.md` for the design.
+
+A workspace `cargo test` builds every crate with the feature `sim` of the engine tests, which
+gives the journal a manual clock. To test the daemon as it ships, with no `sim`, run
+`cargo test -p windsockd`.

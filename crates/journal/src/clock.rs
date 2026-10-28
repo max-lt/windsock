@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 thread_local! {
     /// A wall clock that a test sets on its thread. Zero: the system clock.
     static MANUAL_WALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -16,7 +16,7 @@ thread_local! {
 
 /// Nanoseconds on a clock that never steps back, from an arbitrary start: for elapsed times.
 pub fn monotonic_nanos() -> u64 {
-    #[cfg(feature = "sim")]
+    #[cfg(any(test, feature = "sim"))]
     if MANUAL_WALL.with(std::cell::Cell::get) != 0 {
         return MANUAL_MONOTONIC.with(std::cell::Cell::get);
     }
@@ -34,13 +34,13 @@ fn system_nanos() -> u64 {
 }
 
 /// The wall clock in unix nanoseconds.
-#[cfg(not(feature = "sim"))]
+#[cfg(not(any(test, feature = "sim")))]
 pub fn wall_clock_nanos() -> u64 {
     system_nanos()
 }
 
 /// The wall clock in unix nanoseconds: the system clock, or the value of [`set_manual_wall`].
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 pub fn wall_clock_nanos() -> u64 {
     match MANUAL_WALL.with(std::cell::Cell::get) {
         0 => system_nanos(),
@@ -50,7 +50,7 @@ pub fn wall_clock_nanos() -> u64 {
 
 /// Replaces the wall clock of this thread with `nanos`, or gives back the system clock for
 /// `None`. Only with the feature `sim`, for deterministic tests.
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 pub fn set_manual_wall(nanos: Option<u64>) {
     MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
     let counted = nanos
@@ -61,7 +61,7 @@ pub fn set_manual_wall(nanos: Option<u64>) {
 
 /// Gives back the system clock on this thread and forgets every manual time: the next run starts
 /// as on a new thread. Only with the feature `sim`.
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 pub fn reset_manual_clock() {
     MANUAL_WALL.with(|wall| wall.set(0));
     MANUAL_MONOTONIC.with(|mono| mono.set(0));
@@ -70,7 +70,7 @@ pub fn reset_manual_clock() {
 
 /// A host suspend of `nanos` on this thread: the manual wall clock moves on, and the monotonic
 /// clock does not, as a monotonic clock of a suspended host or VM. Only with the feature `sim`.
-#[cfg(feature = "sim")]
+#[cfg(any(test, feature = "sim"))]
 pub fn suspend_manual(nanos: u64) {
     MANUAL_SUSPENDED.with(|suspended| suspended.set(suspended.get() + nanos));
     let wall = MANUAL_WALL.with(std::cell::Cell::get);

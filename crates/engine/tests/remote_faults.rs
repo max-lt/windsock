@@ -191,6 +191,15 @@ async fn read_back(remote: &Arc<FaultRemote>) {
     assert_eq!(object.data, data());
 }
 
+/// The manual wall clock of the tests that measure time: no test waits on the system clock.
+const START: u64 = 1_900_000_000_000_000_000;
+
+/// Moves the manual wall clock of this thread on by `by`.
+fn advance(by: Duration) {
+    let now = journal::wall_clock_nanos();
+    journal::set_manual_wall(Some(now + by.as_nanos() as u64));
+}
+
 #[tokio::test]
 async fn test_refused_pack_upload_is_retried_with_no_duplicate() {
     let remote = Arc::new(FaultRemote::default());
@@ -430,6 +439,7 @@ async fn test_own_write_stays_visible_when_the_commit_reads_a_bad_manifest() {
 /// limit. The recover must not commit it then: the check runs at the commit, not at the plan.
 #[tokio::test]
 async fn test_recover_refuses_an_intent_older_than_the_late_limit() {
+    journal::set_manual_wall(Some(START));
     let remote = Arc::new(FaultRemote::default());
     let config = Config {
         retention: Duration::from_millis(300),
@@ -458,7 +468,7 @@ async fn test_recover_refuses_an_intent_older_than_the_late_limit() {
     put.await.unwrap();
     remote.fail_next("log/", Fault::Refuse);
     assert!(engine.flush().await.is_err());
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    advance(Duration::from_millis(400));
 
     let result = engine.flush().await;
 
@@ -510,6 +520,7 @@ async fn test_audit_runs_again_after_a_sync_that_failed() {
 /// it, and the engine stays quarantined until a restart.
 #[tokio::test]
 async fn test_late_record_stops_the_flush_and_only_it_goes_to_quarantine() {
+    journal::set_manual_wall(Some(START));
     let remote = Arc::new(FaultRemote::default());
     let config = Config {
         retention: Duration::from_millis(3000),
@@ -539,7 +550,7 @@ async fn test_late_record_stops_the_flush_and_only_it_goes_to_quarantine() {
         )
     };
     put("late").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    advance(Duration::from_millis(2200));
     put("young").await.unwrap();
 
     let result = engine.flush().await;
@@ -575,6 +586,7 @@ async fn test_late_record_stops_the_flush_and_only_it_goes_to_quarantine() {
 /// proxy starts once the operator empties the quarantine.
 #[tokio::test]
 async fn test_late_intent_goes_to_the_quarantine_at_open() {
+    journal::set_manual_wall(Some(START));
     let remote = Arc::new(FaultRemote::default());
     let config = Config {
         retention: Duration::from_millis(3000),
@@ -605,7 +617,7 @@ async fn test_late_intent_goes_to_the_quarantine_at_open() {
     remote.fail_next("log/", Fault::Refuse);
     assert!(engine.flush().await.is_err());
     drop(engine);
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    advance(Duration::from_millis(2500));
 
     assert!(
         open().await.is_err(),
@@ -653,8 +665,7 @@ async fn test_first_entry_with_a_lost_answer_is_visible_to_other_proxies() {
 #[tokio::test]
 async fn test_wall_clock_step_back_does_not_make_an_old_plan_young() {
     let horizon = Duration::from_secs(600);
-    let start = 1_900_000_000_000_000_000;
-    journal::set_manual_wall(Some(start));
+    journal::set_manual_wall(Some(START));
     let remote = Arc::new(FaultRemote::default());
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(
@@ -683,8 +694,8 @@ async fn test_wall_clock_step_back_does_not_make_an_old_plan_young() {
     assert!(engine.flush().await.is_err());
     assert_eq!(remote.inner.list("packs/").await.unwrap().len(), 1);
 
-    journal::set_manual_wall(Some(start + horizon.as_nanos() as u64));
-    journal::set_manual_wall(Some(start));
+    journal::set_manual_wall(Some(START + horizon.as_nanos() as u64));
+    journal::set_manual_wall(Some(START));
     engine.flush().await.unwrap();
 
     assert_eq!(
@@ -753,8 +764,7 @@ async fn test_failed_starts_never_replace_a_held_quarantine() {
 #[tokio::test]
 async fn test_plan_is_stale_after_a_host_suspend() {
     let horizon = Duration::from_secs(600);
-    let start = 1_900_000_000_000_000_000;
-    journal::set_manual_wall(Some(start));
+    journal::set_manual_wall(Some(START));
     let remote = Arc::new(FaultRemote::default());
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(

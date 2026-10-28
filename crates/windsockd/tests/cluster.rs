@@ -609,9 +609,17 @@ async fn test_second_gc_runner_warns_at_start() {
     assert!(condemn.is_some(), "the GC of a condemns the pack");
     assert!(a.stop());
 
-    let mut b = start(&cluster.config_with("b", 100, gc), "info");
+    // A GC interval of 1 h: the only GC check of b in this test is the one at its start.
+    let b = start(
+        &cluster.config_with(
+            "b",
+            100,
+            &gc.replace("interval_secs = 1", "interval_secs = 3600"),
+        ),
+        "info",
+    );
 
-    let warned = b.wait_for("another node ran the GC", Duration::from_secs(30));
-    assert!(warned.is_some_and(|line| line.contains("WARN")));
+    // The start reads the log up to the listen line, so the WARN is in the lines already seen.
+    assert!(b.logged("WARN windsockd: another node ran the GC"));
     assert!(b.stop());
 }

@@ -203,7 +203,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   not enforce this rule. No lock stops a second GC runner. The GC protocol is model-checked with
   one GC runner and two writers only, so two GC runners on one remote are not verified. A proxy
   with `gc.enabled` logs `WARN another node ran the GC in the last horizon` at start and at each
-  GC run when it reads a condemn of another node from the last horizon.
+  GC run when it reads a condemn of another node from the last horizon. The check can miss a
+  second runner: it does not see a condemn that a prune redacted, or that a snapshot covers, as a
+  new proxy loads the snapshot and does not read the entries under it.
 
 - All remote data is encrypted with `repo.key`: see `docs/encryption.md`. Without this file,
   nobody can read the data.

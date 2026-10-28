@@ -69,10 +69,32 @@ impl<R: Remote + 'static> Engine<R> {
 
         // Entries under the latest snapshot can be redacted: read from the snapshot instead.
         if entries.iter().any(|entry| entry.actions.is_none()) {
-            if let Err(none) = self.bootstrap(journal).await? {
-                return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
+            match self.bootstrap(journal).await? {
+                Ok(()) => entries = journal.sync_all().await?,
+                // A snapshot that does not load: the error names its keys for the operator.
+                Err(none) if !none.is_empty() => {
+                    return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
+                }
+                Err(_) => {}
             }
-            entries = journal.sync_all().await?;
+        }
+        // A redacted entry that no snapshot covers breaks its chain only.
+        let redacted: BTreeMap<NodeId, u64> = entries
+            .iter()
+            .filter(|entry| entry.actions.is_none())
+            .map(|entry| (entry.node, entry.seq))
+            .rev()
+            .collect();
+        if !redacted.is_empty() {
+            let frontiers = self.index().frontiers()?;
+            for (node, seq) in &redacted {
+                let frontier = frontiers
+                    .get(node)
+                    .copied()
+                    .unwrap_or(journal::Frontier::GENESIS);
+                journal.give_up(*node, frontier, journal::ChainError::Redacted { seq: *seq });
+            }
+            entries.retain(|entry| !redacted.contains_key(&entry.node));
         }
 
         if !entries.is_empty() {

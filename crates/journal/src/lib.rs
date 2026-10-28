@@ -383,6 +383,14 @@ impl<R: Remote> Journal<R> {
         }
     }
 
+    /// Moves the chain of `node` back to `frontier` and marks it broken by `source`: its entries
+    /// past `frontier` do not apply, and the next sync reads them again.
+    pub fn give_up(&mut self, node: NodeId, frontier: Frontier, source: ChainError) {
+        warn!(%node, %source, "chain is broken: the other chains go on");
+        self.frontiers.insert(node, frontier);
+        self.broken.insert(node, source);
+    }
+
     /// Reads again from `frontiers`, as after a snapshot load.
     pub fn reset(&mut self, frontiers: Frontiers) {
         self.frontiers = frontiers;

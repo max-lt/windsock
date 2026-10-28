@@ -963,3 +963,48 @@ async fn test_future_hlc_error_is_logged_once() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("ERROR"), "{errors:?}");
 }
+
+/// A redacted entry that no snapshot covers cannot apply. Only a key holder or a corruption makes
+/// one. It must break its own chain, not every sync of every proxy.
+#[tokio::test]
+async fn test_redacted_entry_with_no_snapshot_breaks_only_its_chain() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    let b = proxy(&remote, 2).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "k", "v").await;
+    a.engine.flush().await.unwrap();
+    let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let odd = Entry::sign(
+        &SigningKey::from_bytes(&[55; 32]),
+        0,
+        [0u8; 32],
+        wall,
+        BTreeMap::new(),
+        vec![journal::Action::Delete {
+            bucket: BUCKET.into(),
+            key: "k".into(),
+            hlc: 1,
+        }],
+        keys.sealer(),
+    );
+    let redacted = journal::redact_wire(&odd.to_wire()).unwrap().unwrap();
+    remote
+        .create(&odd.remote_key(), Bytes::from(redacted))
+        .await
+        .unwrap();
+    remote
+        .put(&journal::node_key(odd.node), Bytes::new())
+        .await
+        .unwrap();
+
+    let report = b.engine.sync().await.unwrap();
+
+    assert_eq!(report.broken, vec![odd.node]);
+    let object = b.engine.get(BUCKET, "k", None).await.unwrap();
+    assert_eq!(&object.data[..], b"v");
+}

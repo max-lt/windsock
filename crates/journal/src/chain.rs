@@ -108,6 +108,8 @@ pub enum ChainError {
          key, or changed bytes"
     )]
     BadMac { seq: u64 },
+    #[error("entry {seq} is redacted, and no snapshot covers it")]
+    Redacted { seq: u64 },
     #[error("entry {seq} is missing and entry {later} exists (key {key})")]
     Gap { seq: u64, later: u64, key: String },
     #[error("entry {seq} has an action with an HLC above the entry HLC")]

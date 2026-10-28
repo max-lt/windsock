@@ -195,7 +195,29 @@ until the operator acts.
 | `the own chain is broken`, `entry n differs from the copy that this proxy read before, or is gone` (Changed) | The remote lost or changed own entries, for example a restored older copy of the bucket | The writes of the missing entries are lost from the remote. Restore those objects from a copy of the bucket. With no copy: stop the proxy, move `data/` away, start with a new node key and an empty buffer, and write the lost objects again |
 | An io error with the URL of `repo/key-check`                                                                 | The remote does not answer                                                              | Fix the remote or the network, start again                                                                                                                                                                                                    |
 
+| `the own chain is broken`, `entry n has no valid MAC under the repository key` (BadMac) | A writer with bucket rights and no `repo.key` put an object under the own log, or the bytes changed | The ERROR names the key. Check who has write access to the bucket, then remove the objects that this node did not write |
+
 A key named in an error is the key as it is in the bucket.
+
+## A writer without the repository key
+
+A client with write access to the bucket but no `repo.key` cannot read the data or make a valid
+journal entry. It can still put objects. Each known limit, its cost and what protects the data:
+
+| What it puts                                    | Effect and cost                                                                                                                                                                                                                                     | What protects the data                                                                                     |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| A fake chain: `nodes/<id>` and `log/<id>/<seq>` | The chain is broken (BadMac) and named. The GC refuses to run while it is there. A normal sync does not read a chain whose first entry fails: the open and each GC run read it, 1 LIST and 2 GET each. One WARN per chain and process names the key | The MAC under `repo.key`: no entry applies, no clock moves                                                 |
+| A fake node marker only                         | One more chain to read at each sync: 2 GET, and its line in the `nodes/` LIST (1 LIST for 1000 markers)                                                                                                                                             | The marker content is never read                                                                           |
+| A forged snapshot                               | Skipped with a WARN; the next older snapshot loads. A load reads each newer forged object first, up to 16 GiB for one object                                                                                                                        | The key hash and the AEAD seal: a forged snapshot never loads, and the GC deletes only below one it loaded |
+| An overwritten pack or manifest                 | Reads of the objects in it fail, and fail closed. A write right is a delete right on this remote: the data in it is lost                                                                                                                            | AEAD per chunk: a changed chunk is never served                                                            |
+| A `repo/key-check` before the first open        | Every open fails on `repo/key-check`, and no data is written                                                                                                                                                                                        | AEAD: the proxy fails closed. Remove the object, then start                                                |
+
+Give write access to the bucket only to the proxies.
+
+Two writes to one key through one proxy, before the flush of the first one, give one version: the
+buffer keeps the last one, and the journal never holds the first one. A read between the two
+writes returns the second one. The S3 API has no version IDs, so no client holds one for the
+first write.
 
 ## Journal reads
 

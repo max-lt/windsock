@@ -123,7 +123,7 @@ async fn test_flush_succeeds_while_clients_hold_more_connections_than_descriptor
     let remote = dir.path().join("remote");
     let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
     let keys = common::test_keys();
-    let daemon = common::start_with_fd_limit(&config, "info", 128);
+    let daemon = common::start_with_fd_limit(&config, "info", 600);
     call(&daemon, &keys, "PUT", "/demo", b"").await;
     wait_for_more_entries(&remote, 0).await;
     let before = entries(&remote);
@@ -135,7 +135,8 @@ async fn test_flush_succeeds_while_clients_hold_more_connections_than_descriptor
         StatusCode::OK
     );
     let mut held = Vec::new();
-    for _ in 0..150 {
+    // 600 descriptors give (600 - 256) / 2 = 172 connections: hold more than that.
+    for _ in 0..300 {
         held.push(
             tokio::net::TcpStream::connect(&daemon.address)
                 .await
@@ -598,4 +599,99 @@ async fn test_quarantine_list_and_export_escape_the_keys() {
             .count()
             > 0
     );
+}
+
+/// Runs `windsockd run` under a soft and hard descriptor limit of `fds`, to its exit.
+fn run_with_fd_limit(config: &Path, fds: u64) -> std::process::Output {
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("ulimit -n {fds} && exec \"$0\" run \"$1\""))
+        .arg(BIN)
+        .arg(config)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn test_start_under_512_descriptors_is_refused() {
+    let (_dir, config, _keys) = init();
+
+    let output = run_with_fd_limit(&config, 300);
+
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(text.contains("ulimit -n"), "{text}");
+}
+
+#[test]
+fn test_max_connections_over_the_descriptors_is_refused() {
+    let (_dir, config, _keys) = init();
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("max_connections = 400\n{text}")).unwrap();
+
+    let output = run_with_fd_limit(&config, 600);
+
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(text.contains("max_connections = 400 needs 1056"), "{text}");
+}
+
+/// The open descriptors of a process, from lsof.
+fn open_fds(pid: u32) -> usize {
+    let output = Command::new("lsof")
+        .args(["-n", "-P", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// With every connection open and a request in each, the daemon stays under its soft limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_all_connections_stay_under_the_descriptor_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
+    let keys = common::test_keys();
+    let daemon = common::start_with_fd_limit(&config, "info", 600);
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; 1 << 20]).await;
+
+    let mut held = Vec::new();
+    for _ in 0..172 {
+        held.push(
+            tokio::net::TcpStream::connect(&daemon.address)
+                .await
+                .unwrap(),
+        );
+    }
+    let mut peak = 0;
+    let mut reads = Vec::new();
+    for _ in 0..64 {
+        let (daemon, keys) = (&daemon, &keys);
+        reads.push(async move { call(daemon, keys, "GET", "/demo/k", b"").await });
+    }
+    let watch = async {
+        for _ in 0..20 {
+            peak = peak.max(open_fds(daemon.pid()));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::join!(futures_join(reads), watch);
+    drop(held);
+
+    assert!(peak > 172, "lsof saw {peak} descriptors");
+    assert!(
+        peak < 600,
+        "{peak} descriptors at the peak for a soft limit of 600"
+    );
+    assert!(daemon.stop());
+}
+
+async fn futures_join<F: std::future::Future>(futures: Vec<F>) {
+    for future in futures {
+        future.await;
+    }
 }

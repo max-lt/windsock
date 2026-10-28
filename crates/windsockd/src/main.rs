@@ -30,7 +30,8 @@ use zeroize::Zeroizing;
 
 use config::{Config, RemoteConfig};
 use listener::{
-    ConnectionActivity, LimitedListener, Timeouts, connection_limit, soft_fd_limit, track_requests,
+    ConnectionActivity, LimitedListener, Timeouts, check_connections, connection_limit,
+    raise_fd_limit, track_requests,
 };
 
 const CONFIG_FILE: &str = "windsock.toml";
@@ -160,14 +161,28 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
 const SHORT_HORIZON_SECS: u64 = 3600;
 
 /// What `windsockd` does with the remote of a configuration.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Serve,
     /// Check the storage contract once, then exit.
     Diagnose,
 }
 
+/// The connection limit, after a raise of the soft descriptor limit. Refuses a limit that the
+/// descriptors cannot hold.
+fn connections(config: &Config) -> Result<usize> {
+    let soft = raise_fd_limit();
+    let safe = connection_limit(soft).map_err(anyhow::Error::msg)?;
+    match config.max_connections {
+        Some(max) => check_connections(max, soft).map_err(anyhow::Error::msg),
+        None => Ok(safe),
+    }
+}
+
 async fn run(config: &Config, mode: Mode) -> Result<()> {
+    if mode == Mode::Serve {
+        connections(config)?;
+    }
     match &config.remote {
         RemoteConfig::Dir { path } => {
             info!(remote = %path.display(), "remote is a local directory");
@@ -351,17 +366,7 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen))?;
-    let soft = soft_fd_limit();
-    let safe = connection_limit(soft);
-    let max_connections = config.max_connections.unwrap_or(safe);
-    if max_connections > safe {
-        warn!(
-            max_connections,
-            soft_fd_limit = soft,
-            safe,
-            "max_connections leaves too few descriptors to the engine: under load, a flush can fail"
-        );
-    }
+    let max_connections = connections(config)?;
     info!(address = %listener.local_addr()?, max_connections, "listening");
 
     let timeouts = Timeouts {

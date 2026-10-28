@@ -20,7 +20,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::{IncomingStream, Listener};
 use http_body::{Frame, SizeHint};
-use rustix::process::{Resource, getrlimit};
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -30,17 +30,53 @@ use tracing::debug;
 /// Descriptors kept for the engine: buffer segments, index files, cache files, remote calls.
 pub const FD_RESERVE: u64 = 256;
 
-/// The connection limit for a soft descriptor limit `soft` (`None`: no limit).
-pub fn connection_limit(soft: Option<u64>) -> usize {
+/// The soft descriptor limit that the daemon asks for at start, under the hard limit.
+pub const FD_TARGET: u64 = 8192;
+/// Below this soft limit the daemon does not start: the reserve would leave too few connections.
+pub const FD_MINIMUM: u64 = 512;
+
+/// The connection limit for a soft descriptor limit `soft` (`None`: no limit). A connection can
+/// hold its socket and one file at once: a buffer segment, a cache file or a multipart part.
+pub fn connection_limit(soft: Option<u64>) -> Result<usize, String> {
     let limit = match soft {
         None => u64::MAX,
-        Some(soft) if soft >= 2 * FD_RESERVE => soft - FD_RESERVE,
-        Some(soft) => soft / 2,
+        Some(soft) if soft < FD_MINIMUM => {
+            return Err(format!(
+                "the soft descriptor limit is {soft}, under {FD_MINIMUM}: raise it with \
+                 `ulimit -n` (or LimitNOFILE under systemd)"
+            ));
+        }
+        Some(soft) => (soft - FD_RESERVE) / 2,
     };
-    usize::try_from(limit).map_or(Semaphore::MAX_PERMITS, |l| l.min(Semaphore::MAX_PERMITS))
+    Ok(usize::try_from(limit).map_or(Semaphore::MAX_PERMITS, |l| l.min(Semaphore::MAX_PERMITS)))
 }
 
-pub fn soft_fd_limit() -> Option<u64> {
+/// Checks a `max_connections` from the configuration against the soft limit `soft`.
+pub fn check_connections(max: usize, soft: Option<u64>) -> Result<usize, String> {
+    let needed = 2 * max as u64 + FD_RESERVE;
+    match soft {
+        Some(soft) if needed > soft => Err(format!(
+            "max_connections = {max} needs {needed} descriptors (2 for each connection, and \
+             {FD_RESERVE} for the engine), and the soft descriptor limit is {soft}"
+        )),
+        _ => Ok(max),
+    }
+}
+
+/// Raises the soft descriptor limit to FD_TARGET, or to the hard limit when it is lower.
+/// Returns the soft limit after the raise.
+pub fn raise_fd_limit() -> Option<u64> {
+    let limit = getrlimit(Resource::Nofile);
+    let target = limit.maximum.map_or(FD_TARGET, |hard| hard.min(FD_TARGET));
+    if limit.current.is_some_and(|soft| soft < target) {
+        let raised = Rlimit {
+            current: Some(target),
+            maximum: limit.maximum,
+        };
+        if let Err(e) = setrlimit(Resource::Nofile, raised) {
+            debug!(%e, "the soft descriptor limit stays as it is");
+        }
+    }
     getrlimit(Resource::Nofile).current
 }
 
@@ -323,10 +359,24 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_limit_keeps_a_reserve_for_the_engine() {
-        assert_eq!(connection_limit(Some(1024)), 768);
-        assert_eq!(connection_limit(Some(128)), 64);
-        assert_eq!(connection_limit(None), Semaphore::MAX_PERMITS);
+    fn test_connection_limit_keeps_a_reserve_and_a_file_per_connection() {
+        assert_eq!(connection_limit(Some(1024)), Ok(384));
+        assert_eq!(connection_limit(Some(512)), Ok(128));
+        assert!(
+            connection_limit(Some(511))
+                .unwrap_err()
+                .contains("ulimit -n")
+        );
+        assert_eq!(connection_limit(None), Ok(Semaphore::MAX_PERMITS));
+    }
+
+    #[test]
+    fn test_explicit_max_connections_over_the_limit_is_refused() {
+        assert_eq!(check_connections(384, Some(1024)), Ok(384));
+
+        let error = check_connections(500, Some(1024)).unwrap_err();
+
+        assert!(error.contains("500") && error.contains("1256") && error.contains("1024"));
     }
 
     #[tokio::test]

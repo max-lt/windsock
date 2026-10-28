@@ -274,17 +274,42 @@ async fn quarantine_at_open(
     Ok(())
 }
 
-/// Refuses to start while the quarantine directory holds a file.
+/// Refuses to start while the quarantine directory holds a record segment. Another file holds
+/// no write: it gives a WARN. A directory that does not read can hold writes: it fails the start.
 async fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
-    let held = match std::fs::read_dir(quarantine) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(_) => false,
+    let entries = match std::fs::read_dir(quarantine) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(EngineError::Quarantined(format!(
+                "{} does not read: {e}. It can hold writes that were never committed",
+                quarantine.display()
+            )));
+        }
     };
+    let mut held = false;
+    for entry in entries {
+        let path = entry?.path();
+        match path.extension().is_some_and(|e| e == "log") {
+            true => held = true,
+            false if is_intent(&path) => {}
+            false => {
+                warn!(path = %path.display(), "a file in the quarantine that holds no write: ignored")
+            }
+        }
+    }
     if held {
         let keys = held_writes(quarantine).await?;
         return Err(refusal(quarantine, &keys));
     }
     Ok(())
+}
+
+/// An intent moved with the late records of its flush: the plan only, never a write.
+fn is_intent(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "intent" || name.starts_with("intent."))
 }
 
 /// Each write in the quarantine as `target (ack HLC n)`: what the operator decides on.
@@ -410,6 +435,9 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
         let dir = dir.as_ref();
+        // Before any remote call: a move later in the open could put a write next to one that
+        // the operator has not decided on yet, and the operator must see it with the remote down.
+        refuse_held_quarantine(&dir.join(QUARANTINE_DIR)).await?;
         let index = Index::open(dir.join(INDEX_DIR))?;
         let journal = Journal::new(
             remote.clone(),
@@ -502,10 +530,7 @@ impl<R: Remote + 'static> Engine<R> {
         // Last, once the clock passed every HLC that the open found. The commit measures an ack
         // against its entry HLC: the clock, not the wall clock. An intent in the remote applies
         // first and frees its segments. An intent that is late and not in the remote never
-        // commits: it goes to the quarantine with its records. A held quarantine blocks the start
-        // first: a move now could put a write next to, or in place of, one the operator has not
-        // decided on yet.
-        refuse_held_quarantine(&dir.join(QUARANTINE_DIR)).await?;
+        // commits: it goes to the quarantine with its records.
         if let Err(e) = engine.recover().await {
             if !matches!(e, EngineError::Quarantined(_)) {
                 return Err(e);

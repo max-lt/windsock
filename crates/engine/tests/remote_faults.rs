@@ -1039,3 +1039,76 @@ async fn test_open_ignores_a_log_key_that_is_not_a_seq() {
 
     assert!(reopened.engine.list_buckets().await.unwrap().len() == 1);
 }
+
+/// A held quarantine stops the start before any remote call: the operator sees the quarantine
+/// and its keys also while the remote is down.
+#[tokio::test]
+async fn test_held_quarantine_is_checked_before_the_remote() {
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let quarantine = dir.path().join("quarantine");
+    std::fs::create_dir_all(&quarantine).unwrap();
+    std::fs::write(quarantine.join("00000000000000000001.log"), b"").unwrap();
+    *remote.failing_reads.lock().unwrap() = Some("");
+
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(engine::EngineError::Quarantined(_))),
+        "{:?}",
+        result.err()
+    );
+}
+
+/// Only record segments hold writes to decide on. A leftover file of another kind gives a WARN
+/// and does not stop the start.
+#[tokio::test]
+async fn test_stray_file_in_the_quarantine_does_not_block_the_start() {
+    let logs = common::capture();
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let quarantine = dir.path().join("quarantine");
+    std::fs::create_dir_all(&quarantine).unwrap();
+    std::fs::write(quarantine.join("00000000000000000001.tmp"), b"").unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await;
+
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(logs.lines("00000000000000000001.tmp").len(), 1);
+}
+
+/// A quarantine that cannot be read can hold writes: the start fails closed and names it.
+#[tokio::test]
+async fn test_unreadable_quarantine_fails_the_start() {
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("quarantine"), b"not a directory").unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a proxy with an unreadable quarantine opens");
+    };
+    assert!(error.to_string().contains("quarantine"), "{error}");
+}

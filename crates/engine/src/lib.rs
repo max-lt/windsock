@@ -566,11 +566,19 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
 
-        let Some(theirs) = RepoRules::parse(lines) else {
+        let rest: Vec<&str> = lines.collect();
+        let Some(theirs) = RepoRules::parse(rest.iter().copied()) else {
             return Err(EngineError::Config(format!(
                 "{KEY_CHECK_KEY}: this remote was written by an older build; create a new remote"
             )));
         };
+        // The exact text: a later build that adds a rule, or another number form, is refused.
+        if rest.join("\n") != theirs.text() {
+            return Err(EngineError::Config(format!(
+                "{KEY_CHECK_KEY}: the rules are not in the form that this build writes: a later \
+                 build wrote them; run that build"
+            )));
+        }
         if theirs != ours {
             return Err(EngineError::Config(format!(
                 "the remote holds {}; this proxy has {}. Every proxy of a remote needs the \

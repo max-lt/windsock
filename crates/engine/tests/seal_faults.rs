@@ -584,3 +584,42 @@ async fn test_entry_cap_above_the_shared_limit_is_refused() {
 
     assert!(result.is_err(), "an entry cap of 2 GiB opens");
 }
+
+/// A later build can add a rule to the key check. This build must refuse that remote, not read
+/// the rules it knows and ignore the rest. A number in another form is not the same text either.
+#[tokio::test]
+async fn test_key_check_with_a_rule_this_build_does_not_know_is_refused() {
+    let defaults = "horizon_ns 86400000000000\nretention_ns 86400000000000\nlate_margin_ns \
+                    3600000000000";
+    let texts = [
+        format!("{defaults}\nnew_rule_ns 5"),
+        defaults.replace("horizon_ns 86400000000000", "horizon_ns +86400000000000"),
+        defaults.replace("horizon_ns 86400000000000", "horizon_ns 086400000000000"),
+    ];
+    for rules in texts {
+        let remote = Arc::new(MemoryRemote::default());
+        let keys = RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+        let text = format!("windsock repository key check\nformat 2\n{rules}");
+        let check = keys.sealer().seal(
+            seal::Kind::KeyCheck,
+            b"windsock repository key check",
+            text.as_bytes(),
+        );
+        remote
+            .create("repo/key-check", Bytes::from(check))
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[2; 32]),
+            keys,
+            Config::default(),
+        )
+        .await;
+
+        assert!(result.is_err(), "a key check with {rules:?} opens");
+    }
+}

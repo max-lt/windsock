@@ -222,6 +222,7 @@ struct Stats {
     stale_plan: bool,
     marker_fault: bool,
     far_ahead: bool,
+    keyless: bool,
     slow_stale_plan: bool,
     /// Chunks that a flush found stored and did not upload again.
     dedup_hits: u64,
@@ -295,6 +296,10 @@ struct Sim {
     prune_bound: u64,
     /// The highest wall clock of any proxy so far: no HLC is above it, also after a step back.
     highest_clock: u64,
+    /// The keys of a chain that a writer with no repo key put, and the node of that chain.
+    keyless: Option<(Vec<String>, [u8; 32])>,
+    /// The HLC of the latest keyless entry: no clock may reach it.
+    keyless_hlc: u64,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
     /// Real time since the start: it never steps back, unlike the wall clocks.
@@ -531,12 +536,60 @@ impl Sim {
         }
     }
 
+    /// A writer with bucket rights and no repo key puts a chain far ahead, or the operator
+    /// removes the one it put.
+    async fn keyless_step(&mut self) {
+        if let Some((keys, _)) = self.keyless.take() {
+            for key in keys {
+                self.remote.delete(&key).await.unwrap();
+            }
+            return;
+        }
+        let seed = 100 + self.rng.below(100) as u8;
+        let other = RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let hlc = self.now + 10 * config().retention.as_nanos() as u64;
+        let entry = journal::Entry::sign(
+            &SigningKey::from_bytes(&[seed; 32]),
+            0,
+            [0; 32],
+            hlc,
+            BTreeMap::new(),
+            vec![journal::Action::Delete {
+                bucket: BUCKET.into(),
+                key: "k0".into(),
+                hlc,
+            }],
+            other.sealer(),
+        );
+        let keys = vec![entry.remote_key(), journal::node_key(entry.node)];
+        self.remote
+            .inner
+            .put(&keys[0], Bytes::from(entry.to_wire()))
+            .await
+            .unwrap();
+        self.remote.inner.put(&keys[1], Bytes::new()).await.unwrap();
+        self.keyless = Some((keys, *entry.node.as_bytes()));
+        self.keyless_hlc = self.keyless_hlc.max(hlc);
+        self.stats.keyless = true;
+    }
+
     /// A GC run on proxy 0. An error fails the run, unless a fault for it is in place.
     async fn gc(&mut self) -> Result<(), String> {
         let armed = self.remote.next.lock().unwrap().is_some();
         let r = self.engine(0).gc().await;
         self.log.push(format!("gc {r:?}"));
         let hit = armed && self.remote.next.lock().unwrap().is_none();
+        // A chain from a writer with no repo key stops every GC run, and the refusal names it.
+        if let Some((_, node)) = &self.keyless {
+            match &r {
+                Err(EngineError::BrokenChains(nodes))
+                    if nodes.iter().any(|n| n.as_bytes() == node) => {}
+                Err(EngineError::Quarantined(_)) => {}
+                Err(e) if hit || self.far_ahead_explains(e) => {}
+                other => return Err(format!("gc with a keyless chain: {other:?}")),
+            }
+            return Ok(());
+        }
         match r {
             Ok(report) => {
                 // The stable HLC is at most the highest clock of the proxies so far.
@@ -779,6 +832,7 @@ impl Sim {
                     false => self.now.saturating_sub(step),
                 };
             }
+            90 => self.keyless_step().await,
             _ => {
                 let prefix = ["log/", "packs/", "manifests/", "snapshots/", "nodes/"]
                     [self.rng.below(5) as usize];
@@ -811,6 +865,10 @@ impl Sim {
 
     async fn settle(&mut self) -> Result<(), String> {
         *self.remote.next.lock().unwrap() = None;
+        // The operator removes a chain of a writer with no repo key.
+        if self.keyless.is_some() {
+            self.keyless_step().await;
+        }
         // Clocks come back, and time passes every HLC that ran ahead.
         for proxy in &mut self.proxies {
             proxy.offset = 0;
@@ -956,6 +1014,12 @@ impl Sim {
     }
 
     async fn check(&self) -> Result<(), String> {
+        for i in 0..3 {
+            let clock = self.engine(i).last_hlc();
+            if self.keyless_hlc > 0 && clock >= self.keyless_hlc {
+                return Err(format!("p{i}: the clock took a keyless HLC: {clock}"));
+            }
+        }
         for (key, winner) in Self::winners(&self.keys) {
             let expected = winner.as_ref().and_then(|w| w.value.clone());
             let mut seen = Vec::new();
@@ -1044,6 +1108,8 @@ async fn run(seed: u64) -> Result<Stats, String> {
         far_until: 0,
         prune_bound: 0,
         highest_clock: 0,
+        keyless: None,
+        keyless_hlc: 0,
         max_offset: 0,
         elapsed: SECOND,
     };
@@ -1100,6 +1166,7 @@ struct Totals {
     stale_plan: u64,
     marker_fault: u64,
     far_ahead: u64,
+    keyless: u64,
     slow_stale_plan: u64,
     dedup_hits: u64,
     crashes: BTreeMap<Point, u64>,
@@ -1121,6 +1188,7 @@ impl Totals {
         self.marker_fault += u64::from(stats.marker_fault);
         self.far_ahead += u64::from(stats.far_ahead);
         self.slow_stale_plan += u64::from(stats.slow_stale_plan);
+        self.keyless += u64::from(stats.keyless);
         self.dedup_hits += stats.dedup_hits;
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
@@ -1149,6 +1217,7 @@ impl Totals {
             ("a failed marker write", self.marker_fault),
             ("a clock more than R ahead", self.far_ahead),
             ("a StalePlan after a slow upload", self.slow_stale_plan),
+            ("a chain from a writer with no repo key", self.keyless),
             ("a dedup hit", self.dedup_hits),
         ];
         for (branch, count) in branches {

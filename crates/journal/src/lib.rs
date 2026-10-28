@@ -78,6 +78,8 @@ pub enum JournalError {
     ClockOverflow,
     #[error("{0}: the node marker holds data; this node never wrote it")]
     Marker(String),
+    #[error("{0}: the store says the node marker exists, and a read finds no marker")]
+    MarkerMissing(String),
 }
 
 /// Reads all chains of a remote and appends to the chain of one node.
@@ -446,19 +448,28 @@ impl<R: Remote> Journal<R> {
             return Ok(());
         }
         let key = node_key(self.node);
-        match self.remote.create(&key, Bytes::new()).await {
-            Ok(()) => {}
-            Err(RemoteError::AlreadyExists(_)) => {
-                let held = self.remote.get(&key).await?;
-                if held.is_some_and(|bytes| !bytes.is_empty()) {
-                    error!(key, "the node marker holds data");
-                    return Err(JournalError::Marker(key));
-                }
+        // A store that says the marker exists and then has none gets one more create.
+        for _ in 0..2 {
+            match self.remote.create(&key, Bytes::new()).await {
+                Ok(()) => {}
+                Err(RemoteError::AlreadyExists(_)) => match self.remote.get(&key).await? {
+                    None => continue,
+                    Some(bytes) if !bytes.is_empty() => {
+                        error!(key, "the node marker holds data");
+                        return Err(JournalError::Marker(key));
+                    }
+                    Some(_) => {}
+                },
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+            self.registered = true;
+            return Ok(());
         }
-        self.registered = true;
-        Ok(())
+        error!(
+            key,
+            "the store says the node marker exists, and has no marker"
+        );
+        Err(JournalError::MarkerMissing(key))
     }
 }
 

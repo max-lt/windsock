@@ -23,6 +23,8 @@ enum Fault {
     Refuse,
     /// Stores, then fails: the answer is lost.
     LoseAnswer,
+    /// A create answers that the key exists and stores nothing, as an inconsistent store.
+    PhantomExists,
 }
 
 #[derive(Default)]
@@ -70,7 +72,7 @@ impl Remote for FaultRemote {
             return Err(unavailable());
         }
         match self.take(key) {
-            Some(Fault::Refuse) => Err(unavailable()),
+            Some(Fault::Refuse | Fault::PhantomExists) => Err(unavailable()),
             Some(Fault::LoseAnswer) => {
                 self.inner.put(key, data).await?;
                 Err(unavailable())
@@ -86,6 +88,7 @@ impl Remote for FaultRemote {
                 self.inner.create(key, data).await?;
                 Err(unavailable())
             }
+            Some(Fault::PhantomExists) => Err(RemoteError::AlreadyExists(key.to_string())),
             None => self.inner.create(key, data).await,
         }
     }
@@ -987,4 +990,20 @@ async fn test_failed_buffer_writes_log_once_and_their_end() {
 
     assert_eq!(logs.lines("buffer writes fail").len(), 1);
     assert_eq!(logs.lines("buffer writes work again").len(), 1);
+}
+
+/// An inconsistent store says the node marker exists and then has no marker. The commit must not
+/// go on with no marker: the GC finds chains through the markers.
+#[tokio::test]
+async fn test_commit_never_goes_on_with_no_node_marker() {
+    let remote = Arc::new(FaultRemote::default());
+    let writer = proxy(&remote, 1).await;
+    let marker = journal::node_key(writer.engine.node());
+    remote.fail_next("nodes/", Fault::PhantomExists);
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+
+    let flushed = writer.engine.flush().await;
+
+    let marked = remote.inner.get(&marker).await.unwrap().is_some();
+    assert!(flushed.is_err() || marked, "a commit with no node marker");
 }

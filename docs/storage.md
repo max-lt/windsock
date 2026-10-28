@@ -225,7 +225,9 @@ chaos soak on macOS, the index tables grew from 2 to 22 in 7 minutes.
 One process per remote runs the GC (`gc.enabled = true`). No lock enforces this, and the model
 check covers one runner. A proxy with `gc.enabled` logs `WARN another node ran the GC in the last
 horizon` when it reads a condemn entry of another node from the last horizon (24 h). The check
-sees only condemn entries that no prune has redacted yet: a second runner can stay unseen.
+sees only condemn entries that no prune has redacted yet and that no snapshot covers: a new
+proxy loads the snapshot and does not read the entries under it. A second runner can stay
+unseen.
 
 ## Snapshots
 

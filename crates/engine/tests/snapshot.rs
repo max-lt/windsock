@@ -29,6 +29,8 @@ struct TestRemote {
     snapshot_len: std::sync::Mutex<Option<u64>>,
     /// A fault on the ranged reads of snapshot parts, when set.
     tamper: std::sync::Mutex<Option<Tamper>>,
+    /// The put of a snapshot head first deletes part 0, as a GC on another proxy can.
+    drop_part_at_head: AtomicBool,
 }
 
 /// What the remote does to a ranged read of a snapshot part.
@@ -47,6 +49,12 @@ enum Tamper {
 #[async_trait::async_trait]
 impl Remote for TestRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        if key.ends_with("/head") && self.drop_part_at_head.swap(false, Ordering::SeqCst) {
+            let base = key.trim_end_matches("head");
+            let parts = self.inner.list(base).await?;
+            let first = parts.iter().find(|part| !part.ends_with("/head"));
+            self.inner.delete(first.expect("a part exists")).await?;
+        }
         self.inner.put(key, data).await
     }
 
@@ -1265,4 +1273,22 @@ async fn test_orphan_count_survives_a_restart() {
 
     let left = remote.list(engine::SNAPSHOTS_PREFIX).await.unwrap();
     assert!(orphans.iter().all(|key| !left.contains(key)), "{left:?}");
+}
+
+/// A GC on another proxy can delete a part with no head yet. The writer lists the parts after
+/// its head: a missing part fails the snapshot, so no proxy trusts a head with a part gone.
+#[tokio::test]
+async fn test_snapshot_fails_when_a_part_is_gone_after_its_head() {
+    let remote = Arc::new(TestRemote::default());
+    let a = history_with_entries(&remote).await;
+    let b = open_with(&remote, 64).await.unwrap();
+    put(&b.engine, "w", "four").await;
+    b.engine.flush().await.unwrap();
+    remote.drop_part_at_head.store(true, Ordering::SeqCst);
+
+    let result = b.engine.snapshot().await;
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("listed after the head"), "{error}");
+    drop(a);
 }

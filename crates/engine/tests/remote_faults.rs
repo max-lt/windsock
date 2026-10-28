@@ -1,5 +1,7 @@
 //! A remote that fails once on a pack upload, a journal append or a snapshot read.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -846,4 +848,52 @@ async fn test_node_marker_with_data_fails_the_commit() {
 
     assert!(error.contains(&marker), "{error}");
     assert!(error.contains("holds data"), "{error}");
+}
+
+/// The quarantine ERROR names the late write, and not the young one next to it.
+#[tokio::test]
+async fn test_quarantine_error_names_only_the_late_keys() {
+    journal::set_manual_wall(Some(START));
+    let logs = common::capture();
+    let remote = Arc::new(FaultRemote::default());
+    let config = Config {
+        retention: Duration::from_millis(3000),
+        late_margin: Duration::from_millis(1000),
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config.clone(),
+        )
+    };
+    let engine = open().await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = |key: &'static str| {
+        engine.put(
+            BUCKET,
+            key,
+            Bytes::from(data()),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+    };
+    put("late").await.unwrap();
+    advance(Duration::from_millis(2200));
+    put("young").await.unwrap();
+    assert!(engine.flush().await.is_err());
+    drop(engine);
+
+    assert!(open().await.is_err());
+
+    let errors = logs.lines("moved to quarantine");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("ERROR"), "{errors:?}");
+    assert!(errors[0].contains("bkt/late"), "{errors:?}");
+    assert!(!errors[0].contains("bkt/young"), "{errors:?}");
 }

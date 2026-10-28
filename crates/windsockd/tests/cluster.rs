@@ -585,3 +585,33 @@ async fn test_signal_during_the_start_replay_keeps_the_buffer() {
     eventually(&b, "/shared/kept", &data, Duration::from_secs(60)).await;
     assert!(b.stop());
 }
+
+/// A second proxy with the GC turned on finds the condemn of the first one at its start, and
+/// warns: one GC runner per remote is a configuration rule that no lock enforces.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_second_gc_runner_warns_at_start() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    // The check looks one horizon back: H must outlast the restart. A short R lets the deleted
+    // version, and so its pack, die at once.
+    let gc = "enabled = true\ninterval_secs = 1\nhorizon_secs = 3600\nretention_secs = 3\n\
+              late_margin_secs = 1";
+    let mut a = start(&cluster.config_with("a", 100, gc), "info");
+    assert_eq!(put(&a, "/shared", b"").await.status, StatusCode::OK);
+    put(&a, "/shared/gone", b"dead soon").await;
+    // A new proxy loads the snapshot and never reads the entries under it: the condemn must
+    // come after the first snapshot.
+    let snapshot = a.wait_for("snapshot_written: true", Duration::from_secs(30));
+    assert!(snapshot.is_some(), "the first GC run writes a snapshot");
+    let delete = call(&a, &test_keys(), "DELETE", "/shared/gone", b"").await;
+    assert_eq!(delete.status, StatusCode::NO_CONTENT);
+    let condemn = a.wait_for("condemned_packs: 1", Duration::from_secs(30));
+    assert!(condemn.is_some(), "the GC of a condemns the pack");
+    assert!(a.stop());
+
+    let mut b = start(&cluster.config_with("b", 100, gc), "info");
+
+    let warned = b.wait_for("another node ran the GC", Duration::from_secs(30));
+    assert!(warned.is_some_and(|line| line.contains("WARN")));
+    assert!(b.stop());
+}

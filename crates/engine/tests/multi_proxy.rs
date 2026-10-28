@@ -1,6 +1,8 @@
 //! Two or three proxies on one remote: clock skew, races, restarts, lag and broken chains.
 //! Each case ends with the same visible state on every proxy, or with a clear error.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -934,4 +936,30 @@ async fn test_broken_mark_clears_with_no_gc_run() {
     let report = c.engine.sync().await.unwrap();
 
     assert!(report.broken.is_empty(), "{:?}", report.broken_causes);
+}
+
+/// An entry more than R ahead of the clock of a reader breaks its chain at each sync, but the
+/// reader logs the ERROR once: a log line at each sync would flood the log for up to R.
+#[tokio::test]
+async fn test_future_hlc_error_is_logged_once() {
+    let start = 1_900_000_000_000_000_000;
+    journal::set_manual_wall(Some(start));
+    let logs = common::capture();
+    let remote = Arc::new(MemoryRemote::default());
+    let writer = proxy(&remote, 1).await;
+    let reader = proxy(&remote, 2).await;
+    let ahead = Duration::from_secs(3 * 24 * 3600).as_nanos() as u64;
+    journal::set_manual_wall(Some(start + ahead));
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    journal::set_manual_wall(Some(start));
+
+    for _ in 0..3 {
+        let report = reader.engine.sync().await.unwrap();
+        assert_eq!(report.broken, vec![writer.engine.node()]);
+    }
+
+    let errors = logs.lines("more than R ahead");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("ERROR"), "{errors:?}");
 }

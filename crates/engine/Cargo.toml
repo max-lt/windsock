@@ -32,3 +32,4 @@ engine = { path = ".", features = ["sim"] }
 async-trait.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

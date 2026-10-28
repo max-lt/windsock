@@ -124,7 +124,13 @@ restart or a long remote outage. A prune can then have removed a newer delete of
 commit would bring the key back. The rule: a proxy never commits a write whose ack HLC is older
 than the late limit, R - M at the commit: R is `gc.retention_secs` (24 h by default), M is
 `gc.late_margin_secs` (1 h), the clock skew that the rule allows. The check uses the HLC of the
-entry that the proxy commits, also when it commits an intent after a restart.
+entry that the proxy commits.
+
+An intent of an earlier process is never committed: its plan has an unknown age. At open, the
+proxy looks its entry up in the remote. When the entry is there, it applies and frees its
+segments. When it is not there and its writes are late, measured with max(wall clock, entry
+HLC), the intent moves to `data/engine/quarantine/intent` (or `intent.<n>`) and its records go
+to the quarantine with the other late writes. Else the next flush plans those writes again.
 
 - At a flush, such a write stops the flush before any plan or upload. The proxy logs
   `ERROR buffered writes older than the late limit` with the keys, refuses writes, and stops its
@@ -135,14 +141,20 @@ entry that the proxy commits, also when it commits an intent after a restart.
   the move. A record in the quarantine never applies.
 - While the quarantine holds files, the proxy does not start, and a start moves nothing more
   there.
+- A quarantine file holds the records with their data, or an intent with its plan only. No tool
+  reads them: the ERROR line and the error of the failed start give each key with its ack HLC.
+  `engine::quarantined_writes` gives the same list from the segment files, with no data.
+
+The open runs in this order: the snapshot load, one full sync with the audit, a stop on a held
+quarantine, the recover of an intent, then the move of the late writes to the quarantine.
 
 What the operator does:
 
 1. Read the keys in the ERROR line, or in the error of the failed start.
 2. For each key, decide. To drop the late write, do nothing more for that key: the delete or the
-   newer write that the remote holds stays. To keep the late write, read the record with the
-   build that wrote it, and write the object again through the S3 API after the start. That new
-   write gets a new ack HLC, so it wins over the delete.
+   newer write that the remote holds stays. To keep the late write, write the object again
+   through the S3 API after the start, from the copy that the client holds. That new write gets
+   a new ack HLC, so it wins over the delete.
 3. Empty `data/engine/quarantine` (move its files away), then start the proxy. The young writes
    in the buffer flush at this start. Emptying the quarantine drops every late write in it that
    step 2 did not write again.
@@ -182,8 +194,10 @@ must pass them before the first ack. When the own chain does not read at open, t
 with `ERROR the own chain does not read: no start` and the cause, for example `entry 7 is missing
 and entry 999999999 exists (key log/<node>/00000000000999999999)`. An object that a writer with
 no repo key put under the own chain gives this error. To act: read the ERROR, check the named key
-in the bucket, remove it when it is not an entry of this proxy, and start again. The remote must
-be reachable at start: a start with the remote down fails.
+in the bucket, remove it when it is not an entry of this proxy, and start again.
+
+Known limit: the remote must be reachable at start. A start with the remote down fails, also
+when the buffer holds acked writes.
 
 Known limit: a remote that drops the newest entries of a chain (a cut tail) looks like a chain
 with fewer entries. No reader can tell. The next commit of the writer goes after the cut, so the

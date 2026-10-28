@@ -101,7 +101,7 @@ same values. When the remote is down for longer than R - M (23 h by default), th
 that wait in the buffer are older than the late limit. The proxy logs an ERROR with their keys,
 stops its flusher and refuses writes. At the next start, only those writes move to
 `data/engine/quarantine` and the start fails. To replay a write, write the object again through
-the S3 API after the start. To discard the late writes, move the files out of the quarantine.
+the S3 API after the start, from the copy that the client holds: no tool reads the quarantine. To discard the late writes, move the files out of the quarantine.
 Then start the proxy: the younger writes flush.
 
 ## Encryption

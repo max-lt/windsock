@@ -945,3 +945,46 @@ async fn test_start_errors_name_each_quarantined_key_with_its_hlc() {
     assert!(moved.to_string().contains(&named), "{moved}");
     assert!(held.to_string().contains(&named), "{held}");
 }
+
+/// A buffer disk that refuses writes gives 503 to the clients. The operator must see it in the
+/// log once, and see when it works again.
+#[tokio::test]
+async fn test_failed_buffer_writes_log_once_and_their_end() {
+    use std::os::unix::fs::PermissionsExt;
+    let logs = common::capture();
+    let remote = Arc::new(FaultRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[1; 32]),
+        RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config {
+            pack_target: 1024,
+            ..Config::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    let buffer = dir.path().join("buffer");
+    let put = |key: &'static str| {
+        engine.put(
+            BUCKET,
+            key,
+            Bytes::from(vec![7; 2000]),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+    };
+    std::fs::set_permissions(&buffer, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    for key in ["a", "b", "c"] {
+        let _ = put(key).await;
+    }
+    std::fs::set_permissions(&buffer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    put("d").await.unwrap();
+
+    assert_eq!(logs.lines("buffer writes fail").len(), 1);
+    assert_eq!(logs.lines("buffer writes work again").len(), 1);
+}

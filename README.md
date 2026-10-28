@@ -138,6 +138,10 @@ ERROR with the keys and stops its flusher. At the next start, only those writes 
 
 `docs/storage.md` (Order of writes) gives the details.
 
+If the buffer disk is full or cannot be written, the proxy answers writes with 503 SlowDown and
+logs `buffer writes fail` once, and `buffer writes work again` when a write works. The flush
+frees the buffer disk as the remote takes the segments. Reads go on.
+
 If the chunk cache disk is full or cannot be written, the proxy logs `cache writes fail, reads go to
 the remote` once, and `cache writes work again` when a write works. Reads go on from the remote.
 

@@ -183,7 +183,18 @@ impl<R: Remote + 'static> Engine<R> {
             return Err(EngineError::BufferFull { limit });
         }
 
-        let record = buffer.append(Head { time, op }, data).await?;
+        let record = match buffer.append(Head { time, op }, data).await {
+            Ok(record) => record,
+            Err(e) => {
+                if !self.buffer_failing.swap(true, Ordering::SeqCst) {
+                    warn!(%e, "buffer writes fail: writes get 503 until the buffer disk works");
+                }
+                return Err(e);
+            }
+        };
+        if self.buffer_failing.swap(false, Ordering::SeqCst) {
+            info!("buffer writes work again");
+        }
 
         if buffer.bytes() >= self.config.pack_target as u64 {
             self.flush_wanted.notify_one();

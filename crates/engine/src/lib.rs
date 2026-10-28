@@ -235,6 +235,8 @@ pub struct Engine<R> {
     draining: AtomicBool,
     /// A buffered write is older than R at flush: no write and no flush until a restart.
     quarantined: AtomicBool,
+    /// The last buffer append failed: logged once until an append works.
+    buffer_failing: AtomicBool,
     /// Snapshot bases with parts and no head, and when this node first listed each one
     /// (unix nanos of this node). Kept in `orphans_file`, so a restart keeps the count.
     orphans_seen: Mutex<BTreeMap<String, u64>>,
@@ -443,6 +445,7 @@ impl<R: Remote + 'static> Engine<R> {
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
+            buffer_failing: AtomicBool::new(false),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),
             other_gc_node: Mutex::new(None),

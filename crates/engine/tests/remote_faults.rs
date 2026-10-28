@@ -395,8 +395,9 @@ async fn test_apply_error_does_not_read_the_chains_again_at_each_sync() {
     let second = reader.engine.sync().await;
     let read = gets() - before;
 
-    // Two chains, and for each one the read of the next seq and the gap probe.
-    assert_eq!(read, 4, "entry reads at one sync; {second:?}");
+    // Three chains: the writer, the forged node, and the own empty chain that the open read. For
+    // each one the read of the next seq and the gap probe.
+    assert_eq!(read, 6, "entry reads at one sync; {second:?}");
 }
 
 /// Two processes share one identity. The second one commits after the first, so its commit reads

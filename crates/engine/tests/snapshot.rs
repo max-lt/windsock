@@ -301,9 +301,9 @@ async fn test_new_proxy_starts_from_the_snapshot() {
     assert_eq!(get(&b.engine, "y").await, "two");
     assert_eq!(keys(&b.engine).await, keys(&a.engine).await);
     // For the one chain: the seq after the frontier, the gap probe, and the audit read of
-    // the last entry.
+    // the last entry. For the own empty chain of b: seq 0 and the gap probe.
     assert!(
-        remote.log_gets.load(Ordering::SeqCst) <= 3,
+        remote.log_gets.load(Ordering::SeqCst) <= 5,
         "b reads only after each snapshot frontier: {}",
         remote.log_gets.load(Ordering::SeqCst)
     );

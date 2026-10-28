@@ -95,6 +95,8 @@ pub struct Journal<R> {
     registered: bool,
     /// The next sync lists each chain and reads its last entry again.
     audit: bool,
+    /// A sync of this process read the own chain.
+    own_read: bool,
     /// Nanoseconds that an entry HLC may be ahead of the wall clock of this reader: R.
     max_ahead: u64,
     /// Entries already logged as too far ahead: one ERROR each.
@@ -125,6 +127,7 @@ impl<R: Remote> Journal<R> {
             broken: BTreeMap::new(),
             registered: false,
             audit: true,
+            own_read: false,
             max_ahead: DEFAULT_MAX_AHEAD,
             reported_ahead: BTreeSet::new(),
         }
@@ -376,6 +379,11 @@ impl<R: Remote> Journal<R> {
     /// [`Journal::broken`]; a remote error stops the sync.
     pub async fn sync_all(&mut self) -> Result<Vec<Entry>, JournalError> {
         let mut nodes: BTreeSet<NodeId> = self.frontiers.keys().copied().collect();
+        // The own chain with no frontier and no marker still orders the next acks: the first
+        // sync of the process reads it.
+        if !self.own_read {
+            nodes.insert(self.node);
+        }
 
         for key in self.remote.list(NODES_PREFIX).await? {
             if let Some(node) = key.strip_prefix(NODES_PREFIX).and_then(|s| s.parse().ok()) {
@@ -436,6 +444,7 @@ impl<R: Remote> Journal<R> {
         }
 
         self.audit = false;
+        self.own_read = true;
         Ok(entries)
     }
 
@@ -802,6 +811,22 @@ mod tests {
             [c.node()]
         );
         assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
+    }
+
+    /// A node with a lost index and no marker must still read its own chain, or its next acks
+    /// rank under its own entries.
+    #[tokio::test]
+    async fn test_own_chain_is_read_with_no_frontier_and_no_marker() {
+        use remote::Sweep;
+        let remote = Arc::new(MemoryRemote::default());
+        let mut first = journal(&remote, 1);
+        let written = first.append(vec![put("a")], Seen::new()).await.unwrap();
+        remote.delete(&node_key(first.node())).await.unwrap();
+
+        let mut fresh = journal(&remote, 1);
+        let entries = fresh.sync_all().await.unwrap();
+
+        assert_eq!(entries, vec![written]);
     }
 
     #[tokio::test]

@@ -97,6 +97,11 @@ pub struct Journal<R> {
     audit: bool,
     /// A sync of this process read the own chain.
     own_read: bool,
+    /// Chains whose first entry has no valid MAC: no real entry ever. Only the full audits read
+    /// them.
+    fake: BTreeSet<NodeId>,
+    /// The fake chains that the last sync did not read.
+    skipped: usize,
     /// Nanoseconds that an entry HLC may be ahead of the wall clock of this reader: R.
     max_ahead: u64,
     /// Entries already logged as too far ahead: one ERROR each.
@@ -128,6 +133,8 @@ impl<R: Remote> Journal<R> {
             registered: false,
             audit: true,
             own_read: false,
+            fake: BTreeSet::new(),
+            skipped: 0,
             max_ahead: DEFAULT_MAX_AHEAD,
             reported_ahead: BTreeSet::new(),
         }
@@ -320,6 +327,11 @@ impl<R: Remote> Journal<R> {
         Ok(entries)
     }
 
+    /// The chains with no valid first entry that the last sync did not read.
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
+
     /// Chains that the last `sync_all` could not read past their frontier, and why.
     pub fn broken(&self) -> &BTreeMap<NodeId, ChainError> {
         &self.broken
@@ -425,7 +437,12 @@ impl<R: Remote> Journal<R> {
         let mut queue: Vec<NodeId> = nodes.iter().copied().collect();
         let mut known = nodes;
 
+        self.skipped = 0;
         while let Some(node) = queue.pop() {
+            if !self.audit && self.fake.contains(&node) {
+                self.skipped += 1;
+                continue;
+            }
             // Between the open and GC audits, a sync audits only the marked chains.
             let audit = self.audit || self.broken.contains_key(&node);
             // The listing comes first: each entry in it exists before the reads below.
@@ -446,6 +463,7 @@ impl<R: Remote> Journal<R> {
                         }
                     }
                     entries.extend(read);
+                    self.fake.remove(&node);
                     let next = self.frontier(node).next_seq;
                     match highest {
                         Some(seq) if seq >= next => {
@@ -466,6 +484,13 @@ impl<R: Remote> Journal<R> {
                 }
                 // One bad chain must not stop the sync of every chain.
                 Err(JournalError::Chain { node, source }) => {
+                    let first = matches!(source, ChainError::BadMac { seq: 0 });
+                    if first && self.frontier(node) == Frontier::GENESIS && self.fake.insert(node) {
+                        warn!(
+                            key = entry_key(node, 0),
+                            "a chain with no valid first entry: read only at the open and GC audits"
+                        );
+                    }
                     warn!(%node, %source, "chain is broken: the other chains go on");
                     self.broken.insert(node, source);
                 }
@@ -903,6 +928,7 @@ mod tests {
         inner: MemoryRemote,
         keys: std::sync::atomic::AtomicUsize,
         lists: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
     }
 
     impl Counting {
@@ -926,6 +952,9 @@ mod tests {
         }
 
         async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+            if key.starts_with(LOG_PREFIX) {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner.get(key).await
         }
 
@@ -953,6 +982,109 @@ mod tests {
             self.count(prefix, &keys);
             Ok(keys)
         }
+    }
+
+    /// Chains whose first entry has no valid MAC never held a real entry: a normal sync does not
+    /// read them. The full audits of the open and the GC still do.
+    #[tokio::test]
+    async fn test_fake_chains_cost_nothing_at_a_normal_sync() {
+        let remote = Arc::new(Counting::default());
+        let mut real = Journal::new(
+            remote.clone(),
+            key(1),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        real.append(vec![put("a")], Seen::new()).await.unwrap();
+        for seed in 60..65 {
+            let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+            let fake = Entry::sign(
+                &key(seed),
+                0,
+                [0; 32],
+                1,
+                Seen::new(),
+                vec![put("x")],
+                other.sealer(),
+            );
+            remote
+                .inner
+                .put(&fake.remote_key(), Bytes::from(fake.to_wire()))
+                .await
+                .unwrap();
+            remote
+                .inner
+                .put(&node_key(fake.node), Bytes::new())
+                .await
+                .unwrap();
+        }
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        reader.sync_all().await.unwrap();
+        assert_eq!(reader.broken().len(), 5);
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        remote.gets.store(0, ordering);
+        remote.lists.store(0, ordering);
+
+        reader.sync_all().await.unwrap();
+
+        // The real chain and the own chain: the next seq and the gap probe each.
+        assert_eq!(remote.gets.load(ordering), 4);
+        assert_eq!(remote.lists.load(ordering), 0);
+        assert_eq!(reader.skipped(), 5);
+        assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
+    }
+
+    /// A chain with a real entry that later fails stays audited at each sync: it can be a real
+    /// chain that a fault broke.
+    #[tokio::test]
+    async fn test_real_chain_that_fails_later_is_audited_at_each_sync() {
+        let remote = Arc::new(Counting::default());
+        let mut real = Journal::new(
+            remote.clone(),
+            key(1),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        let first = real.append(vec![put("a")], Seen::new()).await.unwrap();
+        let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let bad = Entry::sign(
+            &key(1),
+            1,
+            first.hash(),
+            5,
+            Seen::new(),
+            vec![put("x")],
+            other.sealer(),
+        );
+        remote
+            .inner
+            .put(&bad.remote_key(), Bytes::from(bad.to_wire()))
+            .await
+            .unwrap();
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        reader.sync_all().await.unwrap();
+        assert!(reader.broken().contains_key(&first.node));
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        remote.lists.store(0, ordering);
+
+        reader.sync_all().await.unwrap();
+
+        assert_eq!(
+            remote.lists.load(ordering),
+            1,
+            "the marked real chain is audited"
+        );
+        assert_eq!(reader.skipped(), 0);
     }
 
     /// An audit of a long chain lists the keys after the frontier, not the whole chain.

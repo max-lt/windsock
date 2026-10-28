@@ -35,6 +35,7 @@ impl<R: Remote + 'static> Engine<R> {
                 .iter()
                 .map(|(node, cause)| format!("chain of node {node}: {cause}"))
                 .collect(),
+            skipped: journal.skipped(),
             ..SyncReport::default()
         };
 

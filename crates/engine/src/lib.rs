@@ -180,6 +180,9 @@ pub struct SyncReport {
     pub broken: Vec<NodeId>,
     /// For each broken chain: its node, the seq and the cause.
     pub broken_causes: Vec<String>,
+    /// Chains with no valid first entry that this sync did not read: a writer with no
+    /// repository key made them. The open and GC audits read them.
+    pub skipped: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

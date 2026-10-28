@@ -485,8 +485,10 @@ async fn test_broken_chain_fails_alone_and_recovers() {
     );
 
     remote.put(&key, good).await.unwrap();
+    // The first entry of the chain failed its MAC: a normal sync skips it, and the full audit
+    // of the next GC run reads it again.
     let report = reader.engine.sync().await.unwrap();
-    assert!(report.broken.is_empty(), "the sync audits the marked chain");
+    assert_eq!((report.broken.len(), report.skipped), (1, 1));
 
     reader.engine.gc().await.unwrap();
     assert_eq!(keys(&reader.engine).await, ["copy", "k0", "k1", "k2"]);

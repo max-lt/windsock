@@ -260,38 +260,48 @@ async fn quarantine_at_open(
     late_limit: Duration,
 ) -> Result<()> {
     let quarantine = dir.join(QUARANTINE_DIR);
-    let refuse = |what: String| {
-        Err(EngineError::Quarantined(format!(
-            "{what}{} holds writes that were never committed. Decide for each key, then empty \
-             the directory and start again",
-            quarantine.display()
-        )))
-    };
-
     let limit = now.saturating_sub(late_limit.as_nanos() as u64);
     if buffer.oldest_time().is_some_and(|oldest| oldest < limit) {
-        let moved = buffer::quarantine_late(buffer_dir, &quarantine, limit).await?;
-        let keys = moved.join(", ");
+        buffer::quarantine_late(buffer_dir, &quarantine, limit).await?;
+        let keys = held_writes(&quarantine).await?;
         error!(keys, path = %quarantine.display(), "buffered writes older than the late limit: moved to quarantine");
-        return refuse(format!("{keys}: "));
+        return Err(refusal(&quarantine, &keys));
     }
     Ok(())
 }
 
 /// Refuses to start while the quarantine directory holds a file.
-fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
+async fn refuse_held_quarantine(quarantine: &Path) -> Result<()> {
     let held = match std::fs::read_dir(quarantine) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => false,
     };
     if held {
-        return Err(EngineError::Quarantined(format!(
-            "{} holds writes that were never committed. Decide for each key, then empty the \
-             directory and start again",
-            quarantine.display()
-        )));
+        let keys = held_writes(quarantine).await?;
+        return Err(refusal(quarantine, &keys));
     }
     Ok(())
+}
+
+/// Each write in the quarantine as `target (ack HLC n)`: what the operator decides on.
+async fn held_writes(quarantine: &Path) -> Result<String> {
+    let writes = buffer::read_quarantine(quarantine).await?;
+    let named: Vec<String> = writes
+        .iter()
+        .map(|write| format!("{} (ack HLC {})", write.target, write.hlc))
+        .collect();
+    if named.is_empty() {
+        return Ok("an interrupted flush (intent file only)".to_string());
+    }
+    Ok(named.join(", "))
+}
+
+fn refusal(quarantine: &Path, keys: &str) -> EngineError {
+    EngineError::Quarantined(format!(
+        "{keys}: {} holds writes that were never committed. Decide for each key, then empty \
+         the directory and start again",
+        quarantine.display()
+    ))
 }
 
 /// A time on both clocks. The GC measures H on the wall clock, and a monotonic clock does not
@@ -475,7 +485,7 @@ impl<R: Remote + 'static> Engine<R> {
         // commits: it goes to the quarantine with its records. A held quarantine blocks the start
         // first: a move now could put a write next to, or in place of, one the operator has not
         // decided on yet.
-        refuse_held_quarantine(&dir.join(QUARANTINE_DIR))?;
+        refuse_held_quarantine(&dir.join(QUARANTINE_DIR)).await?;
         if let Err(e) = engine.recover().await {
             if !matches!(e, EngineError::Quarantined(_)) {
                 return Err(e);

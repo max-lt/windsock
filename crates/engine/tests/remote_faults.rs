@@ -897,3 +897,51 @@ async fn test_quarantine_error_names_only_the_late_keys() {
     assert!(errors[0].contains("bkt/late"), "{errors:?}");
     assert!(!errors[0].contains("bkt/young"), "{errors:?}");
 }
+
+/// The operator decides on each late write from the start error alone: the start that moves the
+/// writes and every later start on the held quarantine name each key with its ack HLC.
+#[tokio::test]
+async fn test_start_errors_name_each_quarantined_key_with_its_hlc() {
+    journal::set_manual_wall(Some(START));
+    let remote = Arc::new(FaultRemote::default());
+    let config = Config {
+        retention: Duration::from_millis(3000),
+        late_margin: Duration::from_millis(1000),
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config.clone(),
+        )
+    };
+    let engine = open().await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    let put = engine.put(
+        BUCKET,
+        "late",
+        Bytes::from(data()),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    let hlc = put.await.unwrap().last_modified;
+    advance(Duration::from_millis(2500));
+    assert!(engine.flush().await.is_err());
+    drop(engine);
+    let named = format!("bkt/late (ack HLC {hlc})");
+
+    let Err(moved) = open().await else {
+        panic!("a proxy with a late write opens");
+    };
+    let Err(held) = open().await else {
+        panic!("a proxy with a held quarantine opens");
+    };
+
+    assert!(moved.to_string().contains(&named), "{moved}");
+    assert!(held.to_string().contains(&named), "{held}");
+}

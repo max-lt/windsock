@@ -142,7 +142,9 @@ to the quarantine with the other late writes. Else the next flush plans those wr
 - While the quarantine holds files, the proxy does not start, and a start moves nothing more
   there.
 - A quarantine file holds the records with their data, or an intent with its plan only. No tool
-  reads them: the ERROR line and the error of the failed start give each key with its ack HLC.
+  reads them: the ERROR line of the move, and the error of every start that the quarantine
+  stops, give each key as `bucket/key (ack HLC n)`. The flush ERROR before a restart gives the
+  keys only.
   `engine::quarantined_writes` gives the same list from the segment files, with no data.
 
 The open runs in this order: the snapshot load, one full sync with the audit, a stop on a held

@@ -168,6 +168,11 @@ What the operator does:
 Each sync lists the node markers once, then reads each chain from the seq after the last one it
 read.
 
+A node marker `nodes/<node id>` says only that the node exists. A node creates it once, before its
+first entry. Its content is never read: a marker that holds data, for example one that a writer
+with no repository key put there, gives one WARN with the key in each process, and the commits go
+on.
+
 | When                                                              | For each chain                                             | Once          |
 | ----------------------------------------------------------------- | ---------------------------------------------------------- | ------------- |
 | Each sync, no new entry                                           | 2 GET (the next seq, and the seq after it)                 | 1 LIST nodes/ |

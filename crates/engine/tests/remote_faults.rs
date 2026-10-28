@@ -834,9 +834,11 @@ async fn test_restart_commits_on_a_write_once_store() {
     writer.engine.flush().await.unwrap();
 }
 
-/// A marker with data was not written by this node: the commit fails closed and names it.
+/// A writer with no repo key can put data in the node marker of another node. The marker only
+/// says that the node exists: the commit goes on, and one WARN names the key.
 #[tokio::test]
-async fn test_node_marker_with_data_fails_the_commit() {
+async fn test_node_marker_with_data_warns_once_and_commits() {
+    let logs = common::capture();
     let remote = Arc::new(FaultRemote::default());
     let writer = proxy(&remote, 1).await;
     let marker = journal::node_key(writer.engine.node());
@@ -846,11 +848,20 @@ async fn test_node_marker_with_data_fails_the_commit() {
         .await
         .unwrap();
     writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    drop(writer);
 
-    let error = writer.engine.flush().await.unwrap_err().to_string();
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket("other", None).await.unwrap();
+    writer.engine.flush().await.unwrap();
 
-    assert!(error.contains(&marker), "{error}");
-    assert!(error.contains("holds data"), "{error}");
+    let warnings = logs.lines("the node marker holds data");
+    assert_eq!(warnings.len(), 2, "one per process: {warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w.contains("WARN") && w.contains(&marker))
+    );
 }
 
 /// The quarantine ERROR names the late write, and not the young one next to it.

@@ -76,8 +76,6 @@ pub enum JournalError {
     Contended(u32),
     #[error("the HLC is at the end of its range: a new entry would rank under the old ones")]
     ClockOverflow,
-    #[error("{0}: the node marker holds data; this node never wrote it")]
-    Marker(String),
     #[error("{0}: the store says the node marker exists, and a read finds no marker")]
     MarkerMissing(String),
 }
@@ -442,7 +440,7 @@ impl<R: Remote> Journal<R> {
     }
 
     /// Makes the node marker exist before the first entry of the chain. It is created once, as
-    /// every remote object, and an existing marker must be empty.
+    /// every remote object.
     async fn register(&mut self) -> Result<(), JournalError> {
         if self.registered {
             return Ok(());
@@ -454,9 +452,12 @@ impl<R: Remote> Journal<R> {
                 Ok(()) => {}
                 Err(RemoteError::AlreadyExists(_)) => match self.remote.get(&key).await? {
                     None => continue,
+                    // The marker only says that the node exists: its content is never read.
                     Some(bytes) if !bytes.is_empty() => {
-                        error!(key, "the node marker holds data");
-                        return Err(JournalError::Marker(key));
+                        warn!(
+                            key,
+                            "the node marker holds data that this node did not write"
+                        );
                     }
                     Some(_) => {}
                 },

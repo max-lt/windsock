@@ -27,7 +27,7 @@ use tracing::{debug, error, warn};
 pub use chain::{ChainError, Frontier};
 pub use entry::{
     Action, Entry, EntryHash, LOG_PREFIX, Link, NODES_PREFIX, Seen, WireError, entry_key, node_key,
-    redact_wire,
+    redact_wire, seq_of,
 };
 
 pub use clock::{HybridClock, monotonic_nanos, wall_clock_nanos};
@@ -277,6 +277,7 @@ impl<R: Remote> Journal<R> {
                         source: ChainError::Gap {
                             seq: frontier.next_seq,
                             later: frontier.next_seq + 1,
+                            key: next,
                         },
                     });
                 }
@@ -337,13 +338,13 @@ impl<R: Remote> Journal<R> {
     /// The highest seq in the listing of a chain, and an error when the last entry read changed.
     async fn audit_chain(&self, node: NodeId) -> Result<Option<u64>, JournalError> {
         let prefix = format!("{LOG_PREFIX}{node}/");
-        let highest = self
-            .remote
-            .list(&prefix)
-            .await?
-            .iter()
-            .filter_map(|key| key.strip_prefix(&prefix)?.parse::<u64>().ok())
-            .max();
+        let mut highest = None;
+        for key in self.remote.list(&prefix).await? {
+            match seq_of(&prefix, &key) {
+                Some(seq) => highest = highest.max(Some(seq)),
+                None => warn!(key, "a key under the log is not an entry: ignored"),
+            }
+        }
 
         let frontier = self.frontier(node);
         let Some(last) = frontier.next_seq.checked_sub(1) else {
@@ -423,6 +424,7 @@ impl<R: Remote> Journal<R> {
                             let source = ChainError::Gap {
                                 seq: next,
                                 later: seq,
+                                key: entry_key(node, seq),
                             };
                             warn!(%node, %source, "chain is broken: the other chains go on");
                             self.broken.insert(node, source);
@@ -811,6 +813,38 @@ mod tests {
             [c.node()]
         );
         assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
+    }
+
+    /// A key under log/<node>/ that is not 20 digits is not an entry: it breaks no chain, and no
+    /// error names a key that is not in the bucket.
+    #[tokio::test]
+    async fn test_log_key_that_is_not_a_canonical_seq_is_ignored() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        a.append(vec![put("a")], Seen::new()).await.unwrap();
+        let odd = format!("{LOG_PREFIX}{}/7777", a.node());
+        remote.put(&odd, Bytes::from_static(b"x")).await.unwrap();
+
+        let mut fresh = journal(&remote, 1);
+        fresh.sync_all().await.unwrap();
+
+        assert!(fresh.broken().is_empty(), "{:?}", fresh.broken());
+    }
+
+    /// A gap names the key of the later entry as it is in the bucket.
+    #[tokio::test]
+    async fn test_gap_names_the_key_that_is_in_the_bucket() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        a.append(vec![put("a")], Seen::new()).await.unwrap();
+        let far = entry_key(a.node(), 999);
+        remote.put(&far, Bytes::from_static(b"x")).await.unwrap();
+
+        let mut reader = journal(&remote, 9);
+        reader.sync_all().await.unwrap();
+
+        let cause = reader.broken()[&a.node()].to_string();
+        assert!(cause.contains(&far), "{cause}");
     }
 
     /// A node with a lost index and no marker must still read its own chain, or its next acks

@@ -309,6 +309,15 @@ pub fn entry_key(node: NodeId, seq: u64) -> String {
     format!("{LOG_PREFIX}{node}/{seq:020}")
 }
 
+/// The seq of a key under `prefix` (`log/<node>/`): exactly 20 digits, as [`entry_key`] writes.
+pub fn seq_of(prefix: &str, key: &str) -> Option<u64> {
+    let digits = key.strip_prefix(prefix)?;
+    if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Remote key of the marker that says `node` has a chain.
 pub fn node_key(node: NodeId) -> String {
     format!("{NODES_PREFIX}{node}")

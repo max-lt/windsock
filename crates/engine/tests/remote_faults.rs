@@ -1019,3 +1019,23 @@ async fn test_commit_never_goes_on_with_no_node_marker() {
     let marked = remote.inner.get(&marker).await.unwrap().is_some();
     assert!(flushed.is_err() || marked, "a commit with no node marker");
 }
+
+/// A key under the own log that is not 20 digits is not an entry. The open must not fail on it.
+#[tokio::test]
+async fn test_open_ignores_a_log_key_that_is_not_a_seq() {
+    let remote = Arc::new(FaultRemote::default());
+    let writer = proxy(&remote, 1).await;
+    writer.engine.create_bucket(BUCKET, None).await.unwrap();
+    writer.engine.flush().await.unwrap();
+    let odd = format!("log/{}/7777", writer.engine.node());
+    remote
+        .inner
+        .put(&odd, Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    drop(writer);
+
+    let reopened = proxy(&remote, 1).await;
+
+    assert!(reopened.engine.list_buckets().await.unwrap().len() == 1);
+}

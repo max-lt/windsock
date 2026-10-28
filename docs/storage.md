@@ -201,7 +201,9 @@ Each open runs one full sync, with the audit, before it serves. The index is a c
 behind after a power loss, or a restored copy, it can miss the newest own entries, and the clock
 must pass them before the first ack. When the own chain does not read at open, the start fails
 with `ERROR the own chain does not read: no start` and the cause, for example `entry 7 is missing
-and entry 999999999 exists (key log/<node>/00000000000999999999)`. An object that a writer with
+and entry 999999999 exists (key log/8a88e3dd.../00000000000999999999)`, with the full node id: the key as it is
+in the bucket. A key under `log/<node>/` that is not 20 digits is not an entry: the proxy logs
+`WARN a key under the log is not an entry: ignored` with the key, and the chain reads. An object that a writer with
 no repo key put under the own chain gives this error. To act: read the ERROR, check the named key
 in the bucket, remove it when it is not an entry of this proxy, and start again.
 

@@ -425,11 +425,19 @@ impl<R: Remote> Journal<R> {
             nodes.insert(self.node);
         }
 
+        let mut marked = BTreeSet::new();
         for key in self.remote.list(NODES_PREFIX).await? {
             if let Some(node) = key.strip_prefix(NODES_PREFIX).and_then(|s| s.parse().ok()) {
-                nodes.insert(node);
+                marked.insert(node);
             }
         }
+        // A fake chain whose marker is gone was removed by the operator: its mark goes too.
+        let gone: Vec<NodeId> = self.fake.difference(&marked).copied().collect();
+        for node in gone {
+            self.fake.remove(&node);
+            self.broken.remove(&node);
+        }
+        nodes.extend(marked);
 
         let mut entries = self.take_stashed();
         // The flag stays set until a whole audit runs: a remote error must not skip it. A marked
@@ -1037,6 +1045,41 @@ mod tests {
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 5);
         assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
+    }
+
+    /// The operator removes the objects of a fake chain: the next normal sync drops its mark,
+    /// also on a proxy with no GC run.
+    #[tokio::test]
+    async fn test_fake_chain_mark_goes_with_its_marker() {
+        use remote::Sweep;
+        let remote = Arc::new(MemoryRemote::default());
+        let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let fake = Entry::sign(
+            &key(60),
+            0,
+            [0; 32],
+            1,
+            Seen::new(),
+            vec![put("x")],
+            other.sealer(),
+        );
+        remote
+            .put(&fake.remote_key(), Bytes::from(fake.to_wire()))
+            .await
+            .unwrap();
+        remote
+            .put(&node_key(fake.node), Bytes::new())
+            .await
+            .unwrap();
+        let mut reader = journal(&remote, 9);
+        reader.sync_all().await.unwrap();
+        assert!(reader.broken().contains_key(&fake.node));
+
+        remote.delete(&fake.remote_key()).await.unwrap();
+        remote.delete(&node_key(fake.node)).await.unwrap();
+        reader.sync_all().await.unwrap();
+
+        assert!(reader.broken().is_empty(), "{:?}", reader.broken());
     }
 
     /// A chain with a real entry that later fails stays audited at each sync: it can be a real

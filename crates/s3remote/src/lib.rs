@@ -132,6 +132,8 @@ fn with_causes(error: &dyn std::error::Error) -> String {
 
 /// Calls to the remote at one time, and idle connections kept for reuse.
 pub const MAX_IN_FLIGHT: usize = 64;
+/// Idle connections that the pool keeps for later requests, on top of the ones in use.
+pub const MAX_IDLE: usize = 32;
 
 fn invalid(message: &str) -> RemoteError {
     RemoteError::Io(std::io::Error::new(
@@ -229,7 +231,7 @@ impl S3Remote {
         }
 
         let client = Client::builder(TokioExecutor::new())
-            .pool_max_idle_per_host(MAX_IN_FLIGHT)
+            .pool_max_idle_per_host(MAX_IDLE)
             .build(connector(config.ca_pem.as_deref())?);
         Ok(Self {
             in_flight: Semaphore::new(MAX_IN_FLIGHT),

@@ -314,8 +314,10 @@ mod tests {
 
     #[test]
     fn test_descriptor_reserve_covers_the_engine() {
-        // Index files, remote connections, and room for buffer, cache and listener files.
-        let engine = engine::INDEX_MAX_OPEN_FILES + s3remote::MAX_IN_FLIGHT + 32;
+        // Index files, remote connections in use and idle, and room for buffer, cache and
+        // listener files.
+        let remote = s3remote::MAX_IN_FLIGHT + s3remote::MAX_IDLE;
+        let engine = engine::INDEX_MAX_OPEN_FILES + remote + 32;
 
         assert!(engine as u64 <= FD_RESERVE, "{engine} > {FD_RESERVE}");
     }

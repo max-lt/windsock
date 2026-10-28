@@ -195,13 +195,13 @@ under `log/<node>/` with the last `flushed seq=` line of that writer (log level 
 
 A daemon keeps these descriptors open. Each count has a cap.
 
-| Kind                  | Cap                                      | Source                    |
-| --------------------- | ---------------------------------------- | ------------------------- |
-| Local index tables    | 128                                      | `index::MAX_OPEN_FILES`   |
-| Remote connections    | 64 in use, 64 idle                       | `s3remote::MAX_IN_FLIGHT` |
-| Buffer                | the active segment, the intent, the lock | 2 to 3 in the soak        |
-| Chunk cache           | one file for each read in progress       | 0 to 1 in the soak        |
-| S3 client connections | `max_connections`                        | soft fd limit - 256       |
+| Kind                  | Cap                                      | Source                                          |
+| --------------------- | ---------------------------------------- | ----------------------------------------------- |
+| Local index tables    | 128                                      | `index::MAX_OPEN_FILES`                         |
+| Remote connections    | 64 in use, 32 idle                       | `s3remote::MAX_IN_FLIGHT`, `s3remote::MAX_IDLE` |
+| Buffer                | the active segment, the intent, the lock | 2 to 3 in the soak                              |
+| Chunk cache           | one file for each read in progress       | 0 to 1 in the soak                              |
+| S3 client connections | `max_connections`                        | soft fd limit - 256                             |
 
 The daemon keeps 256 descriptors out of the S3 connection limit for the first four kinds. In a
 chaos soak on macOS, the index tables grew from 2 to 22 in 7 minutes.

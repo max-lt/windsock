@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 
 use model::{Model, Rng, Value, digest};
 use proxy::{BUCKET, HORIZON, Proxy};
+use s3::Outcome;
 
 const WORKERS: u64 = 6;
 /// Log lines that a soak must never show.
@@ -91,6 +92,7 @@ async fn worker(
     proxies: Arc<Vec<Proxy>>,
     model: Arc<Model>,
     stop: Arc<AtomicBool>,
+    pressure: Arc<Pressure>,
     seed: u64,
 ) {
     let mut rng = Rng::new(seed * 100 + w);
@@ -102,19 +104,27 @@ async fn worker(
         }
         let key = format!("w{w}/k{}", rng.below(40));
         let path = format!("/{BUCKET}/{key}");
-        match rng.weighted(&[40, 20, 10, 10, 5, 15]) {
+        let level = pressure.level();
+        let write = match rng.weighted(&[40, 20, 10, 10, 5, 15]) {
             0 => {
                 let size = *rng.pick(&[0, 1, 100, 4096, 65536, 300_000, 2_000_000]);
                 let data = rng.bytes(size);
-                let value = digest(&data);
-                model.record(&key, value, p.s3.put(&path, Bytes::from(data)).await);
+                let (value, outcome) = (digest(&data), p.s3.put(&path, Bytes::from(data)).await);
+                model.record(&key, value, outcome);
+                Some(outcome)
             }
             1 => {
                 let _ = p.s3.get(&path).await;
+                None
             }
-            2 => model.record(&key, None, p.s3.delete(&path).await),
+            2 => {
+                let outcome = p.s3.delete(&path).await;
+                model.record(&key, None, outcome);
+                Some(outcome)
+            }
             3 => {
                 let _ = p.s3.list(BUCKET, &format!("w{w}/")).await;
+                None
             }
             4 => {
                 let count = 1 + rng.below(3);
@@ -125,14 +135,61 @@ async fn worker(
                     })
                     .collect();
                 let whole: Vec<u8> = parts.iter().flat_map(|part| part.to_vec()).collect();
-                if let Some(outcome) = p.s3.multipart(&path, &parts).await {
+                let outcome = p.s3.multipart(&path, &parts).await;
+                if let Some(outcome) = outcome {
                     model.record(&key, digest(&whole), outcome);
                 }
+                outcome
             }
             _ => {
                 let _ = p.s3.get_range(&path, "bytes=10-5000").await;
+                None
             }
+        };
+        pressure.count(level);
+        // A refused write is back-pressure: a client that sends again at once only adds load.
+        if write == Some(Outcome::Refused) {
+            tokio::time::sleep(REFUSED_PAUSE).await;
         }
+        tokio::time::sleep(LEVELS[level].1).await;
+    }
+}
+
+/// The load levels: a name and the pause of each worker between two operations.
+const LEVELS: [(&str, Duration); 4] = [
+    ("burst", Duration::ZERO),
+    ("high", Duration::from_millis(2)),
+    ("medium", Duration::from_millis(20)),
+    ("quiet", Duration::from_millis(200)),
+];
+/// The pause of a worker after a refused write.
+const REFUSED_PAUSE: Duration = Duration::from_millis(50);
+
+/// The load level of all workers, and the operations at each level.
+#[derive(Default)]
+struct Pressure {
+    level: AtomicU64,
+    ops: [AtomicU64; 4],
+}
+
+impl Pressure {
+    fn level(&self) -> usize {
+        self.level.load(Ordering::SeqCst) as usize
+    }
+
+    fn count(&self, level: usize) {
+        self.ops[level].fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Moves the load to a random level every 20 to 60 s: a soak at one load tests one regime only.
+async fn vary(pressure: Arc<Pressure>, stop: Arc<AtomicBool>, seed: u64) {
+    let mut rng = Rng::new(seed + 7);
+    while !stop.load(Ordering::SeqCst) {
+        let level = rng.below(LEVELS.len() as u64);
+        pressure.level.store(level, Ordering::SeqCst);
+        log(&format!("load: {}", LEVELS[level as usize].0));
+        tokio::time::sleep(rng.secs(20, 60)).await;
     }
 }
 
@@ -261,10 +318,19 @@ async fn soak(args: &Args, proxies: Arc<Vec<Proxy>>) -> Result<bool, String> {
     let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
     let samples = Arc::new(Mutex::new(Vec::new()));
     let mut tasks = Vec::new();
+    let pressure = Arc::new(Pressure::default());
     for w in 0..WORKERS {
         let (proxies, model, stop) = (proxies.clone(), model.clone(), stop.clone());
-        tasks.push(tokio::spawn(worker(w, proxies, model, stop, args.seed)));
+        let pressure = pressure.clone();
+        tasks.push(tokio::spawn(worker(
+            w, proxies, model, stop, pressure, args.seed,
+        )));
     }
+    tasks.push(tokio::spawn(vary(
+        pressure.clone(),
+        stop.clone(),
+        args.seed,
+    )));
     let (p, s, l, c) = (proxies.clone(), stop.clone(), pause.clone(), counts.clone());
     tasks.push(tokio::spawn(faults(p, s, l, args.seed, c)));
     let (p, s, m) = (proxies.clone(), stop.clone(), samples.clone());
@@ -324,6 +390,12 @@ async fn soak(args: &Args, proxies: Arc<Vec<Proxy>>) -> Result<bool, String> {
         println!("RESULT bad {key}: {seen:?}, allowed {:?}", allowed[key]);
     }
     println!("RESULT ops {ops:?}");
+    let by_level: Vec<String> = LEVELS
+        .iter()
+        .zip(&pressure.ops)
+        .map(|((name, _), ops)| format!("{name} {}", ops.load(Ordering::SeqCst)))
+        .collect();
+    println!("RESULT ops by load: {}", by_level.join(", "));
     println!(
         "RESULT faults KILL {} TERM {} failed restarts {}",
         faults[0], faults[1], faults[2]

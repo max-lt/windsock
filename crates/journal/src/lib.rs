@@ -187,7 +187,8 @@ impl<R: Remote> Journal<R> {
     /// Signs actions as the next entry of the own chain, without writing it.
     pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Result<Entry, JournalError> {
         let frontier = self.frontier(self.node);
-
+        // A chain needs a rising HLC: the clock passes the last own entry, with no cap.
+        self.clock.witness(frontier.last_hlc);
         let hlc = self.clock.tick().ok_or(JournalError::ClockOverflow)?;
         Ok(Entry::sign(
             &self.signing_key,
@@ -874,6 +875,29 @@ mod tests {
             [c.node()]
         );
         assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
+    }
+
+    /// The clock can sit under the last own entry, for example after an open that capped it at
+    /// wall + R. The next entry must still rank above the last one, or the own chain breaks.
+    #[tokio::test]
+    async fn test_next_entry_rises_above_the_last_own_entry() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut writer = journal(&remote, 1);
+        let first = writer.append(vec![put("a")], Seen::new()).await.unwrap();
+        let far = wall() + 3_600_000_000_000;
+        let frontiers = Frontiers::from([(
+            first.node,
+            Frontier {
+                next_seq: 1,
+                last_hash: first.hash(),
+                last_hlc: far,
+            },
+        )]);
+        let restarted = Journal::new(remote.clone(), key(1), entry::test_sealer(), frontiers);
+
+        let next = restarted.prepare(vec![put("b")], Seen::new()).unwrap();
+
+        assert!(next.hlc > far, "{} is not above {far}", next.hlc);
     }
 
     /// A writer with bucket rights and no repo key: its own node key, an entry far ahead.

@@ -291,6 +291,10 @@ struct Sim {
     /// The latest HLC that a clock more than R ahead gave: until the clock of proxy 0 is
     /// within R of it, its chain is broken there and a GC or a snapshot may fail.
     far_until: u64,
+    /// The highest bound that a version prune of the GC could use: (stable HLC - R).
+    prune_bound: u64,
+    /// The highest wall clock of any proxy so far: no HLC is above it, also after a step back.
+    highest_clock: u64,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
     /// Real time since the start: it never steps back, unlike the wall clocks.
@@ -302,10 +306,17 @@ impl Sim {
     fn pass(&mut self, by: u64) {
         self.now += by;
         self.elapsed += by;
+        self.note_clocks();
+    }
+
+    /// Keeps the highest wall clock of the proxies, and the latest far HLC.
+    fn note_clocks(&mut self) {
         let r = config().retention.as_nanos() as u64;
         for proxy in &self.proxies {
+            let clock = self.now + proxy.offset;
+            self.highest_clock = self.highest_clock.max(clock);
             if proxy.offset > r {
-                self.far_until = self.far_until.max(self.now + proxy.offset);
+                self.far_until = self.far_until.max(clock);
             }
         }
     }
@@ -528,6 +539,10 @@ impl Sim {
         let hit = armed && self.remote.next.lock().unwrap().is_none();
         match r {
             Ok(report) => {
+                // The stable HLC is at most the highest clock of the proxies so far.
+                self.note_clocks();
+                let bound = self.highest_clock - config().retention.as_nanos() as u64;
+                self.prune_bound = self.prune_bound.max(bound);
                 self.stats.tombstone_prune |= report.pruned_keys > 0;
                 self.stats.deleted_pack |= report.deleted_packs > 0;
                 Ok(())
@@ -751,6 +766,7 @@ impl Sim {
                     false => m + self.rng.below(m),
                 };
                 self.max_offset = self.max_offset.max(self.proxies[i].offset);
+                self.note_clocks();
             }
             86 => {
                 self.proxies[i].offset = self.rng.below(config().late_margin.as_nanos() as u64);
@@ -841,6 +857,74 @@ impl Sim {
         Ok(())
     }
 
+    /// The versions of `key` on each proxy. A version is an acked write that the operator did
+    /// not drop. The last such write of each proxy, at or above the highest bound that a
+    /// version prune could use, is on every proxy. A key may be gone only when its winner is a delete under that bound. The
+    /// head and the conflicts are the same everywhere.
+    fn check_versions(&self, key: &str, winner: Option<&Acked>) -> Result<(), String> {
+        let acked: BTreeSet<(u64, [u8; 32])> = self
+            .keys
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|a| !a.dropped)
+            .map(|a| (a.hlc, a.node))
+            .collect();
+        let bound = self.prune_bound;
+        // The buffer keeps only the last write of a proxy to a key before a flush, so an
+        // earlier one can never be a version. The last one of each proxy always is.
+        let mut last = BTreeMap::new();
+        for write in self.keys.get(key).into_iter().flatten() {
+            let newer = last
+                .get(&write.node)
+                .is_none_or(|(hlc, _)| write.hlc > *hlc);
+            if newer {
+                last.insert(write.node, (write.hlc, write.dropped));
+            }
+        }
+        let kept: BTreeSet<_> = last
+            .into_iter()
+            .filter(|(_, (hlc, dropped))| !dropped && *hlc >= bound)
+            .map(|(node, (hlc, _))| (hlc, node))
+            .collect();
+        let mut conflicts = Vec::new();
+        for i in 0..3 {
+            let state = self.engine(i).versions(BUCKET, key);
+            let state = state.map_err(|e| format!("p{i} versions {key}: {e}"))?;
+            conflicts.push(state.as_ref().map(|s| s.conflicts()).unwrap_or_default());
+            let held: BTreeSet<(u64, [u8; 32])> = state
+                .into_iter()
+                .flat_map(|s| s.versions)
+                .map(|v| (v.hlc, *v.node.as_bytes()))
+                .collect();
+            if let Some(phantom) = held.difference(&acked).next() {
+                return Err(format!("p{i} {key}: version {phantom:?} was never acked"));
+            }
+            if held.is_empty() {
+                let old_delete = winner.is_some_and(|w| w.value.is_none() && w.hlc < bound);
+                if !old_delete && winner.is_some() {
+                    return Err(format!("p{i} {key}: no version, the winner is {winner:?}"));
+                }
+                continue;
+            }
+            if let Some(lost) = kept.difference(&held).next() {
+                return Err(format!(
+                    "p{i} {key}: version {lost:?} at or above the prune bound {bound} is gone"
+                ));
+            }
+            let head = held.last().copied();
+            if head != winner.map(|w| (w.hlc, w.node)) {
+                return Err(format!(
+                    "p{i} {key}: head {head:?}, the winner is {winner:?}"
+                ));
+            }
+        }
+        if conflicts.iter().any(|c| c != &conflicts[0]) {
+            return Err(format!("{key}: conflicts differ: {conflicts:?}"));
+        }
+        Ok(())
+    }
+
     /// Every proxy lists the keys whose winner is a put, each at the HLC of that put.
     async fn check_lists(&self) -> Result<(), String> {
         let expected: Vec<(String, u64)> = Self::winners(&self.keys)
@@ -901,38 +985,7 @@ impl Sim {
             if seen.iter().any(|s| s != &seen[0]) {
                 return Err(format!("{key}: proxies differ: {seen:?}"));
             }
-            let mut versions = Vec::new();
-            let mut conflicts = Vec::new();
-            for i in 0..3 {
-                let state = self.engine(i).versions(BUCKET, &key);
-                let state = state.map_err(|e| format!("p{i} versions {key}: {e}"))?;
-                conflicts.push(state.as_ref().map(|s| s.conflicts()).unwrap_or_default());
-                let ranks: BTreeSet<_> = state
-                    .into_iter()
-                    .flat_map(|s| s.versions)
-                    .map(|v| (v.hlc, v.node))
-                    .collect();
-                versions.push(ranks);
-            }
-            // The version prune is local: it drops known versions below its bound, and keeps
-            // the head and the conflicts. A proxy holds fewer versions, never other ones. A key
-            // whose head is an old delete goes as a whole.
-            if expected.is_none() {
-                let kept: Vec<usize> = (0..3).filter(|&i| !versions[i].is_empty()).collect();
-                versions = kept.iter().map(|&i| versions[i].clone()).collect();
-                conflicts = kept.iter().map(|&i| conflicts[i].clone()).collect();
-            }
-            let all: BTreeSet<_> = versions.iter().flatten().copied().collect();
-            let longest = versions.iter().map(BTreeSet::len).max().unwrap_or(0);
-            let heads: Vec<_> = versions.iter().map(|v| v.last()).collect();
-            if all.len() != longest
-                || heads.iter().any(|h| h != &heads[0])
-                || conflicts.iter().any(|c| c != &conflicts[0])
-            {
-                return Err(format!(
-                    "{key}: version lists differ: {versions:?}, conflicts {conflicts:?}"
-                ));
-            }
+            self.check_versions(&key, winner.as_ref())?;
             if seen[0] != expected {
                 return Err(format!(
                     "{key}: read {:?}, the winner is {winner:?}",
@@ -989,6 +1042,8 @@ async fn run(seed: u64) -> Result<Stats, String> {
         log: Vec::new(),
         stats: Stats::default(),
         far_until: 0,
+        prune_bound: 0,
+        highest_clock: 0,
         max_offset: 0,
         elapsed: SECOND,
     };

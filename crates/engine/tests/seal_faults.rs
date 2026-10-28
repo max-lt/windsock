@@ -485,8 +485,8 @@ async fn test_proxy_with_another_retention_refuses_to_open() {
     };
     let error = error.to_string();
     let (held, ours) = error.split_once("this proxy has").unwrap();
-    assert!(held.contains("retention_ns 7200000000000"), "{error}");
-    assert!(ours.contains("retention_ns 9000000000000"), "{error}");
+    assert!(held.contains("gc.retention_secs = 7200"), "{error}");
+    assert!(ours.contains("gc.retention_secs = 9000"), "{error}");
 }
 
 /// H is a rule of the remote too: a writer with a longer H could commit a plan that names a pack
@@ -522,10 +522,11 @@ async fn test_proxy_with_another_horizon_refuses_to_open() {
     let Err(error) = other else {
         panic!("a proxy with another horizon opens");
     };
-    assert!(
-        error.to_string().contains("horizon_ns 86400000000000"),
-        "{error}"
-    );
+    // The values are in the unit of the settings, so the operator compares them as they are.
+    let error = error.to_string();
+    assert!(error.contains("gc.horizon_secs = 86400"), "{error}");
+    assert!(error.contains("gc.horizon_secs = 172800"), "{error}");
+    assert!(!error.contains("_ns"), "{error}");
 }
 
 /// A key check of format 2 with no rules comes from an older build: the open says so.

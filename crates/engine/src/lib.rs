@@ -350,6 +350,20 @@ impl RepoRules {
         )
     }
 
+    /// The rules in the names and the unit of the configuration.
+    fn settings(&self) -> String {
+        let secs = |ns: u64| match ns % 1_000_000_000 {
+            0 => (ns / 1_000_000_000).to_string(),
+            _ => format!("{}", ns as f64 / 1e9),
+        };
+        format!(
+            "gc.horizon_secs = {}, gc.retention_secs = {}, gc.late_margin_secs = {}",
+            secs(self.horizon_ns),
+            secs(self.retention_ns),
+            secs(self.late_margin_ns)
+        )
+    }
+
     fn parse<'a>(mut lines: impl Iterator<Item = &'a str>) -> Option<Self> {
         let mut value = |name: &str| {
             lines
@@ -582,9 +596,9 @@ impl<R: Remote + 'static> Engine<R> {
         if theirs != ours {
             return Err(EngineError::Config(format!(
                 "the remote holds {}; this proxy has {}. Every proxy of a remote needs the \
-                 same gc.horizon_secs, gc.retention_secs and gc.late_margin_secs",
-                theirs.text().replace('\n', ", "),
-                ours.text().replace('\n', ", ")
+                 same values",
+                theirs.settings(),
+                ours.settings()
             )));
         }
         Ok(())

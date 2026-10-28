@@ -113,8 +113,8 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 - Last-Modified is the ack HLC. It does not change at the flush.
 - Format markers: `repo/key-check` holds the remote format, `data/engine/buffer/format` the
   buffer format, the local index a format key, and each snapshot a format byte. This build
-  writes and reads format 2 only. An older format stops the open with an error that names both
-  formats.
+  writes and reads remote format 3 (journal entries with a MAC) only. Another format stops the
+  open with an error that names both formats.
 
 H, R and M are rules of the remote. The first proxy that opens a remote writes them into
 `repo/key-check` (create-only), with the format. A proxy with other values refuses to open, and

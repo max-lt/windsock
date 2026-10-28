@@ -69,12 +69,14 @@ impl RepoKey {
         let chunk_id = blake3::derive_key("windsock 2026-10-26 chunk id", &self.0);
         let mut seal = blake3::derive_key("windsock 2026-10-26 seal", &self.0);
         let id = blake3::derive_key("windsock 2026-10-26 seal key id", &seal);
+        let entry_mac = blake3::derive_key("windsock 2026-10-28 entry mac", &self.0);
         let cipher = XChaCha20Poly1305::new(&seal.into());
         seal.zeroize();
         Keys {
             chunk_id,
             sealer: Sealer {
                 cipher,
+                entry_mac,
                 key_id: id[..KEY_ID_LEN]
                     .try_into()
                     .expect("a hash has more than 4 bytes"),
@@ -144,10 +146,28 @@ pub enum Kind {
 #[derive(Clone)]
 pub struct Sealer {
     cipher: XChaCha20Poly1305,
+    /// The key of the entry MAC: only a holder of the repository secret extends a chain.
+    entry_mac: [u8; 32],
     key_id: [u8; KEY_ID_LEN],
 }
 
+impl Drop for Sealer {
+    fn drop(&mut self) {
+        self.entry_mac.zeroize();
+    }
+}
+
 impl Sealer {
+    /// The MAC of a journal entry, over the hash of its signed content.
+    pub fn entry_mac(&self, content: &[u8; 32]) -> [u8; 32] {
+        *blake3::keyed_hash(&self.entry_mac, content).as_bytes()
+    }
+
+    /// Checks an entry MAC in constant time.
+    pub fn entry_mac_is_valid(&self, content: &[u8; 32], mac: &[u8; 32]) -> bool {
+        blake3::keyed_hash(&self.entry_mac, content) == blake3::Hash::from(*mac)
+    }
+
     /// Seals `plain` for the object `context` of kind `kind`, with a new random nonce.
     pub fn seal(&self, kind: Kind, context: &[u8], plain: &[u8]) -> Vec<u8> {
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);

@@ -68,7 +68,7 @@ const KEY_CHECK: &str = "windsock repository key check";
 /// one reply, so every proxy reads every entry whatever its own setting.
 pub const MAX_ENTRY_ACTIONS: u64 = 512 * 1024 * 1024;
 /// The remote format of this build: journal actions carry their ack HLC.
-const REMOTE_FORMAT: u32 = 2;
+const REMOTE_FORMAT: u32 = 3;
 
 pub fn pack_key(id: PackId) -> String {
     format!("{PACKS_PREFIX}{id}")

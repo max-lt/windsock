@@ -20,6 +20,12 @@ place, away from the remote and away from its backups.
 Each proxy also has its own signing key, `node.key`. The signing key proves which proxy wrote a
 journal entry. It does not give access to the data.
 
+Each journal entry also carries a MAC under a subkey of `repo.key`, over the same fields as the
+signature. A writer that can put objects in the bucket but has no `repo.key` can make a node key,
+but not a valid entry: a reader checks the MAC before it uses the entry, so that chain is broken
+and named, the other chains read, and the clock of the reader does not move. A redaction by the
+GC keeps the MAC, because the MAC does not cover the sealed actions.
+
 ## For the operator
 
 - `windsockd init <dir>` writes `<dir>/repo.key`: 64 hex characters, mode 600.

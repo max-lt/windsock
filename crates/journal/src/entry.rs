@@ -96,6 +96,8 @@ pub struct Entry {
     sealed: Option<Vec<u8>>,
     /// ed25519 signature over the content hash, in two halves: serde has no `[u8; 64]`.
     signature: ([u8; 32], [u8; 32]),
+    /// MAC of the content hash under the repository key. A redaction keeps it.
+    mac: [u8; 32],
 }
 
 /// The signed part of an entry.
@@ -120,6 +122,7 @@ struct Wire {
     actions_hash: [u8; 32],
     sealed: Option<Vec<u8>>,
     signature: ([u8; 32], [u8; 32]),
+    mac: [u8; 32],
 }
 
 /// An entry from the remote does not read back.
@@ -130,6 +133,9 @@ pub enum WireError {
     ActionsMismatch,
     /// The sealed actions do not open: another repository key, or changed bytes.
     Sealed,
+    /// The MAC under the repository key does not match: a writer with no repository key, or
+    /// changed bytes.
+    BadMac,
 }
 
 fn actions_hash(sealed: &[u8]) -> [u8; 32] {
@@ -178,6 +184,7 @@ impl Entry {
         let actions_hash = actions_hash(&sealed);
         let hash = content_hash(node, seq, &prev, hlc, &seen, &actions_hash);
         let signature = key.sign(&hash).to_bytes();
+        let mac = sealer.entry_mac(&hash);
         let mut r = [0u8; 32];
         let mut s = [0u8; 32];
         r.copy_from_slice(&signature[..32]);
@@ -193,6 +200,7 @@ impl Entry {
             actions: Some(actions),
             sealed: Some(sealed),
             signature: (r, s),
+            mac,
         }
     }
 
@@ -252,6 +260,7 @@ impl Entry {
             actions_hash: self.actions_hash,
             sealed: self.sealed.clone(),
             signature: self.signature,
+            mac: self.mac,
         };
         postcard::to_allocvec(&wire).expect("an entry always serializes")
     }
@@ -259,6 +268,18 @@ impl Entry {
     /// Reads an entry from the remote and opens its actions.
     pub fn from_wire(bytes: &[u8], sealer: &Sealer) -> Result<Self, WireError> {
         let wire: Wire = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
+        // Before any use of the header: a writer with no repository key stops here.
+        let content = content_hash(
+            wire.node,
+            wire.seq,
+            &wire.prev,
+            wire.hlc,
+            &wire.seen,
+            &wire.actions_hash,
+        );
+        if !sealer.entry_mac_is_valid(&content, &wire.mac) {
+            return Err(WireError::BadMac);
+        }
         let actions = match &wire.sealed {
             None => None,
             Some(sealed) if actions_hash(sealed) != wire.actions_hash => {
@@ -283,6 +304,7 @@ impl Entry {
             actions,
             sealed: wire.sealed,
             signature: wire.signature,
+            mac: wire.mac,
         })
     }
 
@@ -495,7 +517,8 @@ mod tests {
 
         let result = Entry::from_wire(&entry.to_wire(), other.sealer());
 
-        assert_eq!(result, Err(WireError::Sealed));
+        // The MAC fails first, before any use of the header or the sealed actions.
+        assert_eq!(result, Err(WireError::BadMac));
     }
 
     #[test]
@@ -509,5 +532,52 @@ mod tests {
         assert_eq!(read.hash(), entry.hash());
         assert!(read.signature_is_valid());
         assert_eq!(redact_wire(&redacted).unwrap(), None);
+    }
+
+    /// A key holder redacts an entry with no key: the mac stays valid, so readers take it.
+    #[test]
+    fn test_redacted_wire_form_keeps_a_valid_mac() {
+        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()], &test_sealer());
+
+        let redacted = redact_wire(&entry.to_wire()).unwrap().unwrap();
+
+        assert!(Entry::from_wire(&redacted, &test_sealer()).is_ok());
+    }
+
+    /// An entry signed by any node key but with no repository key does not read.
+    #[test]
+    fn test_entry_from_a_writer_with_no_repo_key_does_not_read() {
+        let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let entry = Entry::sign(&key(), 0, [0u8; 32], 1, seen(), vec![put()], other.sealer());
+        let redacted = redact_wire(&entry.to_wire()).unwrap().unwrap();
+
+        for wire in [entry.to_wire(), redacted] {
+            let read = Entry::from_wire(&wire, &test_sealer());
+            assert_eq!(read.err(), Some(WireError::BadMac));
+        }
+    }
+
+    /// Pins the wire layout of an entry, with fixed field values: the sealed actions hold a
+    /// random nonce.
+    #[test]
+    fn test_entry_wire_form_is_stable() {
+        let wire = Wire {
+            node: NodeId::from_bytes([1u8; 32]),
+            seq: 3,
+            prev: [5u8; 32],
+            hlc: 7,
+            seen: seen(),
+            actions_hash: [6u8; 32],
+            sealed: Some(vec![9, 9]),
+            signature: ([7u8; 32], [8u8; 32]),
+            mac: [4u8; 32],
+        };
+
+        let bytes = postcard::to_allocvec(&wire).unwrap();
+
+        assert_eq!(
+            blake3::hash(&bytes).to_string(),
+            "48c370a3aaabc21d82f1561ce2fba6c915b7a1bff6570bd6850f0a2942b18255"
+        );
     }
 }

@@ -445,7 +445,7 @@ async fn test_remote_of_another_format_is_refused_at_open() {
     };
     let error = error.to_string();
     assert!(error.contains("remote has format 1"), "{error}");
-    assert!(error.contains("reads format 2"), "{error}");
+    assert!(error.contains("reads format 3"), "{error}");
 }
 
 /// R and M are rules of the remote: the first proxy writes them, and a proxy with others refuses
@@ -529,7 +529,7 @@ async fn test_proxy_with_another_horizon_refuses_to_open() {
     assert!(!error.contains("_ns"), "{error}");
 }
 
-/// A key check of format 2 with no rules comes from an older build: the open says so.
+/// A key check of format 3 with no rules comes from an older build: the open says so.
 #[tokio::test]
 async fn test_key_check_with_no_rules_names_an_older_build() {
     let remote = Arc::new(MemoryRemote::default());
@@ -538,7 +538,7 @@ async fn test_key_check_with_no_rules_names_an_older_build() {
     let old = keys.sealer().seal(
         seal::Kind::KeyCheck,
         context,
-        b"windsock repository key check\nformat 2",
+        b"windsock repository key check\nformat 3",
     );
     remote
         .create("repo/key-check", Bytes::from(old))
@@ -600,7 +600,7 @@ async fn test_key_check_with_a_rule_this_build_does_not_know_is_refused() {
     for rules in texts {
         let remote = Arc::new(MemoryRemote::default());
         let keys = RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
-        let text = format!("windsock repository key check\nformat 2\n{rules}");
+        let text = format!("windsock repository key check\nformat 3\n{rules}");
         let check = keys.sealer().seal(
             seal::Kind::KeyCheck,
             b"windsock repository key check",

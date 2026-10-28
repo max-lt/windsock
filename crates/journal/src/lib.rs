@@ -292,6 +292,7 @@ impl<R: Remote> Journal<R> {
                         WireError::Malformed => ChainError::Malformed { seq },
                         WireError::ActionsMismatch => ChainError::ActionsMismatch { seq },
                         WireError::Sealed => ChainError::Sealed { seq },
+                        WireError::BadMac => ChainError::BadMac { seq },
                     },
                 })?;
             frontier = frontier
@@ -834,6 +835,60 @@ mod tests {
         assert_eq!(reader.frontier(c.node()), Frontier::GENESIS);
     }
 
+    /// A writer with bucket rights and no repo key: its own node key, an entry far ahead.
+    async fn keyless_entry(remote: &MemoryRemote, redact: bool) -> (NodeId, u64) {
+        let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let hlc = wall() + 20 * 3600 * 1_000_000_000;
+        let entry = Entry::sign(
+            &key(77),
+            0,
+            [0; 32],
+            hlc,
+            Seen::new(),
+            vec![put("x")],
+            other.sealer(),
+        );
+        let wire = match redact {
+            true => redact_wire(&entry.to_wire()).unwrap().unwrap(),
+            false => entry.to_wire(),
+        };
+        remote
+            .put(&entry.remote_key(), Bytes::from(wire))
+            .await
+            .unwrap();
+        remote
+            .put(&node_key(entry.node), Bytes::new())
+            .await
+            .unwrap();
+        (entry.node, hlc)
+    }
+
+    /// An entry from a writer with no repo key breaks its own chain only: the other chains
+    /// read, and the clock of the reader does not take its HLC.
+    #[tokio::test]
+    async fn test_entry_with_no_repo_key_breaks_only_its_chain() {
+        for redact in [true, false] {
+            let remote = Arc::new(MemoryRemote::default());
+            let mut a = journal(&remote, 1);
+            let good = a.append(vec![put("a")], Seen::new()).await.unwrap();
+            let (forged, hlc) = keyless_entry(&remote, redact).await;
+            let mut reader = journal(&remote, 9);
+
+            let entries = reader.sync_all().await.unwrap();
+
+            assert_eq!(entries, vec![good], "redacted {redact}");
+            assert!(
+                matches!(reader.broken()[&forged], ChainError::BadMac { seq: 0 }),
+                "{:?}",
+                reader.broken()
+            );
+            assert!(
+                reader.clock.tick().unwrap() < hlc,
+                "the clock took the forged HLC"
+            );
+        }
+    }
+
     /// A remote that counts the log keys that its listings return, and the log listings.
     #[derive(Default)]
     struct Counting {
@@ -1147,7 +1202,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(JournalError::Chain {
-                source: ChainError::Sealed { seq: 0 },
+                source: ChainError::BadMac { seq: 0 },
                 ..
             })
         ));

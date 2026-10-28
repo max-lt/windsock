@@ -327,73 +327,112 @@ impl Sim {
         journal::set_manual_monotonic(self.elapsed - proxy.suspended);
     }
 
-    async fn open(&mut self, i: usize) -> Result<(), String> {
+    async fn try_open(&self, i: usize) -> Result<Engine<ProxyRemote>, EngineError> {
         self.clocks(i);
-        let proxy = &mut self.proxies[i];
+        let proxy = &self.proxies[i];
         let remote = Arc::new(ProxyRemote {
             shared: self.remote.clone(),
             outage: proxy.outage.clone(),
         });
-        let result = Engine::open(
+        Engine::open(
             proxy.dir.path(),
             remote,
             SigningKey::from_bytes(&[proxy.seed; 32]),
             RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
             config(),
         )
-        .await;
-        match result {
-            Ok(engine) => {
-                proxy.engine = Some(engine);
-                Ok(())
-            }
-            Err(EngineError::Quarantined(_)) => {
-                let dir = proxy.dir.path().to_path_buf();
-                // The supervisor starts the proxy again before the operator acts: a held
-                // quarantine must block the start and stay as it is.
-                if self.rng.chance(30) {
-                    let wait = self.rng.below(120 * SECOND);
-                    self.pass(wait);
-                    self.stats.held_restart = true;
-                    return Box::pin(self.open(i)).await;
+        .await
+    }
+
+    /// The record segments in the quarantine of proxy `i`, by name, with their bytes.
+    fn held_segments(&self, i: usize) -> BTreeMap<String, Vec<u8>> {
+        let quarantine = self.proxies[i].dir.path().join("quarantine");
+        let Ok(entries) = std::fs::read_dir(quarantine) else {
+            return BTreeMap::new();
+        };
+        entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "log"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&path).unwrap())
+            })
+            .collect()
+    }
+
+    async fn open(&mut self, i: usize) -> Result<(), String> {
+        loop {
+            match self.try_open(i).await {
+                Ok(engine) => {
+                    self.proxies[i].engine = Some(engine);
+                    return Ok(());
                 }
-                // The operator reads the late writes, drops them, and starts the proxy again.
-                let held = engine::quarantined_writes(&dir)
-                    .await
-                    .map_err(|e| format!("p{i} quarantine: {e}"))?;
-                self.log.push(format!("p{i} quarantine at open: {held:?}"));
-                self.stats.quarantine = true;
-                // A write is late when its HLC is under the clock less (R - M), and the clock of
-                // the open is at most R ahead of its wall clock.
-                let wall = self.now + self.proxies[i].offset;
-                let bound = wall + config().late_margin.as_nanos() as u64;
-                if let Some(young) = held.iter().find(|w| w.hlc >= bound) {
-                    return Err(format!(
-                        "p{i}: a young write is in the quarantine: {young:?}"
-                    ));
+                Err(EngineError::Quarantined(e)) => self.operator(i, &e).await?,
+                // A remote error at open: the supervisor starts the proxy again.
+                Err(e) if e.to_string().contains("injected") => {
+                    self.log.push(format!("p{i} open failed: {e}"));
                 }
-                let intent = std::fs::read_dir(dir.join("quarantine")).unwrap().any(|e| {
-                    e.unwrap()
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("intent")
-                });
-                self.stats.intent_quarantined |= intent;
-                let newest = held.iter().map(|w| w.hlc).max().unwrap_or(0);
-                self.stats.young_kept |= self.acked_after(i, newest);
-                for write in held {
-                    self.drop_acked(i, &write.target, write.hlc)?;
-                }
-                std::fs::remove_dir_all(dir.join("quarantine")).unwrap();
-                Box::pin(self.open(i)).await
+                Err(e) => return Err(format!("p{i} open: {e}")),
             }
-            // A remote error at open: the supervisor starts the proxy again.
-            Err(e) if e.to_string().contains("injected") => {
-                self.log.push(format!("p{i} open failed: {e}"));
-                Box::pin(self.open(i)).await
-            }
-            Err(e) => Err(format!("p{i} open: {e}")),
         }
+    }
+
+    /// A start refused on the quarantine: maybe a supervisor restart first, then the operator
+    /// reads the late writes, drops them, and empties the quarantine.
+    async fn operator(&mut self, i: usize, refusal: &str) -> Result<(), String> {
+        let held = self.held_segments(i);
+        if held.is_empty() {
+            return Err(format!(
+                "p{i}: a quarantine refusal with no segment held: {refusal}"
+            ));
+        }
+        // The supervisor starts the proxy again before the operator acts: the held quarantine
+        // must block the start and stay as it is.
+        if self.rng.chance(30) {
+            let wait = self.rng.below(120 * SECOND);
+            self.pass(wait);
+            self.stats.held_restart = true;
+            let again = self.try_open(i).await;
+            if !matches!(again, Err(EngineError::Quarantined(_))) {
+                return Err(format!(
+                    "p{i}: a start on a held quarantine: {:?}",
+                    again.err()
+                ));
+            }
+            if self.held_segments(i) != held {
+                return Err(format!("p{i}: a start changed a held quarantine"));
+            }
+        }
+        let dir = self.proxies[i].dir.path().to_path_buf();
+        let writes = engine::quarantined_writes(&dir)
+            .await
+            .map_err(|e| format!("p{i} quarantine: {e}"))?;
+        self.log
+            .push(format!("p{i} quarantine at open: {writes:?}"));
+        self.stats.quarantine = true;
+        // A write is late when its HLC is under the clock less (R - M), and the clock of the
+        // open is at most R ahead of its wall clock.
+        let wall = self.now + self.proxies[i].offset;
+        let bound = wall + config().late_margin.as_nanos() as u64;
+        if let Some(young) = writes.iter().find(|w| w.hlc >= bound) {
+            return Err(format!(
+                "p{i}: a young write is in the quarantine: {young:?}"
+            ));
+        }
+        let intent = std::fs::read_dir(dir.join("quarantine")).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("intent")
+        });
+        self.stats.intent_quarantined |= intent;
+        let newest = writes.iter().map(|w| w.hlc).max().unwrap_or(0);
+        self.stats.young_kept |= self.acked_after(i, newest);
+        for write in writes {
+            self.drop_acked(i, &write.target, write.hlc)?;
+        }
+        std::fs::remove_dir_all(dir.join("quarantine")).unwrap();
+        Ok(())
     }
 
     /// True when proxy `i` acked a write after `hlc` that the operator did not drop.

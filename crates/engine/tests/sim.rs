@@ -285,6 +285,8 @@ struct Sim {
     stats: Stats,
     /// A clock ran more than R ahead: a GC or a snapshot may then fail on a broken chain.
     faulty: bool,
+    /// The largest clock offset of the run: an HLC from it stays in the journal.
+    max_offset: u64,
 }
 
 impl Sim {
@@ -659,6 +661,7 @@ impl Sim {
                     }
                     false => m + self.rng.below(m),
                 };
+                self.max_offset = self.max_offset.max(self.proxies[i].offset);
             }
             86 => {
                 self.proxies[i].offset = self.rng.below(config().late_margin.as_nanos() as u64);
@@ -705,11 +708,10 @@ impl Sim {
     async fn settle(&mut self) -> Result<(), String> {
         *self.remote.next.lock().unwrap() = None;
         // Clocks come back, and time passes every HLC that ran ahead.
-        let ahead = self.proxies.iter().map(|p| p.offset).max().unwrap_or(0);
         for proxy in &mut self.proxies {
             proxy.offset = 0;
         }
-        self.now += ahead;
+        self.now += self.max_offset;
         for i in 0..3 {
             if self.proxies[i].engine.is_none() {
                 self.open(i).await?;
@@ -812,23 +814,36 @@ impl Sim {
                 return Err(format!("{key}: proxies differ: {seen:?}"));
             }
             let mut versions = Vec::new();
+            let mut conflicts = Vec::new();
             for i in 0..3 {
                 let state = self.engine(i).versions(BUCKET, &key);
                 let state = state.map_err(|e| format!("p{i} versions {key}: {e}"))?;
-                let ranks: Vec<_> = state
+                conflicts.push(state.as_ref().map(|s| s.conflicts()).unwrap_or_default());
+                let ranks: BTreeSet<_> = state
                     .into_iter()
                     .flat_map(|s| s.versions)
                     .map(|v| (v.hlc, v.node))
                     .collect();
                 versions.push(ranks);
             }
-            // The version prune is local: a proxy can hold fewer old versions, never other ones.
-            let shortest = versions.iter().map(Vec::len).min().unwrap_or(0);
-            if versions
-                .iter()
-                .any(|v| v[..shortest] != versions[0][..shortest])
+            // The version prune is local: it drops known versions below its bound, and keeps
+            // the head and the conflicts. A proxy holds fewer versions, never other ones. A key
+            // whose head is an old delete goes as a whole.
+            if expected.is_none() {
+                let kept: Vec<usize> = (0..3).filter(|&i| !versions[i].is_empty()).collect();
+                versions = kept.iter().map(|&i| versions[i].clone()).collect();
+                conflicts = kept.iter().map(|&i| conflicts[i].clone()).collect();
+            }
+            let all: BTreeSet<_> = versions.iter().flatten().copied().collect();
+            let longest = versions.iter().map(BTreeSet::len).max().unwrap_or(0);
+            let heads: Vec<_> = versions.iter().map(|v| v.last()).collect();
+            if all.len() != longest
+                || heads.iter().any(|h| h != &heads[0])
+                || conflicts.iter().any(|c| c != &conflicts[0])
             {
-                return Err(format!("{key}: version lists differ: {versions:?}"));
+                return Err(format!(
+                    "{key}: version lists differ: {versions:?}, conflicts {conflicts:?}"
+                ));
             }
             if seen[0] != expected {
                 return Err(format!(
@@ -884,6 +899,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         log: Vec::new(),
         stats: Stats::default(),
         faulty: false,
+        max_offset: 0,
     };
     for seed in 1..=3u8 {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -1073,7 +1089,9 @@ fn test_simulation_of_three_proxies_20000_seeds() {
 /// - 61: a remote error at open, with the supervisor starting the proxy again.
 /// - 598: a first entry reached the remote with a lost answer and no node marker; the GC did not
 ///   see the chain and deleted its pack.
-const REGRESSION_SEEDS: &[u64] = &[522, 50, 10, 32, 35, 40, 61, 598];
+const REGRESSION_SEEDS: &[u64] = &[
+    522, 50, 10, 32, 35, 40, 61, 598, 382, 454, 506, 638, 869, 926, 999,
+];
 
 #[test]
 fn test_simulation_regression_seeds() {

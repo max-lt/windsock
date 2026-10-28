@@ -388,6 +388,15 @@ impl Sim {
                 Err(e) if e.to_string().contains("injected") => {
                     self.log.push(format!("p{i} open failed: {e}"));
                 }
+                // After a clock more than R ahead, an own entry can be more than R ahead of this
+                // clock: the start waits until the clock passes it, as the refusal table says.
+                Err(e)
+                    if self.far_until > 0
+                        && e.to_string().contains("more than the retention ahead") =>
+                {
+                    self.log.push(format!("p{i} open waits for its clock: {e}"));
+                    self.pass(60 * SECOND);
+                }
                 Err(e) => return Err(format!("p{i} open: {e}")),
             }
         }
@@ -516,8 +525,13 @@ impl Sim {
     /// Records an ack of proxy `i` at `hlc` and checks that its acks rise.
     fn acked(&mut self, i: usize, hlc: u64) -> Result<(), String> {
         self.log.push(format!("p{i} ack {hlc}"));
+        // The open caps the clock at wall + R. After a clock more than R ahead, the clock of a
+        // proxy can hold an HLC above that cap: then, and only then, a restart lowers the acks.
+        let r = config().retention.as_nanos() as u64;
+        let cap = self.now + self.proxies[i].offset + r;
+        let capped = self.far_until > 0 && self.proxies[i].last_ack > cap;
         let proxy = &mut self.proxies[i];
-        if hlc <= proxy.last_ack {
+        if hlc <= proxy.last_ack && !capped {
             // The last steps show how the ack went down.
             let tail: Vec<_> = self.log.iter().rev().take(25).rev().cloned().collect();
             let tail = tail.join("\n");
@@ -1311,7 +1325,7 @@ fn test_simulation_of_three_proxies_20000_seeds() {
 /// - 598: a first entry reached the remote with a lost answer and no node marker; the GC did not
 ///   see the chain and deleted its pack.
 const REGRESSION_SEEDS: &[u64] = &[
-    522, 50, 10, 32, 35, 40, 61, 598, 382, 454, 506, 638, 869, 926, 999,
+    615, 919, 522, 50, 10, 32, 35, 40, 61, 598, 382, 454, 506, 638, 869, 926, 999,
 ];
 
 #[test]

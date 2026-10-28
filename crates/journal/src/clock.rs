@@ -73,16 +73,6 @@ pub fn set_manual_monotonic(nanos: u64) {
     MANUAL_MONOTONIC.with(|mono| mono.set(nanos));
 }
 
-/// Gives back the system clock on this thread and forgets every manual time: the next run starts
-/// as on a new thread. Only with the feature `sim`.
-#[cfg(any(test, feature = "sim"))]
-pub fn reset_manual_clock() {
-    MANUAL_WALL.with(|wall| wall.set(0));
-    MANUAL_MONOTONIC.with(|mono| mono.set(0));
-    MANUAL_SUSPENDED.with(|suspended| suspended.set(0));
-    MANUAL_MONOTONIC_SET.with(|set| set.set(false));
-}
-
 /// A host suspend of `nanos` on this thread: the manual wall clock moves on, and the monotonic
 /// clock does not, as a monotonic clock of a suspended host or VM. Only with the feature `sim`.
 #[cfg(any(test, feature = "sim"))]

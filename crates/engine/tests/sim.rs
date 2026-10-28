@@ -918,8 +918,9 @@ impl Sim {
 
 async fn run(seed: u64) -> Result<Stats, String> {
     CURRENT_SEED.with(|current| current.set(seed));
-    // A seed must not see the clocks of the seed before it on this thread.
-    journal::reset_manual_clock();
+    // A seed must not see an armed crash point of the seed before it. Each call sets the
+    // clocks of its proxy, so no clock carries over.
+    engine::sim::arm_crash(None);
     let now = START;
     let dedup_before = engine::sim::dedup_hits();
     journal::set_manual_wall(Some(now));
@@ -1142,7 +1143,8 @@ fn test_simulation_regression_seeds() {
     }
 }
 
-/// One seed gives the same run alone and after other seeds on the same thread.
+/// A seed gives the same run on a new thread and on a thread that an earlier seed left in any
+/// state: manual clocks, a suspend, an armed crash point.
 #[test]
 fn test_seed_alone_and_after_other_seeds_gives_the_same_run() {
     let runtime = || {
@@ -1151,16 +1153,17 @@ fn test_seed_alone_and_after_other_seeds_gives_the_same_run() {
             .build()
             .unwrap()
     };
+    let result = |stats: Stats| (stats.log_hash, stats.dedup_hits);
     let after = std::thread::spawn(move || {
-        let runtime = runtime();
-        for seed in 0..3 {
-            runtime.block_on(run(seed)).unwrap();
-        }
-        runtime.block_on(run(3)).unwrap().log_hash
+        journal::set_manual_wall(Some(START + 7 * 3600 * SECOND));
+        journal::suspend_manual(3600 * SECOND);
+        journal::set_manual_monotonic(u64::MAX / 2);
+        engine::sim::arm_crash(Some(Point::Commit));
+        result(runtime().block_on(run(3)).unwrap())
     })
     .join()
     .unwrap();
-    let alone = std::thread::spawn(move || runtime().block_on(run(3)).unwrap().log_hash)
+    let alone = std::thread::spawn(move || result(runtime().block_on(run(3)).unwrap()))
         .join()
         .unwrap();
 

@@ -241,3 +241,13 @@ See `CLAUDE.md` for the build, test and code rules, and `../windsock-todo.md` fo
 A workspace `cargo test` builds every crate with the feature `sim` of the engine tests, which
 gives the journal a manual clock. To test the daemon as it ships, with no `sim`, run
 `cargo test -p windsockd`.
+
+The chaos soak runs 3 daemons on one directory remote under mixed S3 traffic, with kills,
+restarts, a full disk under the buffer and the index, and a stop longer than H. At the end, every
+proxy must read the same value for each key, and one that the acks allow. It needs macOS
+(`hdiutil`), `rsync` and `lsof`, and exits 1 when a check fails:
+
+```bash
+cargo build --release -p windsockd -p chaos
+./target/release/windsock-chaos --minutes 30 --work /tmp/ws-chaos --seed 13
+```

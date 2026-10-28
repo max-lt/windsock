@@ -180,7 +180,11 @@ impl<R: Remote + 'static> Engine<R> {
                                 if !dedup {
                                     return Ok(None);
                                 }
-                                self.stored_chunk(id)
+                                let stored = self.stored_chunk(id);
+                                if let Ok(Some(_)) = &stored {
+                                    crate::sim::count_dedup();
+                                }
+                                stored
                             })?;
                         self.upload_packs(added.closed).await?;
                         if policy.cache == CacheMode::ReadWrite {

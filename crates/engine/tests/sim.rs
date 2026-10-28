@@ -222,6 +222,9 @@ struct Stats {
     stale_plan: bool,
     marker_fault: bool,
     far_ahead: bool,
+    slow_stale_plan: bool,
+    /// Chunks that a flush found stored and did not upload again.
+    dedup_hits: u64,
 }
 
 /// One acked write: its rank and what a reader must see if it wins.
@@ -248,6 +251,8 @@ struct Proxy {
     stale_index: Option<TempDir>,
     /// How far the wall clock of this proxy is ahead of the shared time.
     offset: u64,
+    /// Time that passed while this host was suspended: its monotonic clock did not count it.
+    suspended: u64,
 }
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -287,11 +292,27 @@ struct Sim {
     faulty: bool,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
+    /// Real time since the start: it never steps back, unlike the wall clocks.
+    elapsed: u64,
 }
 
 impl Sim {
+    /// Time goes on for every host.
+    fn pass(&mut self, by: u64) {
+        self.now += by;
+        self.elapsed += by;
+    }
+
+    /// The wall and the monotonic clock of proxy `i`. Each host has its own monotonic clock:
+    /// a wall step or a suspend of one host does not move the others.
+    fn clocks(&self, i: usize) {
+        let proxy = &self.proxies[i];
+        journal::set_manual_wall(Some(self.now + proxy.offset));
+        journal::set_manual_monotonic(self.elapsed - proxy.suspended);
+    }
+
     async fn open(&mut self, i: usize) -> Result<(), String> {
-        journal::set_manual_wall(Some(self.now + self.proxies[i].offset));
+        self.clocks(i);
         let proxy = &mut self.proxies[i];
         let remote = Arc::new(ProxyRemote {
             shared: self.remote.clone(),
@@ -315,8 +336,8 @@ impl Sim {
                 // The supervisor starts the proxy again before the operator acts: a held
                 // quarantine must block the start and stay as it is.
                 if self.rng.chance(30) {
-                    self.now += self.rng.below(120 * SECOND);
-                    journal::set_manual_wall(Some(self.now));
+                    let wait = self.rng.below(120 * SECOND);
+                    self.pass(wait);
                     self.stats.held_restart = true;
                     return Box::pin(self.open(i)).await;
                 }
@@ -417,7 +438,7 @@ impl Sim {
 
     /// The engine of proxy `i`, with the wall clock of that proxy for the call.
     fn engine(&self, i: usize) -> &Engine<ProxyRemote> {
-        journal::set_manual_wall(Some(self.now + self.proxies[i].offset));
+        self.clocks(i);
         self.proxies[i].engine.as_ref().expect("the proxy is open")
     }
 
@@ -490,8 +511,7 @@ impl Sim {
         let other = 3 - o;
         self.proxies[o].outage.store(true, Ordering::SeqCst);
         for _ in 0..8 {
-            self.now += 80 * SECOND;
-            journal::set_manual_wall(Some(self.now));
+            self.pass(80 * SECOND);
             self.put(o).await?;
             self.delete(other).await?;
             if let Err(e) = self.engine(other).flush().await {
@@ -510,7 +530,14 @@ impl Sim {
 
     async fn put(&mut self, i: usize) -> Result<(), String> {
         let key = format!("k{}", self.rng.below(KEYS));
-        let value = self.rng.next().to_le_bytes().to_vec();
+        // Now and then one of a few large values: a later flush can dedup its chunks.
+        let value = match self.rng.chance(30) {
+            true => {
+                let pick = self.rng.below(4) as u8;
+                vec![pick; 64 * 1024]
+            }
+            false => self.rng.next().to_le_bytes().to_vec(),
+        };
         let result = self
             .engine(i)
             .put(
@@ -566,8 +593,8 @@ impl Sim {
         self.log
             .push(format!("step p{i} roll {roll} now {}", self.now));
         // Time goes on between two steps.
-        self.now += self.rng.below(3 * SECOND);
-        journal::set_manual_wall(Some(self.now));
+        let by = self.rng.below(3 * SECOND);
+        self.pass(by);
 
         match roll {
             0..=27 => self.put(i).await?,
@@ -611,13 +638,21 @@ impl Sim {
             61 => {
                 // A slow pack upload: the host sleeps between the plan and the commit.
                 *self.remote.next.lock().unwrap() = Some(("packs/", Fault::Slow));
+                let before = self.now;
                 let r = self.engine(i).flush().await;
                 self.log.push(format!("p{i} slow flush {r:?}"));
-                // The shared time follows the clock that the sleep moved on.
+                // The shared time follows the wall clock that the sleep moved on. The sleeping
+                // host did not count it on its monotonic clock.
                 let wall = journal::wall_clock_nanos();
-                self.now = self.now.max(wall.saturating_sub(self.proxies[i].offset));
+                let slept = wall
+                    .saturating_sub(self.proxies[i].offset)
+                    .saturating_sub(before);
+                self.pass(slept);
+                self.proxies[i].suspended += slept;
                 if let Err(e) = r {
-                    self.stats.stale_plan |= matches!(e, EngineError::StalePlan);
+                    let stale = matches!(e, EngineError::StalePlan);
+                    self.stats.stale_plan |= stale;
+                    self.stats.slow_stale_plan |= stale;
                     self.quarantine(i, &e);
                 }
                 *self.remote.next.lock().unwrap() = None;
@@ -644,8 +679,8 @@ impl Sim {
             89 => {
                 // A host suspend: the wall clock moves on, the monotonic clock does not.
                 let pause = self.rng.below(300 * SECOND);
-                journal::suspend_manual(pause);
-                self.now += pause;
+                self.pass(pause);
+                self.proxies[i].suspended += pause;
                 self.stats.suspend = true;
             }
             85 => {
@@ -673,7 +708,6 @@ impl Sim {
                     true => self.now + step,
                     false => self.now.saturating_sub(step),
                 };
-                journal::set_manual_wall(Some(self.now));
             }
             _ => {
                 let prefix = ["log/", "packs/", "manifests/", "snapshots/", "nodes/"]
@@ -711,7 +745,7 @@ impl Sim {
         for proxy in &mut self.proxies {
             proxy.offset = 0;
         }
-        self.now += self.max_offset;
+        self.pass(self.max_offset);
         for i in 0..3 {
             if self.proxies[i].engine.is_none() {
                 self.open(i).await?;
@@ -886,7 +920,8 @@ async fn run(seed: u64) -> Result<Stats, String> {
     CURRENT_SEED.with(|current| current.set(seed));
     // A seed must not see the clocks of the seed before it on this thread.
     journal::reset_manual_clock();
-    let mut now = START;
+    let now = START;
+    let dedup_before = engine::sim::dedup_hits();
     journal::set_manual_wall(Some(now));
     let remote = Arc::new(SimRemote::default());
     let mut sim = Sim {
@@ -900,6 +935,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         stats: Stats::default(),
         faulty: false,
         max_offset: 0,
+        elapsed: SECOND,
     };
     for seed in 1..=3u8 {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -912,6 +948,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
             outage: Arc::new(AtomicBool::new(false)),
             stale_index: None,
             offset: 0,
+            suspended: 0,
         });
     }
     for i in 0..3 {
@@ -922,9 +959,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         .await
         .map_err(|e| e.to_string())?;
     sim.engine(0).flush().await.map_err(|e| e.to_string())?;
-    now += SECOND;
-    journal::set_manual_wall(Some(now));
-    sim.now = now;
+    sim.pass(SECOND);
     for i in 1..3 {
         sim.engine(i).sync().await.map_err(|e| e.to_string())?;
     }
@@ -934,6 +969,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
     }
     sim.settle().await?;
     sim.check().await?;
+    sim.stats.dedup_hits = engine::sim::dedup_hits() - dedup_before;
     sim.stats.log_hash = *blake3::hash(sim.log.join("\n").as_bytes()).as_bytes();
     Ok(sim.stats)
 }
@@ -954,6 +990,8 @@ struct Totals {
     stale_plan: u64,
     marker_fault: u64,
     far_ahead: u64,
+    slow_stale_plan: u64,
+    dedup_hits: u64,
     crashes: BTreeMap<Point, u64>,
 }
 
@@ -972,6 +1010,8 @@ impl Totals {
         self.stale_plan += u64::from(stats.stale_plan);
         self.marker_fault += u64::from(stats.marker_fault);
         self.far_ahead += u64::from(stats.far_ahead);
+        self.slow_stale_plan += u64::from(stats.slow_stale_plan);
+        self.dedup_hits += stats.dedup_hits;
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
         }
@@ -998,6 +1038,8 @@ impl Totals {
             ("a StalePlan", self.stale_plan),
             ("a failed marker write", self.marker_fault),
             ("a clock more than R ahead", self.far_ahead),
+            ("a StalePlan after a slow upload", self.slow_stale_plan),
+            ("a dedup hit", self.dedup_hits),
         ];
         for (branch, count) in branches {
             assert!(count > 0, "no seed had {branch}: {self:?}");

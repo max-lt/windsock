@@ -17,7 +17,23 @@ pub enum Point {
 #[cfg(feature = "sim")]
 thread_local! {
     static ARMED: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
+    static DEDUP_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// The chunks that a flush on this thread found stored and did not upload again.
+#[cfg(feature = "sim")]
+pub fn dedup_hits() -> u64 {
+    DEDUP_HITS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn count_dedup() {
+    DEDUP_HITS.with(|hits| hits.set(hits.get() + 1));
+}
+
+#[cfg(not(feature = "sim"))]
+#[inline(always)]
+pub(crate) fn count_dedup() {}
 
 /// Makes the next pass at `point` on this thread fail with [`crate::EngineError::SimCrash`].
 #[cfg(feature = "sim")]

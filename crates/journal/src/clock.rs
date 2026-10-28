@@ -12,6 +12,8 @@ thread_local! {
     static MANUAL_MONOTONIC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Wall clock time that passed while the host was suspended.
     static MANUAL_SUSPENDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A test sets the monotonic clock itself: a wall clock change does not move it.
+    static MANUAL_MONOTONIC_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Nanoseconds on a clock that never steps back, from an arbitrary start: for elapsed times.
@@ -53,10 +55,22 @@ pub fn wall_clock_nanos() -> u64 {
 #[cfg(any(test, feature = "sim"))]
 pub fn set_manual_wall(nanos: Option<u64>) {
     MANUAL_WALL.with(|wall| wall.set(nanos.unwrap_or(0)));
+    if MANUAL_MONOTONIC_SET.with(std::cell::Cell::get) {
+        return;
+    }
     let counted = nanos
         .unwrap_or(0)
         .saturating_sub(MANUAL_SUSPENDED.with(std::cell::Cell::get));
     MANUAL_MONOTONIC.with(|mono| mono.set(mono.get().max(counted)));
+}
+
+/// Sets the manual monotonic clock of this thread, as the clock of one simulated host. Each host
+/// has its own: a wall clock step or a suspend of one host does not move the others. Only with
+/// the feature `sim`.
+#[cfg(any(test, feature = "sim"))]
+pub fn set_manual_monotonic(nanos: u64) {
+    MANUAL_MONOTONIC_SET.with(|set| set.set(true));
+    MANUAL_MONOTONIC.with(|mono| mono.set(nanos));
 }
 
 /// Gives back the system clock on this thread and forgets every manual time: the next run starts
@@ -66,6 +80,7 @@ pub fn reset_manual_clock() {
     MANUAL_WALL.with(|wall| wall.set(0));
     MANUAL_MONOTONIC.with(|mono| mono.set(0));
     MANUAL_SUSPENDED.with(|suspended| suspended.set(0));
+    MANUAL_MONOTONIC_SET.with(|set| set.set(false));
 }
 
 /// A host suspend of `nanos` on this thread: the manual wall clock moves on, and the monotonic

@@ -7,6 +7,7 @@
 
 mod config;
 mod listener;
+mod quarantine;
 
 use std::future::IntoFuture;
 use std::io::IsTerminal;
@@ -57,8 +58,13 @@ async fn main() -> Result<()> {
         ["init", dir] => init(Path::new(dir)),
         ["run", path] => run(&Config::load(Path::new(path))?, Mode::Serve).await,
         ["diagnose", path] => run(&Config::load(Path::new(path))?, Mode::Diagnose).await,
+        ["quarantine", "list", path] => quarantine::list(&Config::load(Path::new(path))?).await,
+        ["quarantine", "export", path, out] => {
+            quarantine::export(&Config::load(Path::new(path))?, Path::new(out)).await
+        }
         _ => bail!(
-            "usage: windsockd init <dir> | windsockd run <config> | windsockd diagnose <config>"
+            "usage: windsockd init <dir> | run <config> | diagnose <config> | quarantine list \
+             <config> | quarantine export <config> <new dir>"
         ),
     }
 }

@@ -144,11 +144,12 @@ to the quarantine with the other late writes. Else the next flush plans those wr
   nothing more there. Another file in the quarantine, such as a `<segment>.tmp` left by a crash,
   gives a WARN with its path and does not stop the start. A quarantine that does not read stops
   the start with its path.
-- A quarantine file holds the records with their data, or an intent with its plan only. No tool
-  reads them: the ERROR line of the move, and the error of every start that the quarantine
-  stops, give each key as `bucket/key (ack HLC n)`. The flush ERROR before a restart gives the
-  keys only.
-  `engine::quarantined_writes` gives the same list from the segment files, with no data.
+- A quarantine file holds the records with their data, or an intent with its plan only. The
+  ERROR line of the move, and the error of every start that the quarantine stops, give each key
+  as `bucket/key (ack HLC n)`. The flush ERROR before a restart gives the keys only.
+  `windsockd quarantine list <config>` prints each record, and `windsockd quarantine export
+<config> <new dir>` writes the bodies to new files (README, "When the write buffer does not
+  open"). Both read the local disk only.
 
 The open runs in this order: a stop on a held quarantine (before any remote call), the key check
 (`repo/key-check`), the snapshot load when the index is empty, one full sync with the audit, the
@@ -168,7 +169,8 @@ What the operator does:
 1. Read the keys in the ERROR line, or in the error of the failed start.
 2. For each key, decide. To drop the late write, do nothing more for that key: the delete or the
    newer write that the remote holds stays. To keep the late write, write the object again
-   through the S3 API after the start, from the copy that the client holds. That new write gets
+   through the S3 API after the start, from the body that `windsockd quarantine export` wrote or
+   from the copy that the client holds. That new write gets
    a new ack HLC, so it wins over the delete.
 3. Empty `data/engine/quarantine` (move its files away), then start the proxy. The young writes
    in the buffer flush at this start. Emptying the quarantine drops every late write in it that

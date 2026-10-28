@@ -137,10 +137,28 @@ remote, the proxy does not commit it: a newer delete of the key can be gone. The
 ERROR with the keys and stops its flusher. At the next start, only those writes move to
 `data/engine/quarantine`, and the start fails. The other buffered writes stay.
 
-1. Read the keys in the ERROR line.
-2. For each key that must keep the late value, write the object again through the S3 API after
-   step 3. The other late writes are dropped.
-3. Move the files out of `data/engine/quarantine`, then start the proxy. The young writes flush.
+1. List the late writes. The command reads the local data directory only: it needs no remote and
+   no repository key.
+
+   ```bash
+   windsockd quarantine list /etc/windsock/windsock.toml
+   ```
+
+   Each line gives the file, the record number, the op, the key, the ack HLC, the ack time and the
+   size. A control character, a tab, a newline or a backslash in a key shows as `\xNN`.
+
+2. Export the bodies to a new directory, to decide for each key and to keep a copy:
+
+   ```bash
+   windsockd quarantine export /etc/windsock/windsock.toml /root/late-writes
+   ```
+
+   The directory must not exist. It gets mode 0700, each body goes to `<nnnn>.body` (mode 0600),
+   and `index.tsv` lists every record. The bodies are client data in clear text, as in the buffer.
+
+3. For each key that must keep the late value, write the body again through the S3 API after
+   step 4. The other late writes are dropped.
+4. Move the files out of `data/engine/quarantine`, then start the proxy. The young writes flush.
 
 `docs/storage.md` (Order of writes) gives the details.
 

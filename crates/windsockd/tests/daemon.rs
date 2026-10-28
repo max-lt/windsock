@@ -506,3 +506,96 @@ async fn test_stop_with_late_writes_exits_with_a_failure() {
         "a stop that left late writes in the buffer exits with success"
     );
 }
+
+/// `windsockd quarantine list` and `export` on a real quarantine. The key holds a newline, a tab
+/// and an escape byte: no output line may break on it, and export never overwrites.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quarantine_list_and_export_escape_the_keys() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, config, keys) = init();
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("retention_secs = 86400", "retention_secs = 3")
+        .replace("late_margin_secs = 3600", "late_margin_secs = 1");
+    std::fs::write(&config, text).unwrap();
+    let daemon = start(&config, "info");
+    assert_eq!(
+        call(&daemon, &keys, "PUT", "/demo", b"").await.status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let log = dir.path().join("remote").join("log");
+    let set_mode = |mode: u32| {
+        for entry in std::fs::read_dir(&log).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    set_mode(0o555);
+    let put = call(&daemon, &keys, "PUT", "/demo/a%0Ab%09c%1Bd", b"late body").await;
+    assert_eq!(put.status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!daemon.stop());
+    set_mode(0o755);
+    let started = Command::new(BIN).arg("run").arg(&config).output().unwrap();
+    assert!(
+        !started.status.success(),
+        "the start moves the late write and fails"
+    );
+
+    let listed = Command::new(BIN)
+        .args(["quarantine", "list"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let out = dir.path().join("export");
+    let exported = Command::new(BIN)
+        .args(["quarantine", "export"])
+        .arg(&config)
+        .arg(&out)
+        .output()
+        .unwrap();
+    let again = Command::new(BIN)
+        .args(["quarantine", "export"])
+        .arg(&config)
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    // The record, and the intent of the flush whose create failed: no line from the key itself.
+    assert_eq!(listed.lines().count(), 2, "{listed}");
+    assert!(
+        listed.contains("intent: interrupted flush, plan only"),
+        "{listed}"
+    );
+    assert!(listed.contains("demo/a\\x0ab\\x09c\\x1bd"), "{listed}");
+    assert!(exported.status.success(), "{exported:?}");
+    let index = std::fs::read_to_string(out.join("index.tsv")).unwrap();
+    assert_eq!(index.lines().count(), 2, "{index}");
+    assert_eq!(std::fs::read(out.join("0001.body")).unwrap(), b"late body");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&out), 0o700);
+    assert_eq!(mode(&out.join("0001.body")), 0o600);
+    assert!(
+        !again.status.success(),
+        "a second export into the same directory"
+    );
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+    let to_link = Command::new(BIN)
+        .args(["quarantine", "export"])
+        .arg(&config)
+        .arg(&link)
+        .output()
+        .unwrap();
+    assert!(!to_link.status.success(), "an export through a symlink");
+    assert!(
+        dir.path()
+            .join("data/engine/quarantine")
+            .read_dir()
+            .unwrap()
+            .count()
+            > 0
+    );
+}

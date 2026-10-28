@@ -9,6 +9,7 @@ engine.workspace = true
 remote.workspace = true
 s3api.workspace = true
 s3remote.workspace = true
+s3proto.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
@@ -27,7 +28,6 @@ tracing-subscriber.workspace = true
 tls = ["s3remote/tls"]
 
 [dev-dependencies]
-s3proto.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

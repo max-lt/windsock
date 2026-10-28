@@ -44,7 +44,7 @@ use tracing::{debug, error, info, warn};
 use buffer::{Buffer, BufferedObject, BufferedPut, Durability, Head, Intent, Op, SegmentReader};
 use plan::{Fetch, Nonces, Planner};
 
-pub use buffer::QuarantinedWrite;
+pub use buffer::{QuarantineReader, QuarantinedRecord, QuarantinedWrite};
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
 pub use gc::GcReport;
 pub use index::MAX_OPEN_FILES as INDEX_MAX_OPEN_FILES;
@@ -251,6 +251,11 @@ pub struct Engine<R> {
 /// on before the next start.
 pub async fn quarantined_writes(dir: impl AsRef<Path>) -> Result<Vec<QuarantinedWrite>> {
     buffer::read_quarantine(&dir.as_ref().join(QUARANTINE_DIR)).await
+}
+
+/// The quarantine directory of the engine directory `dir`.
+pub fn quarantine_dir(dir: impl AsRef<Path>) -> PathBuf {
+    dir.as_ref().join(QUARANTINE_DIR)
 }
 
 /// Refuses to open with a quarantine. A buffered write older than the late limit, R - M, moves

@@ -947,6 +947,85 @@ pub struct QuarantinedWrite {
     pub hlc: u64,
 }
 
+/// One record of the quarantine, with its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedRecord {
+    /// The segment file name in the quarantine.
+    pub file: String,
+    /// The place of the record in its file, from 1.
+    pub number: u64,
+    /// `put`, `delete`, `create-bucket` or `delete-bucket`.
+    pub op: &'static str,
+    pub write: QuarantinedWrite,
+    /// The object body of a put; empty for the other ops.
+    pub data: Vec<u8>,
+}
+
+/// Reads the records of the quarantine directory `dir` one at a time, in order.
+pub struct QuarantineReader {
+    paths: std::vec::IntoIter<PathBuf>,
+    current: Option<(PathBuf, SegmentReader, u64)>,
+}
+
+impl QuarantineReader {
+    /// The segment files of `dir` (`*.log`). A missing directory has no record.
+    pub async fn open(dir: &Path) -> Result<Self, EngineError> {
+        let mut paths = Vec::new();
+        if tokio::fs::try_exists(dir).await? {
+            let mut entries = tokio::fs::read_dir(dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "log") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        Ok(Self {
+            paths: paths.into_iter(),
+            current: None,
+        })
+    }
+
+    pub async fn next(&mut self) -> Result<Option<QuarantinedRecord>, EngineError> {
+        loop {
+            if self.current.is_none() {
+                let Some(path) = self.paths.next() else {
+                    return Ok(None);
+                };
+                let reader = SegmentReader::open(&path).await?;
+                self.current = Some((path, reader, 0));
+            }
+            let (path, reader, number) = self.current.as_mut().expect("set above");
+            let Some(record) = reader.next(path).await? else {
+                self.current = None;
+                continue;
+            };
+            *number += 1;
+            let op = match record.head.op {
+                Op::Put { .. } => "put",
+                Op::Delete { .. } => "delete",
+                Op::CreateBucket { .. } => "create-bucket",
+                Op::DeleteBucket { .. } => "delete-bucket",
+            };
+            let file = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Ok(Some(QuarantinedRecord {
+                file,
+                number: *number,
+                op,
+                write: QuarantinedWrite {
+                    target: record.head.op.target(),
+                    hlc: record.head.time,
+                },
+                data: record.data,
+            }));
+        }
+    }
+}
+
 /// The writes in the quarantine directory `dir`, in order.
 pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>, EngineError> {
     let mut out = Vec::new();

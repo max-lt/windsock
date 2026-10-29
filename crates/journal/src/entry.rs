@@ -288,6 +288,29 @@ impl Entry {
         Some(postcard::to_allocvec(&wire).expect("an entry always serializes"))
     }
 
+    /// The length of [`Entry::to_wire`], with no copy of the sealed actions.
+    pub fn wire_len(&self) -> u64 {
+        let header = Wire {
+            node: self.node,
+            seq: self.seq,
+            prev: self.prev,
+            hlc: self.hlc,
+            seen: self.seen.clone(),
+            actions_hash: self.actions_hash,
+            sealed: None,
+            signature: self.signature,
+            mac: self.mac,
+        };
+        let header = postcard::to_allocvec(&header).expect("an entry always serializes");
+        let Some(sealed) = &self.sealed else {
+            return header.len() as u64;
+        };
+        // Some writes a length after its tag, then the bytes.
+        let len = sealed.len() as u64;
+        let varint = (u64::BITS - len.leading_zeros()).div_ceil(7).max(1) as u64;
+        header.len() as u64 + varint + len
+    }
+
     /// Reads an entry from the remote and opens its actions.
     pub fn from_wire(bytes: &[u8], sealer: &Sealer) -> Result<Self, WireError> {
         let wire: Wire = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
@@ -409,6 +432,32 @@ pub(crate) fn test_sealer() -> Sealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wire_len_is_the_length_of_the_wire_bytes() {
+        for size in [0, 10, 200, 20_000] {
+            let action = Action::Put {
+                bucket: "b".into(),
+                key: "k".repeat(size.max(1)),
+                manifest_id: ObjectId::from_bytes([1; 32]),
+                inline_manifest: None,
+                hlc: 1,
+            };
+            let entry = Entry::sign(
+                &key(),
+                3,
+                [2; 32],
+                9,
+                Seen::new(),
+                vec![action],
+                &test_sealer(),
+            );
+
+            assert_eq!(entry.wire_len(), entry.to_wire().len() as u64, "{size}");
+            let redacted = entry.redacted();
+            assert_eq!(redacted.wire_len(), redacted.to_wire().len() as u64);
+        }
+    }
 
     /// Pins the bytes that the MAC covers and the key that it uses: a change here makes
     /// every entry in every remote fail its MAC.

@@ -80,6 +80,8 @@ pub enum JournalError {
     ClockOverflow,
     #[error("{0}: the store says the node marker exists, and a read finds no marker")]
     MarkerMissing(String),
+    #[error("entry {seq} would have {len} bytes, over the {max} bytes that a reader takes")]
+    EntryTooLarge { seq: u64, len: u64, max: u64 },
 }
 
 /// Reads all chains of a remote and appends to the chain of one node.
@@ -108,6 +110,8 @@ pub struct Journal<R> {
     reported_broken: BTreeSet<NodeId>,
     /// Nanoseconds that an entry HLC may be ahead of the wall clock of this reader: R.
     max_ahead: u64,
+    /// The largest entry that this journal signs: MAX_ENTRY, lower in tests.
+    max_entry: u64,
     /// Entries already logged as too far ahead: one ERROR each.
     reported_ahead: BTreeSet<(NodeId, u64)>,
 }
@@ -141,6 +145,7 @@ impl<R: Remote> Journal<R> {
             skipped: 0,
             reported_broken: BTreeSet::new(),
             max_ahead: DEFAULT_MAX_AHEAD,
+            max_entry: MAX_ENTRY,
             reported_ahead: BTreeSet::new(),
         }
     }
@@ -205,7 +210,7 @@ impl<R: Remote> Journal<R> {
                 },
             });
         }
-        Ok(Entry::sign(
+        let entry = Entry::sign(
             &self.signing_key,
             frontier.next_seq,
             frontier.last_hash,
@@ -213,7 +218,17 @@ impl<R: Remote> Journal<R> {
             seen,
             actions,
             &self.sealer,
-        ))
+        );
+        // A reader refuses a larger entry, and the own chain would stop there for every proxy.
+        let len = entry.wire_len();
+        if len > self.max_entry {
+            return Err(JournalError::EntryTooLarge {
+                seq: entry.seq,
+                len,
+                max: self.max_entry,
+            });
+        }
+        Ok(entry)
     }
 
     /// Writes a prepared entry. Safe to call again with the same entry after a
@@ -1132,6 +1147,28 @@ mod tests {
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 5);
         assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
+    }
+
+    #[tokio::test]
+    async fn test_prepare_refuses_an_entry_that_readers_refuse() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut journal = Journal::new(remote, key(1), entry::test_sealer(), Frontiers::new());
+        journal.max_entry = 1024;
+        let small = journal.prepare(vec![put("k")], Seen::new());
+        let large = journal.prepare(vec![put(&"k".repeat(2048))], Seen::new());
+
+        assert!(small.is_ok());
+        assert!(
+            matches!(
+                large,
+                Err(JournalError::EntryTooLarge {
+                    seq: 0,
+                    max: 1024,
+                    ..
+                })
+            ),
+            "{large:?}"
+        );
     }
 
     /// The own chain is exempt from the FutureHlc check only after the signature and MAC checks:

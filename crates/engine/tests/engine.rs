@@ -1269,3 +1269,43 @@ async fn test_failed_if_match_requests_force_one_sync_per_second_at_most() {
         "{forced} syncs for 100 failed If-Match requests"
     );
 }
+
+#[tokio::test]
+async fn test_pack_target_over_its_bound_is_refused_at_open() {
+    let remote = Arc::new(MemoryRemote::default());
+    let config = Config {
+        pack_target: engine::MAX_PACK_TARGET as usize + 1,
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        remote,
+        SigningKey::from_bytes(&[1; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await;
+
+    let Err(EngineError::Config(reason)) = result else {
+        panic!("a pack target over the bound opens");
+    };
+    assert!(reason.contains("pack_target"), "{reason}");
+}
+
+/// The largest legal configuration writes entries that every reader takes: the actions of up to
+/// 16 segments stop at max_entry_actions, one segment gives at most 3 times its size, and the
+/// header and the seal take far less than the rest.
+#[test]
+fn test_largest_legal_entry_is_under_the_reader_limit() {
+    let header = 64 * 1024;
+    let seal = 45;
+    let largest = engine::MAX_ENTRY_ACTIONS.max(3 * engine::MAX_PACK_TARGET) + header + seal;
+
+    assert!(
+        largest <= journal::MAX_ENTRY,
+        "{largest} > {}",
+        journal::MAX_ENTRY
+    );
+}

@@ -70,6 +70,10 @@ const MAX_KEY_CHECK: u64 = 64 * 1024;
 /// The largest actions of one entry that a proxy writes. Half of the entry that a reader takes, so
 /// every proxy reads every entry whatever its own setting.
 pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
+/// The largest pack target. A buffer segment rotates at this size, and the flush writes its actions
+/// in one entry: an action takes at most a few times the bytes of its record, so 3 times this
+/// size stays under MAX_ENTRY_ACTIONS.
+pub const MAX_PACK_TARGET: u64 = 128 * 1024 * 1024;
 /// The remote format of this build: each journal entry carries a MAC under the repository key.
 const REMOTE_FORMAT: u32 = 3;
 
@@ -459,6 +463,13 @@ impl<R: Remote + 'static> Engine<R> {
                 "max_entry_actions ({}) is above {MAX_ENTRY_ACTIONS}: other proxies could not read \
                  the entries",
                 config.max_entry_actions
+            )));
+        }
+        if config.pack_target as u64 > MAX_PACK_TARGET {
+            return Err(EngineError::Config(format!(
+                "pack_target ({}) is above {MAX_PACK_TARGET}: one buffer segment of that size can \
+                 give an entry that other proxies cannot read",
+                config.pack_target
             )));
         }
         if config.retention <= config.late_margin {

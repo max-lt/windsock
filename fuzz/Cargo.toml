@@ -1,0 +1,56 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blake3 = { version = "1", features = ["pure"] }
+engine = { path = "../crates/engine" }
+index = { path = "../crates/index" }
+journal = { path = "../crates/journal" }
+model = { path = "../crates/model" }
+pack = { path = "../crates/pack" }
+s3proto = { path = "../crates/s3proto" }
+seal = { path = "../crates/seal" }
+
+[workspace]
+
+[[bin]]
+name = "pack_parse"
+path = "fuzz_targets/pack_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry_wire"
+path = "fuzz_targets/entry_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_decode"
+path = "fuzz_targets/manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "s3_headers"
+path = "fuzz_targets/s3_headers.rs"
+test = false
+doc = false
+bench = false

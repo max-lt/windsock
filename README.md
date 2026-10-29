@@ -236,7 +236,15 @@ Measured with 200,000 small objects in one bucket:
 
 ## Development
 
-See `CLAUDE.md` for the build, test and code rules, and `../windsock-todo.md` for the design.
+See `CLAUDE.md` for the code rules. `docs/storage.md` and `docs/encryption.md` give the design.
+
+```bash
+just check              # cargo fmt --check, clippy (default, tls, fuzz/)
+just test               # cargo test --no-fail-fast
+just fuzz 60            # each fuzz target for 60 s (nightly, cargo-fuzz)
+just fuzz 600 pack_parse
+just bench              # release build, writes bench.md
+```
 
 A workspace `cargo test` builds every crate with the feature `sim` of the engine tests, which
 gives the journal a manual clock. To test the daemon as it ships, with no `sim`, run

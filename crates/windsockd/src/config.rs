@@ -95,6 +95,8 @@ pub struct EngineConfig {
     pub cache_bytes: u64,
     pub flush_delay_ms: u64,
     pub buffer_limit_bytes: u64,
+    /// The parts of all open multipart uploads together. A part over it gets 503.
+    pub parts_limit_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -104,6 +106,7 @@ impl Default for EngineConfig {
             cache_bytes: engine.cache_bytes,
             flush_delay_ms: engine.flush_delay.as_millis() as u64,
             buffer_limit_bytes: engine.buffer_limit,
+            parts_limit_bytes: s3api::DEFAULT_PARTS_LIMIT,
         }
     }
 }

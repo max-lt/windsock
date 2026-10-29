@@ -22,6 +22,7 @@ const REGION: &str = "us-east-1";
 struct Server {
     _dir: TempDir,
     engine: Arc<Engine<DirRemote>>,
+    uploads: Arc<s3api::Uploads>,
     app: Router,
 }
 
@@ -30,10 +31,15 @@ async fn server() -> Server {
 }
 
 async fn server_with(config: Config) -> Server {
-    server_in(tempfile::tempdir().unwrap(), config).await
+    server_in(
+        tempfile::tempdir().unwrap(),
+        config,
+        s3api::DEFAULT_PARTS_LIMIT,
+    )
+    .await
 }
 
-async fn server_in(dir: TempDir, config: Config) -> Server {
+async fn server_in(dir: TempDir, config: Config, parts_limit: u64) -> Server {
     let remote = Arc::new(DirRemote::open(dir.path().join("remote")).unwrap());
     let engine = Engine::open(
         dir.path().join("engine"),
@@ -45,18 +51,19 @@ async fn server_in(dir: TempDir, config: Config) -> Server {
     .await
     .unwrap();
     let engine = Arc::new(engine);
-    let config = S3Config::new(
+    let mut config = S3Config::new(
         HashMap::from([(ACCESS.to_string(), SECRET.to_string())]),
         dir.path().join("uploads"),
     );
-    s3api::reserve_waiting_parts(&engine, &config.uploads_dir)
-        .await
-        .unwrap();
+    config.uploads = Arc::new(s3api::Uploads::new(dir.path().join("uploads"), parts_limit));
+    config.uploads.rescan().await.unwrap();
+    let uploads = config.uploads.clone();
     let app = s3api::router(engine.clone(), config);
 
     Server {
         _dir: dir,
         engine,
+        uploads,
         app,
     }
 }
@@ -1380,21 +1387,23 @@ async fn test_xml_with_many_duplicate_attributes_answers_quickly() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 }
 
-async fn small_buffer() -> Server {
-    let config = Config {
-        buffer_limit: 1000,
-        ..Config::default()
-    };
-    bucket_on(server_with(config).await).await
+/// A server whose multipart parts hold at most 1000 bytes together.
+async fn small_parts() -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    bucket_on(server_in(dir, Config::default(), 1000).await).await
+}
+
+async fn initiate(server: &Server) -> String {
+    run(server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap()
 }
 
 #[tokio::test]
-async fn test_parts_count_against_the_buffer_limit() {
-    let server = small_buffer().await;
-    let id = run(&server, call("POST", "/bkt/big?uploads"))
-        .await
-        .xml("UploadId")
-        .unwrap();
+async fn test_parts_have_their_own_limit_and_plain_puts_keep_room() {
+    let server = small_parts().await;
+    let id = initiate(&server).await;
 
     let first = upload_part(&server, &id, 1, &"x".repeat(600)).await;
     let second = upload_part(&server, &id, 2, &"x".repeat(600)).await;
@@ -1402,35 +1411,37 @@ async fn test_parts_count_against_the_buffer_limit() {
 
     assert_eq!(first.status, StatusCode::OK);
     assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(second.xml("Code").unwrap(), "SlowDown");
+    assert!(
+        second.text().contains("parts_limit_bytes"),
+        "{}",
+        second.text()
+    );
+    assert_eq!(plain.status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn test_replaced_and_aborted_parts_free_their_room() {
-    let server = small_buffer().await;
-    let id = run(&server, call("POST", "/bkt/big?uploads"))
-        .await
-        .xml("UploadId")
-        .unwrap();
+    let server = small_parts().await;
+    let id = initiate(&server).await;
     upload_part(&server, &id, 1, &"x".repeat(600)).await;
 
     let replaced = upload_part(&server, &id, 1, &"x".repeat(400)).await;
     let beside = upload_part(&server, &id, 2, &"x".repeat(400)).await;
     run(&server, call("DELETE", &format!("/bkt/big?uploadId={id}"))).await;
-    let after_abort = put(&server, "other", &"x".repeat(600)).await;
+    let other = initiate(&server).await;
+    let after_abort = upload_part(&server, &other, 1, &"x".repeat(900)).await;
 
     assert_eq!(replaced.status, StatusCode::OK);
     assert_eq!(beside.status, StatusCode::OK);
     assert_eq!(after_abort.status, StatusCode::OK);
+    assert_eq!(server.uploads.held(), 900);
 }
 
 #[tokio::test]
-async fn test_complete_does_not_count_its_parts_twice() {
-    let server = small_buffer().await;
-    let id = run(&server, call("POST", "/bkt/big?uploads"))
-        .await
-        .xml("UploadId")
-        .unwrap();
+async fn test_complete_frees_the_room_of_its_parts() {
+    let server = small_parts().await;
+    let id = initiate(&server).await;
     let etag = upload_part(&server, &id, 1, &"x".repeat(600))
         .await
         .header("etag")
@@ -1448,6 +1459,7 @@ async fn test_complete_does_not_count_its_parts_twice() {
     .await;
 
     assert_eq!(completed.status, StatusCode::OK, "{}", completed.text());
+    assert_eq!(server.uploads.held(), 0);
     assert_eq!(
         run(&server, call("GET", "/bkt/big")).await.text().len(),
         600
@@ -1455,53 +1467,44 @@ async fn test_complete_does_not_count_its_parts_twice() {
 }
 
 #[tokio::test]
-async fn test_parts_of_an_earlier_process_count_against_the_buffer_limit() {
-    let config = || Config {
-        buffer_limit: 1000,
-        ..Config::default()
-    };
-    let server = bucket_on(server_with(config()).await).await;
-    let id = run(&server, call("POST", "/bkt/big?uploads"))
-        .await
-        .xml("UploadId")
-        .unwrap();
+async fn test_parts_of_an_earlier_process_count_against_the_parts_limit() {
+    let server = small_parts().await;
+    let id = initiate(&server).await;
     upload_part(&server, &id, 1, &"x".repeat(600)).await;
-    server.engine.flush().await.unwrap();
     let Server {
         _dir: dir,
         engine,
         app,
+        ..
     } = server;
     drop(app);
     drop(engine);
 
-    let server = server_in(dir, config()).await;
-    let plain = put(&server, "other", &"x".repeat(600)).await;
+    let server = server_in(dir, Config::default(), 1000).await;
+    let other = initiate(&server).await;
+    let part = upload_part(&server, &other, 1, &"x".repeat(600)).await;
 
-    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(part.status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn test_expired_uploads_free_their_room() {
-    let server = small_buffer().await;
-    let id = run(&server, call("POST", "/bkt/big?uploads"))
-        .await
-        .xml("UploadId")
-        .unwrap();
+    let server = small_parts().await;
+    let id = initiate(&server).await;
     upload_part(&server, &id, 1, &"x".repeat(600)).await;
-    let uploads_dir = server._dir.path().join("uploads");
 
-    let young = s3api::expire_uploads(&server.engine, &uploads_dir, Duration::from_secs(3600))
+    let young = server
+        .uploads
+        .expire(Duration::from_secs(3600))
         .await
         .unwrap();
-    let old = s3api::expire_uploads(&server.engine, &uploads_dir, Duration::ZERO)
-        .await
-        .unwrap();
-    let plain = put(&server, "other", &"x".repeat(600)).await;
+    let old = server.uploads.expire(Duration::ZERO).await.unwrap();
+    let other = initiate(&server).await;
+    let part = upload_part(&server, &other, 1, &"x".repeat(600)).await;
 
     assert_eq!(young, (0, 0));
     assert_eq!(old, (1, 600));
-    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(part.status, StatusCode::OK);
 }
 
 #[tokio::test]

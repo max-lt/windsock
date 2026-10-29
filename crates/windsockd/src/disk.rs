@@ -1,4 +1,4 @@
-//! The startup check that the cache and the buffer limits fit on the disk.
+//! The startup check that the cache, the buffer and the parts limits fit on the disk.
 
 use std::path::Path;
 
@@ -11,17 +11,18 @@ use tracing::{info, warn};
 pub struct Limits {
     pub cache: u64,
     pub buffer: u64,
+    pub parts: u64,
 }
 
-/// The bytes that the cache and the buffer can still take.
-pub fn growth(usage: LocalUsage, limits: Limits) -> u64 {
+/// The bytes that the cache, the buffer and the multipart parts can still take.
+pub fn growth(usage: LocalUsage, parts: u64, limits: Limits) -> u64 {
     let cache = limits.cache.saturating_sub(usage.cache);
-    let buffer = limits.buffer.saturating_sub(usage.buffer + usage.reserved);
-    cache + buffer
+    let buffer = limits.buffer.saturating_sub(usage.buffer);
+    cache + buffer + limits.parts.saturating_sub(parts)
 }
 
-/// Warns when the cache and the buffer cannot reach their limits on the disk of `dir`.
-pub fn check(dir: &Path, usage: LocalUsage, limits: Limits) {
+/// Warns when the cache, the buffer and the parts cannot reach their limits on the disk of `dir`.
+pub fn check(dir: &Path, usage: LocalUsage, parts: u64, limits: Limits) {
     let stat = match statvfs(dir) {
         Ok(stat) => stat,
         Err(e) => {
@@ -30,7 +31,7 @@ pub fn check(dir: &Path, usage: LocalUsage, limits: Limits) {
         }
     };
     let available = stat.f_bavail * stat.f_frsize;
-    let growth = growth(usage, limits);
+    let growth = growth(usage, parts, limits);
 
     if growth > available {
         warn!(
@@ -38,10 +39,12 @@ pub fn check(dir: &Path, usage: LocalUsage, limits: Limits) {
             growth,
             index = usage.index,
             cache = usage.cache,
-            buffer = usage.buffer + usage.reserved,
+            buffer = usage.buffer,
+            parts,
             cache_bytes = limits.cache,
             buffer_limit_bytes = limits.buffer,
-            "the cache and the buffer limits do not fit on the disk: lower engine.cache_bytes"
+            parts_limit_bytes = limits.parts,
+            "the cache, buffer and parts limits do not fit on the disk: lower engine.cache_bytes"
         );
         return;
     }
@@ -50,7 +53,8 @@ pub fn check(dir: &Path, usage: LocalUsage, limits: Limits) {
         growth,
         index = usage.index,
         cache = usage.cache,
-        buffer = usage.buffer + usage.reserved,
+        buffer = usage.buffer,
+        parts,
         "local disk"
     );
 }
@@ -62,6 +66,7 @@ mod tests {
     const LIMITS: Limits = Limits {
         cache: 16,
         buffer: 8,
+        parts: 4,
     };
 
     #[test]
@@ -70,10 +75,9 @@ mod tests {
             index: 100,
             cache: 6,
             buffer: 2,
-            reserved: 1,
         };
 
-        assert_eq!(growth(usage, LIMITS), 10 + 5);
+        assert_eq!(growth(usage, 1, LIMITS), 10 + 6 + 3);
     }
 
     #[test]
@@ -82,9 +86,8 @@ mod tests {
             index: 0,
             cache: 20,
             buffer: 9,
-            reserved: 3,
         };
 
-        assert_eq!(growth(usage, LIMITS), 0);
+        assert_eq!(growth(usage, 5, LIMITS), 0);
     }
 }

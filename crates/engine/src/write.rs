@@ -195,35 +195,6 @@ impl<R: Remote + 'static> Engine<R> {
         Err(EngineError::ClockAhead { wait_secs })
     }
 
-    /// Takes `bytes` of the buffer limit for data that waits outside the buffer.
-    pub async fn reserve(&self, bytes: u64) -> Result<()> {
-        let limit = self.config.buffer_limit;
-        // The buffer lock orders this check with the appends, or both could pass.
-        let buffer = self.buffer.lock().await;
-        if buffer.bytes() + self.reserved() + bytes > limit {
-            return Err(EngineError::BufferFull { limit });
-        }
-        self.reserved.fetch_add(bytes, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Adds to the reserved bytes with no check, for data that is already on disk.
-    pub fn reserve_unchecked(&self, bytes: u64) {
-        self.reserved.fetch_add(bytes, Ordering::SeqCst);
-    }
-
-    pub fn release(&self, bytes: u64) {
-        let _ = self
-            .reserved
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
-                Some(r.saturating_sub(bytes))
-            });
-    }
-
-    fn reserved(&self) -> u64 {
-        self.reserved.load(Ordering::SeqCst)
-    }
-
     /// Bytes on the local disk, by use.
     pub async fn local_usage(&self) -> Result<LocalUsage> {
         let index = self.index().disk_bytes()?;
@@ -231,7 +202,6 @@ impl<R: Remote + 'static> Engine<R> {
             index,
             cache: self.cache.as_ref().map_or(0, ChunkCache::bytes),
             buffer: self.buffered_bytes().await,
-            reserved: self.reserved(),
         })
     }
 
@@ -280,7 +250,7 @@ impl<R: Remote + 'static> Engine<R> {
             });
         }
 
-        if buffer.bytes() + self.reserved() + data.len() as u64 > limit {
+        if buffer.bytes() + data.len() as u64 > limit {
             return Err(EngineError::BufferFull { limit });
         }
 

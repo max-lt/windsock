@@ -364,22 +364,25 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         ));
     }
 
-    let s3 = s3api::S3Config::new(config.keys(), config.data_dir.join("uploads"));
-    let parts = s3api::reserve_waiting_parts(&engine, &s3.uploads_dir)
+    let mut s3 = s3api::S3Config::new(config.keys(), config.data_dir.join("uploads"));
+    s3.uploads = Arc::new(s3api::Uploads::new(
+        config.data_dir.join("uploads"),
+        config.engine.parts_limit_bytes,
+    ));
+    let parts = s3
+        .uploads
+        .rescan()
         .await
         .context("cannot read the multipart uploads")?;
     if parts > 0 {
         info!(bytes = parts, "multipart parts wait for a complete");
     }
-    let expirer = engine.clone();
-    let uploads_dir = s3.uploads_dir.clone();
+    let expirer = s3.uploads.clone();
     let max_age = Duration::from_secs(config.uploads_expire_secs);
     background.push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {
-        let (engine, dir) = (expirer.clone(), uploads_dir.clone());
+        let uploads = expirer.clone();
         async move {
-            let (count, bytes) = s3api::expire_uploads(&engine, &dir, max_age)
-                .await
-                .map_err(|e| e.to_string())?;
+            let (count, bytes) = uploads.expire(max_age).await.map_err(|e| e.to_string())?;
             if count > 0 {
                 info!(count, bytes, "removed expired multipart uploads");
             }
@@ -393,8 +396,9 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     let limits = disk::Limits {
         cache: config.engine.cache_bytes,
         buffer: config.engine.buffer_limit_bytes,
+        parts: config.engine.parts_limit_bytes,
     };
-    disk::check(&config.data_dir, usage, limits);
+    disk::check(&config.data_dir, usage, s3.uploads.held(), limits);
     let router = s3api::router(engine.clone(), s3).layer(axum::middleware::from_fn(track_requests));
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await

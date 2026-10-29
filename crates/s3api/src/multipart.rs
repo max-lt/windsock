@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -46,13 +46,65 @@ pub(crate) struct Assembled {
     pub metadata: BTreeMap<String, String>,
 }
 
-pub(crate) struct Uploads {
+/// The multipart uploads of one proxy, and the bytes that their parts hold on disk.
+pub struct Uploads {
     dir: PathBuf,
+    /// The parts of all uploads together hold at most this many bytes.
+    limit: u64,
+    held: AtomicU64,
 }
 
 impl Uploads {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+    /// Call [`Uploads::rescan`] before the first request: the parts of an earlier process count.
+    pub fn new(dir: impl Into<PathBuf>, limit: u64) -> Self {
+        Self {
+            dir: dir.into(),
+            limit,
+            held: AtomicU64::new(0),
+        }
+    }
+
+    /// Sets the held bytes to the parts on disk, and returns them.
+    pub async fn rescan(&self) -> Result<u64, S3Error> {
+        let bytes = self.all_bytes().await?;
+        self.held.store(bytes, Ordering::SeqCst);
+        Ok(bytes)
+    }
+
+    /// Bytes that the parts hold.
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<(), S3Error> {
+        let limit = self.limit;
+        self.held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                (held + bytes <= limit).then_some(held + bytes)
+            })
+            .map(|_| ())
+            .map_err(|held| {
+                S3Error::new(
+                    "SlowDown",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "multipart parts hold {held} bytes, and the limit is {limit} bytes \
+                         (parts_limit_bytes): complete or abort the uploads"
+                    ),
+                )
+            })
+    }
+
+    fn release(&self, bytes: u64) {
+        let _ = self
+            .held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                Some(held.saturating_sub(bytes))
+            });
     }
 
     /// The directory of an upload. Only 32 hex digits are an id, so no path can leave `dir`.
@@ -83,7 +135,7 @@ impl Uploads {
         Ok(meta)
     }
 
-    pub async fn initiate(
+    pub(crate) async fn initiate(
         &self,
         bucket: &str,
         key: &str,
@@ -114,14 +166,14 @@ impl Uploads {
     }
 
     /// Stores a part and returns its ETag. A part sent again replaces the old one.
-    pub async fn put_part(
+    pub(crate) async fn put_part(
         &self,
         upload_id: &str,
         bucket: &str,
         key: &str,
         number: &str,
         data: &[u8],
-    ) -> Result<(String, u64), S3Error> {
+    ) -> Result<String, S3Error> {
         let number: u16 = number
             .parse()
             .ok()
@@ -131,42 +183,40 @@ impl Uploads {
 
         let dir = self.upload_dir(upload_id)?;
         let etag = blake3::hash(data).to_hex().to_string();
-        let mut replaced = 0;
-        for ((old, old_etag), (size, _)) in part_files(&dir).await? {
-            if old == number {
-                remove_if_present(&dir.join(part_name(old, &old_etag))).await?;
-                replaced += size;
-            }
-        }
-        write_file(&dir, &part_name(number, &etag), data).await?;
-
-        Ok((etag, replaced))
-    }
-
-    /// Bytes of part `number` of an upload, or 0 when there is no such part.
-    pub async fn part_size(&self, upload_id: &str, number: &str) -> u64 {
-        let (Ok(dir), Ok(number)) = (self.upload_dir(upload_id), number.parse::<u16>()) else {
-            return 0;
-        };
-        let Ok(parts) = part_files(&dir).await else {
-            return 0;
-        };
-        parts
-            .iter()
+        let name = part_name(number, &etag);
+        let old: Vec<(String, u64)> = part_files(&dir)
+            .await?
+            .into_iter()
             .filter(|((n, _), _)| *n == number)
-            .map(|(_, (size, _))| size)
-            .sum()
+            .map(|((n, old_etag), (size, _))| (part_name(n, &old_etag), size))
+            .collect();
+        let old_size: u64 = old.iter().map(|(_, size)| size).sum();
+        let size = data.len() as u64;
+        // A part sent again replaces the old one: only its growth needs room.
+        let grow = size.saturating_sub(old_size);
+        self.reserve(grow)?;
+        if let Err(e) = write_file(&dir, &name, data).await {
+            self.release(grow);
+            return Err(e);
+        }
+        for (old_name, _) in old.iter().filter(|(old_name, _)| *old_name != name) {
+            remove_if_present(&dir.join(old_name)).await?;
+        }
+        self.release(old_size.saturating_sub(size));
+
+        Ok(etag)
     }
 
     /// Bytes that the parts of an upload hold on disk.
-    pub async fn bytes(&self, upload_id: &str) -> Result<u64, S3Error> {
+    pub(crate) async fn bytes(&self, upload_id: &str) -> Result<u64, S3Error> {
         let parts = part_files(&self.upload_dir(upload_id)?).await?;
         Ok(parts.values().map(|(size, _)| size).sum())
     }
 
-    /// Removes the uploads with no initiate and no part since `cutoff`, in Unix nanoseconds.
+    /// Removes the uploads with no initiate and no part for `max_age`, and frees their bytes.
     /// Returns the number of uploads and the bytes of their parts.
-    pub async fn expire(&self, cutoff: u64) -> Result<(usize, u64), S3Error> {
+    pub async fn expire(&self, max_age: Duration) -> Result<(usize, u64), S3Error> {
+        let cutoff = unix_nanos().saturating_sub(max_age.as_nanos() as u64);
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0)),
@@ -194,11 +244,12 @@ impl Uploads {
             count += 1;
             bytes += parts.values().map(|(size, _)| size).sum::<u64>();
         }
+        self.release(bytes);
         Ok((count, bytes))
     }
 
     /// Bytes that the parts of all uploads hold on disk.
-    pub async fn all_bytes(&self) -> Result<u64, S3Error> {
+    pub(crate) async fn all_bytes(&self) -> Result<u64, S3Error> {
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
@@ -215,7 +266,7 @@ impl Uploads {
         Ok(total)
     }
 
-    pub async fn parts(
+    pub(crate) async fn parts(
         &self,
         upload_id: &str,
         bucket: &str,
@@ -233,21 +284,23 @@ impl Uploads {
     }
 
     /// Aborting an upload that does not exist is not an error, as in S3.
-    pub async fn abort(&self, upload_id: &str, bucket: &str, key: &str) -> Result<u64, S3Error> {
+    pub(crate) async fn abort(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), S3Error> {
         match self.meta(upload_id, bucket, key).await {
             Ok(_) => {}
-            Err(e) if e.code == "NoSuchUpload" => return Ok(0),
+            Err(e) if e.code == "NoSuchUpload" => return Ok(()),
             Err(e) => return Err(e),
         }
-
-        let freed = self.bytes(upload_id).await?;
-        remove_dir(&self.upload_dir(upload_id)?).await?;
-        Ok(freed)
+        self.finish(upload_id).await
     }
 
     /// Joins the requested parts, in ascending order, each with the ETag it was given.
     /// Refuses before any read when the parts hold more than `limit` bytes together.
-    pub async fn assemble(
+    pub(crate) async fn assemble(
         &self,
         upload_id: &str,
         bucket: &str,
@@ -310,13 +363,16 @@ impl Uploads {
         })
     }
 
-    /// Removes a completed upload.
-    pub async fn finish(&self, upload_id: &str) -> Result<(), S3Error> {
-        remove_dir(&self.upload_dir(upload_id)?).await
+    /// Removes an upload and frees the bytes of its parts.
+    pub(crate) async fn finish(&self, upload_id: &str) -> Result<(), S3Error> {
+        let freed = self.bytes(upload_id).await?;
+        remove_dir(&self.upload_dir(upload_id)?).await?;
+        self.release(freed);
+        Ok(())
     }
 
     /// Uploads in progress for `bucket`: key, id, initiation time.
-    pub async fn list(&self, bucket: &str) -> Result<Vec<(String, String, u64)>, S3Error> {
+    pub(crate) async fn list(&self, bucket: &str) -> Result<Vec<(String, String, u64)>, S3Error> {
         let mut out = Vec::new();
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
             Ok(entries) => entries,
@@ -405,7 +461,7 @@ mod tests {
 
     async fn uploads() -> (tempfile::TempDir, Uploads) {
         let dir = tempfile::tempdir().unwrap();
-        let uploads = Uploads::new(dir.path());
+        let uploads = Uploads::new(dir.path(), u64::MAX);
         (dir, uploads)
     }
 
@@ -416,13 +472,11 @@ mod tests {
         let first = uploads
             .put_part(&id, "b", "k", "1", b"hello ")
             .await
-            .unwrap()
-            .0;
+            .unwrap();
         let second = uploads
             .put_part(&id, "b", "k", "2", b"world")
             .await
-            .unwrap()
-            .0;
+            .unwrap();
 
         let result = uploads
             .assemble(&id, "b", "k", &[(1, first), (2, second)], 10)
@@ -442,13 +496,11 @@ mod tests {
         let second = uploads
             .put_part(&id, "b", "k", "2", b"world")
             .await
-            .unwrap()
-            .0;
+            .unwrap();
         let first = uploads
             .put_part(&id, "b", "k", "1", b"hello ")
             .await
-            .unwrap()
-            .0;
+            .unwrap();
 
         let assembled = uploads
             .assemble(&id, "b", "k", &[(1, first), (2, second)], u64::MAX)
@@ -463,16 +515,8 @@ mod tests {
     async fn test_part_sent_again_replaces_the_old_one() {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
-        let old = uploads
-            .put_part(&id, "b", "k", "1", b"old")
-            .await
-            .unwrap()
-            .0;
-        let new = uploads
-            .put_part(&id, "b", "k", "1", b"new")
-            .await
-            .unwrap()
-            .0;
+        let old = uploads.put_part(&id, "b", "k", "1", b"old").await.unwrap();
+        let new = uploads.put_part(&id, "b", "k", "1", b"new").await.unwrap();
 
         let parts = uploads.parts(&id, "b", "k").await.unwrap();
         let stale = uploads.assemble(&id, "b", "k", &[(1, old)], u64::MAX).await;
@@ -486,7 +530,7 @@ mod tests {
     async fn test_bad_requests_are_rejected() {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
-        let etag = uploads.put_part(&id, "b", "k", "1", b"x").await.unwrap().0;
+        let etag = uploads.put_part(&id, "b", "k", "1", b"x").await.unwrap();
         let code = |r: Result<Assembled, S3Error>| r.err().unwrap().code;
 
         assert_eq!(
@@ -554,20 +598,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expire_removes_only_uploads_idle_since_the_cutoff() {
+    async fn test_expire_removes_idle_uploads_and_frees_their_bytes() {
         let (_dir, uploads) = uploads().await;
         let old = uploads.initiate("b", "old", BTreeMap::new()).await.unwrap();
         uploads
             .put_part(&old, "b", "old", "1", b"12345")
             .await
             .unwrap();
-        let cutoff = unix_nanos();
         let young = uploads
             .initiate("b", "young", BTreeMap::new())
-            .await
-            .unwrap();
-        uploads
-            .put_part(&old, "b", "old", "2", b"123")
             .await
             .unwrap();
         uploads
@@ -575,11 +614,14 @@ mod tests {
             .await
             .unwrap();
 
-        let kept = uploads.expire(cutoff).await.unwrap();
-        let freed = uploads.expire(unix_nanos() + 1).await.unwrap();
+        let kept = uploads.expire(Duration::from_secs(3600)).await.unwrap();
+        let held = uploads.held();
+        let freed = uploads.expire(Duration::ZERO).await.unwrap();
 
-        assert_eq!(kept, (0, 0), "a part after the cutoff keeps its upload");
-        assert_eq!(freed, (2, 10));
+        assert_eq!(kept, (0, 0), "a part in the last hour keeps its upload");
+        assert_eq!(held, 7);
+        assert_eq!(freed, (2, 7));
+        assert_eq!(uploads.held(), 0);
         assert!(uploads.list("b").await.unwrap().is_empty());
     }
 }

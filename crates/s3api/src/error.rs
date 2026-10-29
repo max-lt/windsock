@@ -120,7 +120,8 @@ impl IntoResponse for S3Error {
         let mut response = Response::builder()
             .status(self.status)
             .header("content-type", "application/xml");
-        // A 503 clears by itself: a full buffer uploads, a stopping proxy hands over to another.
+        // A 503 clears when a full buffer uploads, a stopping proxy hands over, the wall clock
+        // catches up, or clients complete or abort their uploads.
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             response = response.header("retry-after", RETRY_AFTER_SECS);
         }

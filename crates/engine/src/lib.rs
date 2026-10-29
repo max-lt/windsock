@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -169,8 +169,6 @@ pub struct LocalUsage {
     pub index: u64,
     pub cache: u64,
     pub buffer: u64,
-    /// Accepted data outside the buffer, such as multipart parts.
-    pub reserved: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,8 +263,6 @@ pub struct Engine<R> {
     clock_ahead: AtomicBool,
     /// The highest own HLC that the open found, and where: the operator sees what holds the clock.
     own_high: Mutex<(u64, &'static str)>,
-    /// Accepted bytes outside the buffer, such as multipart parts. They count against `buffer_limit`.
-    reserved: AtomicU64,
     /// When this process first saw each object that waits for a GC delete.
     gc_waits: gc::Waits,
     /// Snapshot bases with parts and no head, and when this node first listed each one
@@ -534,7 +530,6 @@ impl<R: Remote + 'static> Engine<R> {
             buffer_failing: AtomicBool::new(false),
             clock_ahead: AtomicBool::new(false),
             own_high: Mutex::new(own_high),
-            reserved: AtomicU64::new(0),
             gc_waits: gc::Waits::default(),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),

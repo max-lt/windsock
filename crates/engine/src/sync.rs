@@ -135,19 +135,19 @@ impl<R: Remote + 'static> Engine<R> {
         planned.older_than(self.config.gc_horizon / 2)
     }
 
-    /// Runs `op`. On a missing bucket or key, syncs once and runs it again,
-    /// unless a sync ran in the last second.
+    /// Runs `op`. On a missing bucket or key, or a failed precondition, syncs once and runs it
+    /// again, unless a sync ran in the last second: a proxy behind gives a false answer.
     pub(crate) async fn retry_after_sync<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         match op().await {
-            Err(EngineError::NoSuchBucket(_) | EngineError::NoSuchKey { .. })
-                if self.sync_if_due().await? =>
-            {
-                op().await
-            }
+            Err(
+                EngineError::NoSuchBucket(_)
+                | EngineError::NoSuchKey { .. }
+                | EngineError::PreconditionFailed { .. },
+            ) if self.sync_if_due().await? => op().await,
             result => result,
         }
     }

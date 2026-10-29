@@ -1088,3 +1088,118 @@ async fn test_reader_fails_on_a_bad_chunk_and_does_not_end_early() {
         "a bad chunk fails the read: {rest:?}"
     );
 }
+
+/// A remote that gives garbage for each manifest, or holds each manifest read, on request.
+#[derive(Default)]
+struct ManifestGate {
+    inner: MemoryRemote,
+    /// 0: normal, 1: garbage, 2: the read waits for ever.
+    mode: std::sync::atomic::AtomicU8,
+}
+
+#[async_trait::async_trait]
+impl Remote for ManifestGate {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.create(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        if key.starts_with(engine::MANIFESTS_PREFIX) {
+            match self.mode.load(Ordering::SeqCst) {
+                1 => return Ok(Some(Bytes::from_static(b"garbage"))),
+                2 => std::future::pending::<()>().await,
+                _ => {}
+            }
+        }
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+        self.inner.list(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn test_if_match_on_an_index_miss_does_not_hold_other_writes() {
+    let remote = Arc::new(ManifestGate::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    // Many chunks: the manifest is too large to go inline in the entry.
+    let big = a
+        .engine
+        .put(
+            BUCKET,
+            "k",
+            Bytes::from(random_bytes(7, 8 * 1024 * 1024)),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+    remote.mode.store(1, Ordering::SeqCst);
+    let b = proxy(&remote, 2).await;
+    remote.mode.store(2, Ordering::SeqCst);
+
+    let if_match = b.engine.put(
+        BUCKET,
+        "k",
+        Bytes::from("new"),
+        BTreeMap::new(),
+        WriteMode::IfMatch(vec![big.content_hash]),
+    );
+    let other = async {
+        // The conditional put starts first and waits on the remote.
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(5), put(&b.engine, "other", b"plain")).await
+    };
+
+    tokio::select! {
+        r = if_match => panic!("the manifest read waits for ever: {r:?}"),
+        r = other => r.expect("a plain put waits for a conditional put"),
+    }
+    assert_eq!(get(&b.engine, "other").await.unwrap(), b"plain");
+}
+
+#[tokio::test]
+async fn test_if_match_on_a_proxy_behind_syncs_before_it_refuses() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "k", b"v1").await;
+    a.engine.flush().await.unwrap();
+    let b = proxy(&remote, 2).await;
+    let v2 = a
+        .engine
+        .put(
+            BUCKET,
+            "k",
+            Bytes::from("v2"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+
+    b.engine
+        .put(
+            BUCKET,
+            "k",
+            Bytes::from("v3"),
+            BTreeMap::new(),
+            WriteMode::IfMatch(vec![v2.content_hash]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get(&b.engine, "k").await.unwrap(), b"v3");
+}

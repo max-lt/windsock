@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// A conditional put reads a missing manifest at most this many times, then fails with 412: the
+/// version changes under it each time.
+const MATCH_ATTEMPTS: usize = 3;
+
 impl<R: Remote + 'static> Engine<R> {
     /// Stores an object. Returns once the write survives a crash of this proxy.
     pub async fn put(
@@ -29,22 +33,33 @@ impl<R: Remote + 'static> Engine<R> {
 
         let (info, record) = self
             .retry_after_sync(|| async move {
-                let mut buffer = self.buffer.lock().await;
-                self.require_bucket(&buffer, bucket)?;
+                let mut attempts = 0;
+                let (mut buffer, allowed) = loop {
+                    let buffer = self.buffer.lock().await;
+                    self.require_bucket(&buffer, bucket)?;
 
-                let current = self.current(&buffer, bucket, key)?;
-                let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
-                if needs_object && !current.exists() {
-                    return Err(read::no_such_key(bucket, key));
-                }
-                let allowed = match mode {
-                    _ if create_only => !current.exists(),
-                    WriteMode::IfExists => true,
-                    WriteMode::IfMatch(hashes) => self
-                        .content_hash(current)
-                        .await?
-                        .is_some_and(|hash| hashes.contains(&hash)),
-                    WriteMode::Overwrite | WriteMode::CreateOnly => true,
+                    let current = self.current(&buffer, bucket, key)?;
+                    let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
+                    if needs_object && !current.exists() {
+                        return Err(read::no_such_key(bucket, key));
+                    }
+                    let allowed = match mode {
+                        _ if create_only => !current.exists(),
+                        WriteMode::IfExists => true,
+                        WriteMode::IfMatch(hashes) => match self.local_content_hash(&current)? {
+                            Some(hash) => hashes.contains(&hash),
+                            // A remote read under the buffer lock would hold every write.
+                            None if attempts < MATCH_ATTEMPTS => {
+                                drop(buffer);
+                                attempts += 1;
+                                self.content_hash(current).await?;
+                                continue;
+                            }
+                            None => false,
+                        },
+                        WriteMode::Overwrite | WriteMode::CreateOnly => true,
+                    };
+                    break (buffer, allowed);
                 };
                 if !allowed {
                     return Err(EngineError::PreconditionFailed {

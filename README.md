@@ -222,7 +222,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   `*`). A mismatch gets 412 `PreconditionFailed`. `If-Match` on a missing key gets 404 `NoSuchKey`.
   The check and the write are one step on one proxy. Across proxies there is no check: two
   proxies can pass the check on the same ETag, and the index keeps one write by LWW and marks the
-  key as a conflict. The check costs one manifest read when the manifest is not in the index.
+  key as a conflict. A proxy behind can see an older version: on a mismatch it syncs once and
+  checks again, so it answers 412 only for a version that it cannot see. A pass on an old version
+  stays possible across proxies. The check costs one manifest read when the manifest is not in
+  the index, done outside the buffer lock.
 - Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
 - A multipart upload must complete on the proxy that started it.
 - A GET streams the object in pieces of at most 4 MiB. One GET holds at most about 16 MiB: the

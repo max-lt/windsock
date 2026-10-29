@@ -222,6 +222,19 @@ impl<R: Remote + 'static> Engine<R> {
         }
     }
 
+    /// The content hash of the current object from local state only. `None` when the manifest
+    /// of a stored version is not in the index.
+    pub(crate) fn local_content_hash(&self, current: &Current) -> Result<Option<[u8; 32]>> {
+        match current {
+            Current::Absent => Ok(None),
+            Current::Buffered(put) => Ok(Some(put.content_hash)),
+            Current::Stored { manifest_id, .. } => match self.index().manifest(*manifest_id)? {
+                Some(bytes) => Ok(Some(Manifest::decode(*manifest_id, &bytes)?.content_hash)),
+                None => Ok(None),
+            },
+        }
+    }
+
     /// The content hash of the current object, or `None` when there is none.
     pub(crate) async fn content_hash(&self, current: Current) -> Result<Option<[u8; 32]>> {
         match current {

@@ -21,6 +21,7 @@ use engine::{Engine, ObjectInfo, ObjectReader, WriteMode};
 use remote::Remote;
 use tracing::{info, warn};
 
+use crate::multipart::Claim;
 use crate::xml::{self, ListPage, ListedObject};
 use crate::{AppState, Caller, S3Error};
 use s3proto::time::http_date;

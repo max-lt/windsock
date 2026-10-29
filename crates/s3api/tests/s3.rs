@@ -56,7 +56,7 @@ async fn server_in(dir: TempDir, config: Config, parts_limit: u64) -> Server {
         dir.path().join("uploads"),
     );
     config.uploads = Arc::new(s3api::Uploads::new(dir.path().join("uploads"), parts_limit));
-    config.uploads.rescan().await.unwrap();
+    config.uploads.start().await.unwrap();
     let uploads = config.uploads.clone();
     let app = s3api::router(engine.clone(), config);
 
@@ -1715,4 +1715,32 @@ async fn test_conditional_header_that_is_not_ascii_is_refused() {
         );
     }
     assert_eq!(run(&server, call("GET", "/bkt/k")).await.text(), "v1");
+}
+
+#[tokio::test]
+async fn test_two_completes_of_one_upload_free_its_room_once() {
+    let server = small_parts().await;
+    let id = initiate(&server).await;
+    let etag = upload_part(&server, &id, 1, &"x".repeat(600))
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    let other = initiate(&server).await;
+    upload_part(&server, &other, 1, &"y".repeat(300)).await;
+    let uri = format!("/bkt/big?uploadId={id}");
+
+    let (a, b) = tokio::join!(
+        run(&server, call("POST", &uri).body(body.clone())),
+        run(&server, call("POST", &uri).body(body)),
+    );
+
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
+    assert_eq!(server.uploads.held(), 300, "the other upload still counts");
 }

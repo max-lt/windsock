@@ -36,7 +36,7 @@ pub const DEFAULT_PARTS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 pub struct S3Config {
     /// Access key to secret key.
     pub keys: HashMap<String, String>,
-    /// The multipart uploads. Call [`Uploads::rescan`] before the first request.
+    /// The multipart uploads. Call [`Uploads::start`] before the first request.
     pub uploads: Arc<Uploads>,
     /// Requests with a larger body fail.
     pub max_body: usize,

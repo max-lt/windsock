@@ -155,6 +155,8 @@ fn default_request_timeout() -> u64 {
     300
 }
 
+const MIN_UPLOADS_EXPIRE_SECS: u64 = 3600;
+
 fn default_uploads_expire() -> u64 {
     7 * 24 * 3600
 }
@@ -179,6 +181,14 @@ impl Config {
             bail!(
                 "{}: at least one [[keys]] entry is required",
                 path.display()
+            );
+        }
+        // A short expiry removes uploads that clients still write.
+        if config.uploads_expire_secs < MIN_UPLOADS_EXPIRE_SECS {
+            bail!(
+                "{}: uploads_expire_secs is {}, under the minimum of {MIN_UPLOADS_EXPIRE_SECS}",
+                path.display(),
+                config.uploads_expire_secs
             );
         }
 
@@ -367,5 +377,19 @@ mod tests {
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn test_upload_expiry_under_one_hour_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windsock.toml");
+        let config = Config::local().unwrap();
+        let mut text = toml::to_string(&config).unwrap();
+        text = text.replace("uploads_expire_secs = 604800", "uploads_expire_secs = 0");
+        std::fs::write(&path, text).unwrap();
+
+        let error = Config::load(&path).unwrap_err().to_string();
+
+        assert!(error.contains("uploads_expire_secs"), "{error}");
     }
 }

@@ -371,7 +371,7 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     ));
     let parts = s3
         .uploads
-        .rescan()
+        .start()
         .await
         .context("cannot read the multipart uploads")?;
     if parts > 0 {

@@ -216,27 +216,37 @@ pub(crate) async fn object_post<R: Remote + 'static>(
 
     let mode = write_mode(&headers)?;
     let requested = xml::parse_complete(&body)?;
-    let assembled = state
+    // One complete owns the upload: a second one at the same time gets NoSuchUpload.
+    let claimed = state
         .uploads
-        .assemble(
-            upload_id,
-            &bucket,
-            &key,
-            &requested,
-            state.engine.max_object_size(),
-        )
+        .claim(upload_id, &bucket, &key, Claim::Complete)
         .await?;
-    let info = state
-        .engine
-        .put(
-            &bucket,
-            &key,
-            Bytes::from(assembled.data),
-            assembled.metadata,
-            mode,
-        )
-        .await?;
-    state.uploads.finish(upload_id).await?;
+    let written = async {
+        let assembled = state
+            .uploads
+            .assemble(&claimed, &requested, state.engine.max_object_size())
+            .await?;
+        let info = state
+            .engine
+            .put(
+                &bucket,
+                &key,
+                Bytes::from(assembled.data),
+                assembled.metadata,
+                mode,
+            )
+            .await?;
+        Ok::<_, S3Error>(info)
+    }
+    .await;
+    let info = match written {
+        Ok(info) => info,
+        Err(e) => {
+            state.uploads.unclaim(upload_id, &claimed).await?;
+            return Err(e);
+        }
+    };
+    state.uploads.remove(&claimed).await?;
 
     info!(
         bucket,

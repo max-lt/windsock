@@ -81,6 +81,22 @@ pub async fn reserve_waiting_parts<R: Remote + 'static>(
     Ok(bytes)
 }
 
+/// Removes the uploads with no initiate and no part for `max_age`, and frees their room in the
+/// buffer limit. Returns the number of uploads and the bytes of their parts.
+pub async fn expire_uploads<R: Remote + 'static>(
+    engine: &Engine<R>,
+    uploads_dir: &std::path::Path,
+    max_age: std::time::Duration,
+) -> Result<(usize, u64), S3Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let cutoff = now.saturating_sub(max_age.as_nanos() as u64);
+    let (count, bytes) = Uploads::new(uploads_dir).expire(cutoff).await?;
+    engine.release(bytes);
+    Ok((count, bytes))
+}
+
 /// The S3 routes. Serve it with `axum::serve`.
 pub fn router<R: Remote + 'static>(engine: Arc<Engine<R>>, config: S3Config) -> Router {
     let state = AppState {

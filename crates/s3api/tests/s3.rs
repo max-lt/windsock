@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -1479,4 +1479,27 @@ async fn test_parts_of_an_earlier_process_count_against_the_buffer_limit() {
     let plain = put(&server, "other", &"x".repeat(600)).await;
 
     assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_expired_uploads_free_their_room() {
+    let server = small_buffer().await;
+    let id = run(&server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap();
+    upload_part(&server, &id, 1, &"x".repeat(600)).await;
+    let uploads_dir = server._dir.path().join("uploads");
+
+    let young = s3api::expire_uploads(&server.engine, &uploads_dir, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let old = s3api::expire_uploads(&server.engine, &uploads_dir, Duration::ZERO)
+        .await
+        .unwrap();
+    let plain = put(&server, "other", &"x".repeat(600)).await;
+
+    assert_eq!(young, (0, 0));
+    assert_eq!(old, (1, 600));
+    assert_eq!(plain.status, StatusCode::OK);
 }

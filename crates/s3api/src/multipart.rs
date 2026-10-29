@@ -164,6 +164,39 @@ impl Uploads {
         Ok(parts.values().map(|(size, _)| size).sum())
     }
 
+    /// Removes the uploads with no initiate and no part since `cutoff`, in Unix nanoseconds.
+    /// Returns the number of uploads and the bytes of their parts.
+    pub async fn expire(&self, cutoff: u64) -> Result<(usize, u64), S3Error> {
+        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(io(e)),
+        };
+        let (mut count, mut bytes) = (0, 0);
+        while let Some(entry) = entries.next_entry().await.map_err(io)? {
+            if !entry.file_type().await.map_err(io)?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            let initiated = match tokio::fs::read(dir.join(META)).await {
+                Ok(meta) => postcard::from_bytes::<UploadMeta>(&meta).map_or(0, |m| m.initiated),
+                Err(_) => 0,
+            };
+            let parts = part_files(&dir).await?;
+            let last = parts
+                .values()
+                .map(|(_, time)| *time)
+                .fold(initiated, u64::max);
+            if last >= cutoff {
+                continue;
+            }
+            remove_dir(&dir).await?;
+            count += 1;
+            bytes += parts.values().map(|(size, _)| size).sum::<u64>();
+        }
+        Ok((count, bytes))
+    }
+
     /// Bytes that the parts of all uploads hold on disk.
     pub async fn all_bytes(&self) -> Result<u64, S3Error> {
         let mut entries = match tokio::fs::read_dir(&self.dir).await {
@@ -518,5 +551,35 @@ mod tests {
             uploads.parts(&a, "b", "k1").await.err().unwrap().code,
             "NoSuchUpload"
         );
+    }
+
+    #[tokio::test]
+    async fn test_expire_removes_only_uploads_idle_since_the_cutoff() {
+        let (_dir, uploads) = uploads().await;
+        let old = uploads.initiate("b", "old", BTreeMap::new()).await.unwrap();
+        uploads
+            .put_part(&old, "b", "old", "1", b"12345")
+            .await
+            .unwrap();
+        let cutoff = unix_nanos();
+        let young = uploads
+            .initiate("b", "young", BTreeMap::new())
+            .await
+            .unwrap();
+        uploads
+            .put_part(&old, "b", "old", "2", b"123")
+            .await
+            .unwrap();
+        uploads
+            .put_part(&young, "b", "young", "1", b"xy")
+            .await
+            .unwrap();
+
+        let kept = uploads.expire(cutoff).await.unwrap();
+        let freed = uploads.expire(unix_nanos() + 1).await.unwrap();
+
+        assert_eq!(kept, (0, 0), "a part after the cutoff keeps its upload");
+        assert_eq!(freed, (2, 10));
+        assert!(uploads.list("b").await.unwrap().is_empty());
     }
 }

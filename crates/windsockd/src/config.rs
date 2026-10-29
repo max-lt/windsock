@@ -51,6 +51,9 @@ pub struct Config {
     /// Seconds that a body upload can stop before the request is cut.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// A multipart upload with no initiate and no part for this time is removed, with its parts.
+    #[serde(default = "default_uploads_expire")]
+    pub uploads_expire_secs: u64,
     #[serde(default)]
     pub engine: EngineConfig,
     #[serde(default)]
@@ -149,6 +152,10 @@ fn default_request_timeout() -> u64 {
     300
 }
 
+fn default_uploads_expire() -> u64 {
+    7 * 24 * 3600
+}
+
 fn default_sync_interval() -> u64 {
     10
 }
@@ -227,6 +234,7 @@ impl Config {
             max_connections: None,
             idle_timeout_secs: default_idle_timeout(),
             request_timeout_secs: default_request_timeout(),
+            uploads_expire_secs: default_uploads_expire(),
             engine: EngineConfig::default(),
             gc: GcConfig::default(),
         })

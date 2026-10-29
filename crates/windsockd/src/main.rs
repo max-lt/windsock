@@ -43,6 +43,8 @@ const REPO_KEY_FILE: &str = "repo.key";
 const SHUTDOWN_RETRY: Duration = Duration::from_secs(5);
 /// At most one warning in this time while the final flush fails.
 const SHUTDOWN_WARN_EVERY: Duration = Duration::from_secs(60);
+/// The expiry runs this often, so an upload lives at most this long past `uploads_expire_secs`.
+const UPLOADS_EXPIRE_EVERY: Duration = Duration::from_secs(3600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -369,6 +371,21 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     if parts > 0 {
         info!(bytes = parts, "multipart parts wait for a complete");
     }
+    let expirer = engine.clone();
+    let uploads_dir = s3.uploads_dir.clone();
+    let max_age = Duration::from_secs(config.uploads_expire_secs);
+    background.push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {
+        let (engine, dir) = (expirer.clone(), uploads_dir.clone());
+        async move {
+            let (count, bytes) = s3api::expire_uploads(&engine, &dir, max_age)
+                .await
+                .map_err(|e| e.to_string())?;
+            if count > 0 {
+                info!(count, bytes, "removed expired multipart uploads");
+            }
+            Ok(())
+        }
+    }));
     let usage = engine
         .local_usage()
         .await

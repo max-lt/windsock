@@ -235,9 +235,16 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   clean end. A GET of an object that a client deletes or overwrites keeps working until the GC
   deletes its packs, at least R + H after the delete (48 h by default). A GET that runs longer is
   cut.
+- Measured on macOS, one daemon, a 1 GiB object, readers at 200 KiB/s: an idle daemon holds
+  17 MiB; 64 readers peak at 664 MiB, 250 readers at 1.6 GiB, and 288 connected readers at
+  2.2 GiB, so 5 to 10 MiB per reader. After the readers stop, the allocator keeps about 1.3 GiB,
+  and three more runs of 250 readers do not raise it.
+- A client that stops reading a GET body holds its stream until `idle_timeout_secs` (60 s by
+  default) after the last write that made progress. Then the daemon closes the connection. A client
+  that reads slowly keeps it open: there is no minimum rate.
 - A PUT, a CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB
   per request. No limit covers all requests together: 10 parallel PUTs of 5 GiB need 50 GiB of
-  memory. Size the memory for the largest objects times the parallel uploads, or put a limit in
+  memory. A PUT of 1 GiB raised the daemon to 3.1 GiB. Size the memory for the largest objects times the parallel uploads, or put a limit in
   front of the proxy.
 
 ## Scale

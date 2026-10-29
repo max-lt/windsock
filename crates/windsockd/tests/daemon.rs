@@ -699,3 +699,46 @@ async fn test_all_connections_stay_under_the_descriptor_limit() {
     );
     assert!(daemon.stop());
 }
+
+/// A client that stops reading a GET body holds its stream until the idle timeout, counted from
+/// the last write that made progress. Then the daemon closes the connection, and the client gets
+/// fewer bytes than the length.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reader_that_stops_reading_is_cut_after_the_idle_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let text = text.replace(
+        "sync_interval_secs = 1\n",
+        "sync_interval_secs = 1\nidle_timeout_secs = 2\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let keys = common::test_keys();
+    let daemon = common::start(&config, "info");
+    let size = 64 << 20;
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; size]).await;
+
+    let mut stream = tokio::net::TcpStream::connect(&daemon.address)
+        .await
+        .unwrap();
+    let mut request = "GET /demo/k HTTP/1.1\r\n".to_string();
+    for (name, value) in common::signed_headers(&daemon, &keys, "GET", "/demo/k", b"") {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    // The client reads nothing for longer than the idle timeout: both socket buffers fill.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let mut received = Vec::new();
+    let read =
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut received)).await;
+
+    assert!(read.is_ok(), "the daemon kept a stalled stream open");
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    assert!(received.len() < size, "{} bytes of {size}", received.len());
+    assert!(daemon.stop());
+}

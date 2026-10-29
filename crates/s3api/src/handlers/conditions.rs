@@ -20,6 +20,39 @@ pub(super) fn etag_matches(list: &str, etag: &str) -> bool {
     })
 }
 
+/// The check that the conditional write headers ask of the current object.
+pub(super) fn write_mode(headers: &HeaderMap) -> Result<WriteMode, S3Error> {
+    match (
+        header(headers, "if-match"),
+        header(headers, "if-none-match"),
+    ) {
+        (None, None) => Ok(WriteMode::Overwrite),
+        (None, Some("*")) => Ok(WriteMode::CreateOnly),
+        (None, Some(_)) => Err(S3Error::not_implemented(
+            "If-None-Match on a write takes only '*'",
+        )),
+        (Some(list), None) => Ok(if_match(list)),
+        (Some(_), Some(_)) => Err(S3Error::not_implemented(
+            "If-Match with If-None-Match on a write is not supported",
+        )),
+    }
+}
+
+/// An ETag is the hex content hash, so a tag that is not 64 hex digits matches no object.
+fn if_match(list: &str) -> WriteMode {
+    let mut hashes = Vec::new();
+    for candidate in list.split(',').map(str::trim) {
+        if candidate == "*" {
+            return WriteMode::IfExists;
+        }
+        let mut hash = [0u8; 32];
+        if hex::decode_to_slice(candidate.trim_matches('"'), &mut hash).is_ok() {
+            hashes.push(hash);
+        }
+    }
+    WriteMode::IfMatch(hashes)
+}
+
 pub(super) fn precondition(headers: &HeaderMap, info: &ObjectInfo) -> Precondition {
     let etag = etag(info);
     let modified = info.last_modified / 1_000_000_000;

@@ -1,6 +1,6 @@
 //! Object operations and multipart uploads.
 
-use super::conditions::{Precondition, byte_range, not_modified, precondition};
+use super::conditions::{Precondition, byte_range, not_modified, precondition, write_mode};
 use super::*;
 
 pub(crate) async fn object_put<R: Remote + 'static>(
@@ -42,20 +42,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         return copy_object(&state, source, &bucket, &key, &headers).await;
     }
 
-    if headers.contains_key("if-match") {
-        return Err(S3Error::not_implemented(
-            "If-Match on PutObject is not supported",
-        ));
-    }
-    let mode = match header(&headers, "if-none-match") {
-        Some("*") => WriteMode::CreateOnly,
-        Some(_) => {
-            return Err(S3Error::not_implemented(
-                "If-None-Match on PutObject takes only '*'",
-            ));
-        }
-        None => WriteMode::Overwrite,
-    };
+    let mode = write_mode(&headers)?;
 
     let info = state
         .engine
@@ -230,6 +217,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
         ));
     };
 
+    let mode = write_mode(&headers)?;
     let requested = xml::parse_complete(&body)?;
     let assembled = state
         .uploads
@@ -251,7 +239,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
             &key,
             Bytes::from(assembled.data),
             assembled.metadata,
-            WriteMode::Overwrite,
+            mode,
         )
         .await;
     let info = match info {

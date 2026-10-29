@@ -25,14 +25,28 @@ impl<R: Remote + 'static> Engine<R> {
         let policy = self.config.policy(bucket, key);
         let create_only = mode == WriteMode::CreateOnly || policy.create_only;
         let content_hash = *blake3::hash(&data).as_bytes();
-        let (data, metadata) = (&data, &metadata);
+        let (data, metadata, mode) = (&data, &metadata, &mode);
 
         let (info, record) = self
             .retry_after_sync(|| async move {
                 let mut buffer = self.buffer.lock().await;
                 self.require_bucket(&buffer, bucket)?;
 
-                if create_only && self.current(&buffer, bucket, key)?.exists() {
+                let current = self.current(&buffer, bucket, key)?;
+                let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
+                if needs_object && !current.exists() {
+                    return Err(read::no_such_key(bucket, key));
+                }
+                let allowed = match mode {
+                    _ if create_only => !current.exists(),
+                    WriteMode::IfExists => true,
+                    WriteMode::IfMatch(hashes) => self
+                        .content_hash(current)
+                        .await?
+                        .is_some_and(|hash| hashes.contains(&hash)),
+                    WriteMode::Overwrite | WriteMode::CreateOnly => true,
+                };
+                if !allowed {
                     return Err(EngineError::PreconditionFailed {
                         bucket: bucket.to_string(),
                         key: key.to_string(),

@@ -910,3 +910,79 @@ async fn test_flush_splits_actions_over_the_entry_cap_into_more_entries() {
         assert_eq!(&object.data[..], &[7u8; 200]);
     }
 }
+
+#[tokio::test]
+async fn test_if_match_puts_only_over_the_expected_version() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let put_if = |data: &'static str, mode: WriteMode| {
+        a.engine
+            .put(BUCKET, "k", Bytes::from(data), BTreeMap::new(), mode)
+    };
+
+    let absent = put_if("x", WriteMode::IfExists).await;
+    let first = put_if("first", WriteMode::Overwrite).await.unwrap();
+    let wrong = put_if("x", WriteMode::IfMatch(vec![[9u8; 32]])).await;
+    let buffered = put_if("second", WriteMode::IfMatch(vec![first.content_hash]))
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+    let stale = put_if("x", WriteMode::IfMatch(vec![first.content_hash])).await;
+    let stored = put_if("third", WriteMode::IfMatch(vec![buffered.content_hash])).await;
+    let any = put_if("fourth", WriteMode::IfExists).await;
+
+    assert!(matches!(absent, Err(EngineError::NoSuchKey { .. })));
+    for refused in [wrong, stale] {
+        assert!(matches!(
+            refused,
+            Err(EngineError::PreconditionFailed { .. })
+        ));
+    }
+    stored.unwrap();
+    any.unwrap();
+    assert_eq!(get(&a.engine, "k").await.unwrap(), b"fourth");
+}
+
+#[tokio::test]
+async fn test_if_match_on_two_proxies_both_pass_and_the_race_is_a_conflict() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    let b = proxy(&remote, 2).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let base = a
+        .engine
+        .put(
+            BUCKET,
+            "k",
+            Bytes::from("base"),
+            BTreeMap::new(),
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    a.engine.flush().await.unwrap();
+    b.engine.sync().await.unwrap();
+
+    for (proxy, data) in [(&a, "from a"), (&b, "from b")] {
+        proxy
+            .engine
+            .put(
+                BUCKET,
+                "k",
+                Bytes::from(data),
+                BTreeMap::new(),
+                WriteMode::IfMatch(vec![base.content_hash]),
+            )
+            .await
+            .unwrap();
+        proxy.engine.flush().await.unwrap();
+    }
+    a.engine.sync().await.unwrap();
+    b.engine.sync().await.unwrap();
+
+    let seen_by_a = a.engine.head(BUCKET, "k").await.unwrap();
+    let seen_by_b = b.engine.head(BUCKET, "k").await.unwrap();
+    assert!(seen_by_a.conflicted);
+    assert_eq!(seen_by_a, seen_by_b, "both proxies pick the same winner");
+}

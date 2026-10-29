@@ -144,12 +144,17 @@ pub enum EngineError {
 
 type Result<T> = std::result::Result<T, EngineError>;
 
-/// What a put does when the key exists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a put requires of the current object. Each check is strict through one proxy; across
+/// proxies a race becomes a conflict.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteMode {
     Overwrite,
-    /// `If-None-Match: *`. Strict through one proxy; across proxies a race becomes a conflict.
+    /// `If-None-Match: *`: no current object.
     CreateOnly,
+    /// `If-Match: *`: a current object.
+    IfExists,
+    /// `If-Match`: a current object with one of these content hashes.
+    IfMatch(Vec<[u8; 32]>),
 }
 
 /// Bytes on the local disk, by use. Only the cache can shrink.

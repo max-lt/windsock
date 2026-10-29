@@ -601,8 +601,8 @@ async fn test_conditional_requests() {
     assert_eq!(head_since.status, StatusCode::NOT_MODIFIED);
     assert_eq!(create_only.status, StatusCode::PRECONDITION_FAILED);
     assert_eq!(fresh_key.status, StatusCode::OK);
-    assert_eq!(if_match_put.status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(run(&server, call("GET", "/bkt/k")).await.text(), "v1");
+    assert_eq!(if_match_put.status, StatusCode::OK);
+    assert_eq!(run(&server, call("GET", "/bkt/k")).await.text(), "v3");
 }
 
 #[tokio::test]
@@ -1502,4 +1502,79 @@ async fn test_expired_uploads_free_their_room() {
     assert_eq!(young, (0, 0));
     assert_eq!(old, (1, 600));
     assert_eq!(plain.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_if_match_put_follows_s3() {
+    let server = with_bucket().await;
+    let etag = put(&server, "k", "v1")
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    let put_if = async |key: &str, value: String| {
+        let uri = format!("/bkt/{key}");
+        run(
+            &server,
+            call("PUT", &uri).header("if-match", value).body("new"),
+        )
+        .await
+    };
+
+    let missing = put_if("absent", "*".into()).await;
+    let wrong = put_if("k", "\"0000\"".into()).await;
+    let listed = put_if("k", format!("\"x\", {etag}")).await;
+    let any = put_if("k", "*".into()).await;
+    let both = run(
+        &server,
+        call("PUT", "/bkt/k")
+            .header("if-match", "*")
+            .header("if-none-match", "*")
+            .body("x"),
+    )
+    .await;
+
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.xml("Code").unwrap(), "NoSuchKey");
+    assert_eq!(wrong.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(any.status, StatusCode::OK);
+    assert_eq!(both.status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn test_complete_takes_the_conditional_write_headers() {
+    let server = with_bucket().await;
+    put(&server, "big", "old").await;
+    let complete = async |name: &str, value: &str| {
+        let id = run(&server, call("POST", "/bkt/big?uploads"))
+            .await
+            .xml("UploadId")
+            .unwrap();
+        let etag = upload_part(&server, &id, 1, "part")
+            .await
+            .header("etag")
+            .unwrap()
+            .to_string();
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
+             </Part></CompleteMultipartUpload>"
+        );
+        run(
+            &server,
+            call("POST", &format!("/bkt/big?uploadId={id}"))
+                .header(name, value)
+                .body(body),
+        )
+        .await
+    };
+
+    let exists = complete("if-none-match", "*").await;
+    let wrong = complete("if-match", "\"0000\"").await;
+    let any = complete("if-match", "*").await;
+
+    assert_eq!(exists.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(wrong.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(any.status, StatusCode::OK);
+    assert_eq!(run(&server, call("GET", "/bkt/big")).await.text(), "part");
 }

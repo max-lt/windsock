@@ -123,6 +123,17 @@ impl<R: Remote + 'static> Engine<R> {
         }
     }
 
+    /// The content hash of the current object, or `None` when there is none.
+    pub(crate) async fn content_hash(&self, current: Current) -> Result<Option<[u8; 32]>> {
+        match current {
+            Current::Absent => Ok(None),
+            Current::Buffered(put) => Ok(Some(put.content_hash)),
+            Current::Stored { manifest_id, .. } => {
+                Ok(Some(self.manifest(manifest_id).await?.content_hash))
+            }
+        }
+    }
+
     /// The manifest from the index, or from the remote on a miss.
     pub(crate) async fn manifest(&self, id: ObjectId) -> Result<Manifest> {
         if let Some(bytes) = self.index().manifest(id)? {

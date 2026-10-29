@@ -218,6 +218,11 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Keys come from the configuration file. There are no per-bucket permissions.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.
+- A PUT and a CompleteMultipartUpload take `If-None-Match: *` and `If-Match` (a list of ETags, or
+  `*`). A mismatch gets 412 `PreconditionFailed`. `If-Match` on a missing key gets 404 `NoSuchKey`.
+  The check and the write are one step on one proxy. Across proxies there is no check: two
+  proxies can pass the check on the same ETag, and the index keeps one write by LWW and marks the
+  key as a conflict. The check costs one manifest read when the manifest is not in the index.
 - Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
 - A multipart upload must complete on the proxy that started it.
 - The proxy holds the whole body of a request in memory, up to 5 GiB per request. No limit

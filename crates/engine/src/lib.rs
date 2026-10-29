@@ -35,7 +35,7 @@ use journal::{Action, Commit, Entry, HybridClock, Journal, JournalError};
 pub use list::{ListAfter, ListEntry, ListPage, ListQuery};
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
-pub use read::{ObjectReader, READ_STEP};
+pub use read::{ObjectReader, READ_STEP, ReadRoom};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
 use tokio::sync::Notify;
@@ -74,6 +74,8 @@ pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
 /// in one entry. Measured worst records give an entry of 1.02 times their segment: far under
 /// MAX_ENTRY.
 pub const MAX_PACK_TARGET: u64 = 128 * 1024 * 1024;
+/// The smallest read budget: 16 pieces of READ_STEP.
+pub const MIN_READ_BUDGET: u64 = 64 * 1024 * 1024;
 /// The remote format of this build: each journal entry carries a MAC under the repository key.
 const REMOTE_FORMAT: u32 = 3;
 
@@ -103,6 +105,8 @@ pub enum EngineError {
     Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error("the GETs in flight hold the read budget of {budget} bytes")]
+    ReadBudget { budget: u64 },
     #[error(
         "the clock of this proxy is more than the retention ahead of its wall clock: writes \
          resume in {wait_secs} s"
@@ -267,6 +271,10 @@ pub struct Engine<R> {
     buffer_failing: AtomicBool,
     /// The clock was more than R ahead of the wall clock at the last check: logged once.
     clock_ahead: AtomicBool,
+    /// The room of GET pieces in flight, in bytes.
+    read_budget: Arc<tokio::sync::Semaphore>,
+    /// A GET got no room at its first piece since the last one that got room: logged once.
+    read_budget_short: AtomicBool,
     /// The highest own HLC that the open found, and where: the operator sees what holds the clock.
     own_high: Mutex<(u64, &'static str)>,
     /// When this process first saw each object that waits for a GC delete.
@@ -465,6 +473,13 @@ impl<R: Remote + 'static> Engine<R> {
                 config.max_entry_actions
             )));
         }
+        if config.read_budget < MIN_READ_BUDGET {
+            return Err(EngineError::Config(format!(
+                "read_budget ({}) is under {MIN_READ_BUDGET}: GETs would wait for each other with \
+                 few pieces in flight",
+                config.read_budget
+            )));
+        }
         if config.pack_target as u64 > MAX_PACK_TARGET {
             return Err(EngineError::Config(format!(
                 "pack_target ({}) is above {MAX_PACK_TARGET}: one buffer segment of that size can \
@@ -521,6 +536,7 @@ impl<R: Remote + 'static> Engine<R> {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
         }
 
+        let read_budget = Arc::new(tokio::sync::Semaphore::new(config.read_budget as usize));
         let engine = Self {
             node: journal.node(),
             keys,
@@ -542,6 +558,8 @@ impl<R: Remote + 'static> Engine<R> {
             quarantined: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
             clock_ahead: AtomicBool::new(false),
+            read_budget,
+            read_budget_short: AtomicBool::new(false),
             own_high: Mutex::new(own_high),
             gc_waits: gc::Waits::default(),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),

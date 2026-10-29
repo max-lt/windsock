@@ -97,6 +97,8 @@ pub struct EngineConfig {
     pub buffer_limit_bytes: u64,
     /// The parts of all open multipart uploads together. A part over it gets 503.
     pub parts_limit_bytes: u64,
+    /// The bytes of GET pieces in flight on all connections together.
+    pub read_budget_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -107,6 +109,7 @@ impl Default for EngineConfig {
             flush_delay_ms: engine.flush_delay.as_millis() as u64,
             buffer_limit_bytes: engine.buffer_limit,
             parts_limit_bytes: s3api::DEFAULT_PARTS_LIMIT,
+            read_budget_bytes: engine.read_budget,
         }
     }
 }
@@ -219,6 +222,7 @@ impl Config {
             cache_bytes: self.engine.cache_bytes,
             flush_delay: Duration::from_millis(self.engine.flush_delay_ms),
             buffer_limit: self.engine.buffer_limit_bytes,
+            read_budget: self.engine.read_budget_bytes,
             gc_horizon: Duration::from_secs(self.gc.horizon_secs),
             retention: Duration::from_secs(self.gc.retention_secs),
             late_margin: Duration::from_secs(self.gc.late_margin_secs),

@@ -494,3 +494,38 @@ fn fetch_of(pack: PackId, entries: Vec<PackEntry>) -> Fetch {
         entries,
     }
 }
+
+/// Room in the read budget for one piece of a GET. The room comes back when it drops.
+pub struct ReadRoom {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<R: Remote + 'static> Engine<R> {
+    /// Takes room for one piece of READ_STEP bytes. With `wait`, fails with ReadBudget after it.
+    /// With none, waits until a GET gives room back.
+    pub async fn read_room(&self, wait: Option<Duration>) -> Result<ReadRoom> {
+        let piece = READ_STEP as u32;
+        let take = self.read_budget.clone().acquire_many_owned(piece);
+        let permit = match wait {
+            None => take.await,
+            Some(wait) => match tokio::time::timeout(wait, take).await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let budget = self.config.read_budget;
+                    if !self.read_budget_short.swap(true, Ordering::SeqCst) {
+                        warn!(
+                            budget,
+                            "GETs get 503: the GETs in flight hold the read budget"
+                        );
+                    }
+                    return Err(EngineError::ReadBudget { budget });
+                }
+            },
+        };
+        let permit = permit.expect("the read budget is never closed");
+        if wait.is_some() && self.read_budget_short.swap(false, Ordering::SeqCst) {
+            info!("GETs get room in the read budget again");
+        }
+        Ok(ReadRoom { _permit: permit })
+    }
+}

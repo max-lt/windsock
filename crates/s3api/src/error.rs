@@ -94,6 +94,8 @@ impl From<EngineError> for S3Error {
             EngineError::BufferFull { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
             // The wall clock catches up: the message gives the wait.
             EngineError::ClockAhead { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
+            // The GETs in flight end or get cut: the room comes back.
+            EngineError::ReadBudget { .. } => ("SlowDown", StatusCode::SERVICE_UNAVAILABLE),
             EngineError::ObjectTooLarge { .. } => ("EntityTooLarge", StatusCode::BAD_REQUEST),
             EngineError::MetadataTooLarge { .. } => ("MetadataTooLarge", StatusCode::BAD_REQUEST),
             // A full local disk frees up when the flusher uploads: clients back off and retry.

@@ -1744,3 +1744,49 @@ async fn test_two_completes_of_one_upload_free_its_room_once() {
     assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
     assert_eq!(server.uploads.held(), 300, "the other upload still counts");
 }
+
+/// A server with the smallest read budget: 16 pieces of a GET in flight.
+async fn small_budget() -> Server {
+    let config = Config {
+        read_budget: engine::MIN_READ_BUDGET,
+        ..Config::default()
+    };
+    bucket_on(server_with(config).await).await
+}
+
+#[tokio::test]
+async fn test_get_with_no_room_in_the_read_budget_gets_503() {
+    let server = small_budget().await;
+    let data = vec![3u8; 2 * engine::READ_STEP];
+    run(&server, call("PUT", "/bkt/k").body(data)).await;
+    // Each response holds the room of its first piece while its body is not read.
+    let mut held = Vec::new();
+    for _ in 0..engine::MIN_READ_BUDGET as usize / engine::READ_STEP {
+        let response = get_response(&server, "/bkt/k").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+
+    let started = std::time::Instant::now();
+    let full = run(&server, call("GET", "/bkt/k")).await;
+    let ranged = run(&server, call("GET", "/bkt/k").header("range", "bytes=0-9")).await;
+    let head = run(&server, call("HEAD", "/bkt/k")).await;
+    drop(held);
+    let after = run(&server, call("GET", "/bkt/k")).await;
+
+    assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(full.xml("Code").unwrap(), "SlowDown");
+    assert!(full.header("retry-after").is_some());
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "the first piece waits 5 s"
+    );
+    assert_eq!(
+        ranged.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a range takes room too"
+    );
+    assert_eq!(head.status, StatusCode::OK, "a HEAD takes no room");
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(after.body.len(), 2 * engine::READ_STEP);
+}

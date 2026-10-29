@@ -130,6 +130,8 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         }
 
         let range = byte_range(&headers, info.size)?;
+        // With no room in the budget, a 503 before the body: the client retries cleanly.
+        let room = state.engine.read_room(Some(FIRST_PIECE_WAIT)).await?;
         let reader = state
             .engine
             .get_reader(&bucket, &key, range.clone())
@@ -151,7 +153,7 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         }
 
         return Ok(builder
-            .body(object_body(state.engine.clone(), reader, bucket, key))
+            .body(object_body(state.engine.clone(), reader, room, bucket, key))
             .expect("object headers are valid"));
     }
 }
@@ -263,20 +265,29 @@ pub(crate) async fn object_post<R: Remote + 'static>(
 fn object_body<R: Remote + 'static>(
     engine: Arc<Engine<R>>,
     reader: ObjectReader,
+    first: ReadRoom,
     bucket: String,
     key: String,
 ) -> Body {
-    let pieces = futures_util::stream::try_unfold((engine, reader), move |(engine, mut reader)| {
-        let (bucket, key) = (bucket.clone(), key.clone());
-        async move {
-            match engine.next_piece(&mut reader).await {
-                Ok(piece) => Ok(piece.map(|piece| (piece, (engine, reader)))),
-                Err(e) => {
-                    warn!(bucket, key, %e, "GET body cut");
-                    Err(e)
+    let state = (engine, reader, Some(first), None);
+    let pieces =
+        futures_util::stream::try_unfold(state, move |(engine, mut reader, first, held)| {
+            let (bucket, key) = (bucket.clone(), key.clone());
+            async move {
+                // This poll comes once the last piece is in the socket: its room comes back first.
+                drop::<Option<ReadRoom>>(held);
+                let room = match first {
+                    Some(room) => room,
+                    None => engine.read_room(None).await?,
+                };
+                match engine.next_piece(&mut reader).await {
+                    Ok(piece) => Ok(piece.map(|piece| (piece, (engine, reader, None, Some(room))))),
+                    Err(e) => {
+                        warn!(bucket, key, %e, "GET body cut");
+                        Err(e)
+                    }
                 }
             }
-        }
-    });
+        });
     Body::from_stream(pieces)
 }

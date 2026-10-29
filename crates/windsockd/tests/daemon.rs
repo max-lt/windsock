@@ -742,3 +742,122 @@ async fn test_reader_that_stops_reading_is_cut_after_the_idle_timeout() {
     assert!(received.len() < size, "{} bytes of {size}", received.len());
     assert!(daemon.stop());
 }
+
+/// The text of a signed GET request.
+fn get_request(daemon: &common::Daemon, keys: &(String, String), path: &str) -> String {
+    let mut request = format!("GET {path} HTTP/1.1\r\n");
+    for (name, value) in common::signed_headers(daemon, keys, "GET", path, b"") {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request
+}
+
+/// Sends a request on a new connection and reads its status line, nothing more.
+async fn send_and_hold(address: &str, request: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut status = [0u8; 12];
+    stream.read_exact(&mut status).await.unwrap();
+    assert_eq!(&status, b"HTTP/1.1 200");
+    stream
+}
+
+async fn held_get(
+    daemon: &common::Daemon,
+    keys: &(String, String),
+    path: &str,
+) -> tokio::net::TcpStream {
+    send_and_hold(&daemon.address, &get_request(daemon, keys, path)).await
+}
+
+/// A daemon with an idle timeout of `idle_secs`, the smallest read budget, and no flush during
+/// the test.
+fn small_budget_daemon(dir: &Path, idle_secs: u64) -> common::Daemon {
+    let remote = dir.join("remote");
+    let config = common::cluster_config(dir, &remote, 3_600_000, "enabled = false");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace(
+            "sync_interval_secs = 1\n",
+            &format!("sync_interval_secs = 1\nidle_timeout_secs = {idle_secs}\n"),
+        )
+        .replace(
+            "flush_delay_ms = 3600000\n",
+            "flush_delay_ms = 3600000\nread_budget_bytes = 67108864\n",
+        );
+    std::fs::write(&config, text).unwrap();
+    common::start(&config, "info")
+}
+
+/// GETs whose clients stop reading take the whole read budget: a stream that waits for room or
+/// for the socket makes no progress. The idle timeout cuts each one, and the room comes back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stalled_gets_that_hold_the_read_budget_are_cut_and_free_it() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut daemon = small_budget_daemon(dir.path(), 2);
+    let keys = common::test_keys();
+    let size = 64 << 20;
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; size]).await;
+
+    // 16 pieces of room: one per stalled GET.
+    let mut stalled = Vec::new();
+    for _ in 0..16 {
+        stalled.push(held_get(&daemon, &keys, "/demo/k").await);
+    }
+    // No client reads for longer than the idle timeout of 2 s.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut cut = 0;
+    for stream in &mut stalled {
+        let mut received = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut received));
+        if read.await.is_ok() && received.len() < size {
+            cut += 1;
+        }
+    }
+    let after = call(&daemon, &keys, "GET", "/demo/k", b"").await;
+
+    assert_eq!(cut, 16, "stalled GETs cut");
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(after.body.len(), size);
+    assert_eq!(
+        daemon.count_after("read budget", Duration::from_millis(100)),
+        0
+    );
+    assert!(daemon.stop());
+}
+
+/// While the GETs in flight hold the read budget, each new GET gets 503 SlowDown. The daemon logs
+/// one WARN for the streak, and one INFO when a GET gets room again.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_budget_503_streak_logs_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut daemon = small_budget_daemon(dir.path(), 60);
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; 64 << 20]).await;
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        held.push(held_get(&daemon, &keys, "/demo/k").await);
+    }
+    // Room comes back only from a stream that the socket lets on: with no reader, none.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let first = call(&daemon, &keys, "GET", "/demo/k", b"").await;
+    let second = call(&daemon, &keys, "GET", "/demo/k", b"").await;
+    drop(held);
+    let after = call(&daemon, &keys, "GET", "/demo/k", b"").await;
+
+    assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(after.status, StatusCode::OK);
+    let warns = daemon.count_after("GETs get 503", Duration::from_millis(500));
+    assert_eq!(warns, 1, "one WARN for the streak");
+    assert!(daemon.logged("GETs get room in the read budget again"));
+    assert!(daemon.stop());
+}

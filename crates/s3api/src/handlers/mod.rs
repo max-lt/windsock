@@ -17,7 +17,7 @@ use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
-use engine::{Engine, ObjectInfo, ObjectReader, WriteMode};
+use engine::{Engine, ObjectInfo, ObjectReader, ReadRoom, WriteMode};
 use remote::Remote;
 use tracing::{info, warn};
 
@@ -75,6 +75,8 @@ const OBJECT_UNSUPPORTED: &[&str] = &[
     "torrent",
 ];
 
+/// How long the first piece of a GET waits for room in the read budget before a 503.
+const FIRST_PIECE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_KEYS: usize = 1000;
 const MAX_DELETE_KEYS: usize = 1000;
 

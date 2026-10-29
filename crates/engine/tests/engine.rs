@@ -1371,3 +1371,26 @@ async fn test_worst_records_of_one_segment_fit_in_one_entry() {
         eprintln!("data {data_len}, metadata {metadata_len}: entry / segment = {ratio:.3}");
     }
 }
+
+#[tokio::test]
+async fn test_read_budget_under_its_floor_is_refused_at_open() {
+    let config = Config {
+        read_budget: engine::MIN_READ_BUDGET - 1,
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        Arc::new(MemoryRemote::default()),
+        SigningKey::from_bytes(&[1; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await;
+
+    let Err(EngineError::Config(reason)) = result else {
+        panic!("a read budget under the floor opens");
+    };
+    assert!(reason.contains("read_budget"), "{reason}");
+}

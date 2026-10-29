@@ -648,50 +648,54 @@ fn open_fds(pid: u32) -> usize {
         .saturating_sub(1)
 }
 
-/// With every connection open and a request in each, the daemon stays under its soft limit.
+/// Every connection holds a GET of a buffered object that its client does not read: each one
+/// keeps its socket and the open buffer segment, 2 descriptors. The daemon stays under its
+/// soft limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_all_connections_stay_under_the_descriptor_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let dir = tempfile::tempdir().unwrap();
     let remote = dir.path().join("remote");
-    let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
+    // No flush during the test: the object stays in the buffer.
+    let config = common::cluster_config(dir.path(), &remote, 3_600_000, "enabled = false");
     let keys = common::test_keys();
     let daemon = common::start_with_fd_limit(&config, "info", 600);
     call(&daemon, &keys, "PUT", "/demo", b"").await;
-    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; 1 << 20]).await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7u8; 16 << 20]).await;
+    // (600 - 256) / 2 connections.
+    let connections = 172;
 
     let mut held = Vec::new();
-    for _ in 0..172 {
-        held.push(
-            tokio::net::TcpStream::connect(&daemon.address)
-                .await
-                .unwrap(),
-        );
+    for _ in 0..connections {
+        let mut stream = tokio::net::TcpStream::connect(&daemon.address)
+            .await
+            .unwrap();
+        let mut request = "GET /demo/k HTTP/1.1\r\n".to_string();
+        for (name, value) in common::signed_headers(&daemon, &keys, "GET", "/demo/k", b"") {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut head = [0u8; 12];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        held.push(stream);
     }
     let mut peak = 0;
-    let mut reads = Vec::new();
-    for _ in 0..64 {
-        let (daemon, keys) = (&daemon, &keys);
-        reads.push(async move { call(daemon, keys, "GET", "/demo/k", b"").await });
+    for _ in 0..10 {
+        peak = peak.max(open_fds(daemon.pid()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let watch = async {
-        for _ in 0..20 {
-            peak = peak.max(open_fds(daemon.pid()));
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-    tokio::join!(futures_join(reads), watch);
     drop(held);
 
-    assert!(peak > 172, "lsof saw {peak} descriptors");
+    assert!(
+        peak > 2 * connections,
+        "lsof saw {peak} descriptors: not 2 per connection"
+    );
     assert!(
         peak < 600,
         "{peak} descriptors at the peak for a soft limit of 600"
     );
     assert!(daemon.stop());
-}
-
-async fn futures_join<F: std::future::Future>(futures: Vec<F>) {
-    for future in futures {
-        future.await;
-    }
 }

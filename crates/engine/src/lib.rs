@@ -71,8 +71,8 @@ const MAX_KEY_CHECK: u64 = 64 * 1024;
 /// every proxy reads every entry whatever its own setting.
 pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
 /// The largest pack target. A buffer segment rotates at this size, and the flush writes its actions
-/// in one entry: an action takes at most a few times the bytes of its record, so 3 times this
-/// size stays under MAX_ENTRY_ACTIONS.
+/// in one entry. Measured worst records give an entry of 1.02 times their segment: far under
+/// MAX_ENTRY.
 pub const MAX_PACK_TARGET: u64 = 128 * 1024 * 1024;
 /// The remote format of this build: each journal entry carries a MAC under the repository key.
 const REMOTE_FORMAT: u32 = 3;

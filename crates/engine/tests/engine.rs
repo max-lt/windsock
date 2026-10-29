@@ -1294,18 +1294,80 @@ async fn test_pack_target_over_its_bound_is_refused_at_open() {
     assert!(reason.contains("pack_target"), "{reason}");
 }
 
-/// The largest legal configuration writes entries that every reader takes: the actions of up to
-/// 16 segments stop at max_entry_actions, one segment gives at most 3 times its size, and the
-/// header and the seal take far less than the rest.
+/// The actions of up to 16 segments stop at the largest max_entry_actions: with the header and
+/// the seal, that entry stays under the entry limit of a reader.
 #[test]
 fn test_largest_legal_entry_is_under_the_reader_limit() {
     let header = 64 * 1024;
     let seal = 45;
-    let largest = engine::MAX_ENTRY_ACTIONS.max(3 * engine::MAX_PACK_TARGET) + header + seal;
+    let largest = engine::MAX_ENTRY_ACTIONS + header + seal;
 
     assert!(
         largest <= journal::MAX_ENTRY,
         "{largest} > {}",
         journal::MAX_ENTRY
     );
+}
+
+/// Fills a buffer segment of 1 MiB with one shape of record, flushes it in one entry, and returns
+/// the entry size over the segment size.
+async fn entry_ratio(data_len: usize, metadata_len: usize) -> f64 {
+    let remote = Arc::new(MemoryRemote::default());
+    let config = Config {
+        pack_target: 1 << 20,
+        ..Config::default()
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let metadata = match metadata_len {
+        0 => BTreeMap::new(),
+        len => BTreeMap::from([("x-amz-meta-m".to_string(), "v".repeat(len))]),
+    };
+    let mut n = 0;
+    let mut segment = 0;
+    while segment < 1 << 20 {
+        // Keys of 1024 bytes, the longest that the engine takes.
+        let key = format!("{n:0>1024}");
+        a.engine
+            .put(
+                BUCKET,
+                &key,
+                Bytes::from(vec![7u8; data_len]),
+                metadata.clone(),
+                WriteMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        segment = a.engine.buffered_bytes().await;
+        n += 1;
+    }
+    a.engine.flush().await.unwrap();
+    let mut largest = 0;
+    for key in remote.list("log/").await.unwrap() {
+        largest = largest.max(remote.get(&key, u64::MAX).await.unwrap().unwrap().len());
+    }
+    largest as f64 / segment as f64
+}
+
+/// One segment of pack_target bytes gives one entry: at the largest pack target, the worst
+/// records must stay under the entry limit of a reader.
+#[tokio::test]
+async fn test_worst_records_of_one_segment_fit_in_one_entry() {
+    // No data, no metadata; 1 byte and metadata just under an inline manifest; 1 byte and
+    // metadata that sends the manifest out of the entry.
+    for (data_len, metadata_len) in [(0, 0), (1, 3800), (1, 8000)] {
+        let ratio = entry_ratio(data_len, metadata_len).await;
+        let largest = ratio * engine::MAX_PACK_TARGET as f64 + 64.0 * 1024.0;
+
+        assert!(
+            ratio < 3.0,
+            "data {data_len}, metadata {metadata_len}: ratio {ratio}"
+        );
+        assert!(
+            largest <= journal::MAX_ENTRY as f64,
+            "data {data_len}, metadata {metadata_len}: {largest} bytes"
+        );
+        eprintln!("data {data_len}, metadata {metadata_len}: entry / segment = {ratio:.3}");
+    }
 }

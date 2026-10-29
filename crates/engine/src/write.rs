@@ -166,7 +166,7 @@ impl<R: Remote + 'static> Engine<R> {
 
     /// Fails while the clock is more than R ahead of the wall clock. A reader refuses an entry
     /// that far ahead, so this proxy takes no write and signs no entry until the wall catches up.
-    pub(crate) fn check_clock(&self) -> Result<()> {
+    pub fn check_clock(&self) -> Result<()> {
         let wall = journal::wall_clock_nanos();
         let limit = wall.saturating_add(self.config.retention.as_nanos() as u64);
         let last = self.clock.last();

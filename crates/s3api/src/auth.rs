@@ -13,7 +13,7 @@ use bytes::Bytes;
 use remote::Remote;
 use tracing::debug;
 
-use crate::{AppState, Caller, S3Error};
+use crate::{AppState, Caller, S3Error, presign};
 use s3proto::sigv4::{self, Authorization, ChunkSigner};
 use s3proto::time::parse_amz_date;
 
@@ -46,14 +46,6 @@ fn verify_head(
     keys: &HashMap<String, String>,
     now: u64,
 ) -> Result<Verified, S3Error> {
-    if parts
-        .uri
-        .query()
-        .is_some_and(|q| q.contains("X-Amz-Signature="))
-    {
-        return Err(S3Error::not_implemented("presigned URLs are not supported"));
-    }
-
     let authorization = header(&parts.headers, "authorization")
         .and_then(Authorization::parse)
         .ok_or_else(|| S3Error::access_denied("a SigV4 Authorization header is required"))?;
@@ -121,7 +113,12 @@ fn verify_head(
 }
 
 /// The body as the client meant it: checked against the signed hash, or decoded from `aws-chunked`.
-fn payload(headers: &HeaderMap, verified: Verified, body: Bytes) -> Result<Bytes, S3Error> {
+/// A presigned request has no signer: it takes no signed chunks.
+fn payload(
+    headers: &HeaderMap,
+    signer: Option<ChunkSigner>,
+    body: Bytes,
+) -> Result<Bytes, S3Error> {
     let hash = header(headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
     let incomplete = |e: sigv4::ChunkError| match e {
         sigv4::ChunkError::BadSignature => signature_mismatch(),
@@ -129,16 +126,10 @@ fn payload(headers: &HeaderMap, verified: Verified, body: Bytes) -> Result<Bytes
             S3Error::new("IncompleteBody", StatusCode::BAD_REQUEST, e.to_string())
         }
     };
-    let signer = ChunkSigner {
-        key: verified.signing_key,
-        timestamp: verified.timestamp,
-        scope: verified.scope,
-        previous: verified.signature,
-    };
-
     let decoded = match hash {
         sigv4::UNSIGNED_PAYLOAD => return Ok(body),
         sigv4::STREAMING_SIGNED | sigv4::STREAMING_SIGNED_TRAILER => {
+            let signer = signer.ok_or_else(signature_mismatch)?;
             sigv4::decode_chunked(&body, Some(signer)).map_err(incomplete)?
         }
         sigv4::STREAMING_UNSIGNED_TRAILER => {
@@ -202,8 +193,25 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
     next: Next,
 ) -> Result<Response, S3Error> {
     let (mut parts, body) = request.into_parts();
-    let verified = verify_head(&parts, &state.keys, unix_now())?;
-    parts.extensions.insert(Caller(verified.access_key.clone()));
+    let (access_key, signer) = match presign::is_presigned(parts.uri.query()) {
+        true => {
+            // The expiry needs a wall clock that the proxy trusts.
+            state.engine.check_clock()?;
+            let presigned = presign::verify(&parts, &state.keys, unix_now(), MAX_SKEW_SECS)?;
+            (presigned.access_key, None)
+        }
+        false => {
+            let verified = verify_head(&parts, &state.keys, unix_now())?;
+            let signer = ChunkSigner {
+                key: verified.signing_key,
+                timestamp: verified.timestamp,
+                scope: verified.scope,
+                previous: verified.signature,
+            };
+            (verified.access_key, Some(signer))
+        }
+    };
+    parts.extensions.insert(Caller(access_key));
 
     // A POST carries XML only. Its body must not take the memory of an object upload.
     let (limit, too_large) = match parts.method {
@@ -226,7 +234,7 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
             ),
         }
     })?;
-    let body = payload(&parts.headers, verified, body)?;
+    let body = payload(&parts.headers, signer, body)?;
     strip_aws_chunked(&mut parts.headers);
 
     Ok(next.run(Request::from_parts(parts, Body::from(body))).await)

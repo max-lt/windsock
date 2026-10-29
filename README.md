@@ -228,7 +228,19 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   checks again (at most one such sync per second, shared by all requests), so it answers 412 only for a version that it cannot see. A pass on an old version
   stays possible across proxies. The check costs one manifest read when the manifest is not in
   the index, done outside the buffer lock.
-- Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
+- Object tags, bucket lifecycle rules and ACLs are not supported.
+- Presigned URLs (SigV4 in the query) cover GET, HEAD and a single PUT of an object. Multipart,
+  copy, delete and bucket requests need a signed header. `X-Amz-Expires` is 1 to 604800 seconds
+  (7 days). A URL is valid from `X-Amz-Date` less 15 minutes of clock skew, until `X-Amz-Date`
+  plus `X-Amz-Expires`, with no skew at the end. While the clock of the proxy is more than R ahead
+  of its wall clock, a presigned request gets `503 SlowDown`: the expiry needs a trusted wall
+  clock. A step back of the wall clock under R can make an expired URL valid again for the length
+  of the step.
+- The holder of a presigned URL has the rights of the key that signed it, on every bucket, until
+  the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
+  metadata, If-Match and If-None-Match. Sign Content-Type when it matters. A PUT URL works many
+  times until its expiry, each time for an object up to the buffer limit, and each PUT takes
+  about 3 times its object in memory (see below).
 - A multipart upload must complete on the proxy that started it.
 - A GET streams the object in pieces of at most 4 MiB. One GET holds at most about 16 MiB: the
   stored bytes, the raw chunks and the piece. The peak for GETs is `max_connections` times 16 MiB.

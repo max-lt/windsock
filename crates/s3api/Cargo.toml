@@ -23,6 +23,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "net"] }
 tracing.workspace = true
 
 [dev-dependencies]
+engine = { workspace = true, features = ["sim"] }
+journal = { workspace = true, features = ["sim"] }
 http-body.workspace = true
 ed25519-dalek.workspace = true
 http-body-util.workspace = true

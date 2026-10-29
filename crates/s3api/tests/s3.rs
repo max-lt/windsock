@@ -281,15 +281,6 @@ async fn test_body_must_match_its_signed_hash() {
 }
 
 #[tokio::test]
-async fn test_presigned_url_is_not_supported() {
-    let server = server().await;
-
-    let reply = run(&server, call("GET", "/bkt/k?X-Amz-Signature=ab")).await;
-
-    assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
-}
-
-#[tokio::test]
 async fn test_aws_chunked_bodies_are_decoded() {
     let server = with_bucket().await;
     let unsigned =
@@ -1789,4 +1780,291 @@ async fn test_get_with_no_room_in_the_read_budget_gets_503() {
     assert_eq!(head.status, StatusCode::OK, "a HEAD takes no room");
     assert_eq!(after.status, StatusCode::OK);
     assert_eq!(after.body.len(), 2 * engine::READ_STEP);
+}
+
+/// What a presigned URL signs. The test changes one field to break it.
+#[derive(Clone)]
+struct Presign {
+    method: &'static str,
+    path: String,
+    at: u64,
+    expires: String,
+    access: String,
+    secret: String,
+    host: &'static str,
+}
+
+impl Presign {
+    fn new(method: &'static str, path: &str) -> Self {
+        Self {
+            method,
+            path: path.to_string(),
+            at: now(),
+            expires: "300".into(),
+            access: ACCESS.into(),
+            secret: SECRET.into(),
+            host: "localhost",
+        }
+    }
+
+    /// The query of the URL: the five signed parameters, then the signature.
+    fn query(&self) -> String {
+        let timestamp = sigv4::timestamp(self.at);
+        let date = &timestamp[..8];
+        let encode = |value: &str| sigv4::uri_encode(value.as_bytes(), sigv4::Slash::Encode);
+        let credential = format!("{}/{date}/{REGION}/s3/aws4_request", self.access);
+        let query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={timestamp}\
+             &X-Amz-Expires={}&X-Amz-SignedHeaders=host",
+            encode(&credential),
+            encode(&self.expires),
+        );
+        let headers = [("host".to_string(), self.host.to_string())];
+        let canonical = sigv4::canonical_request(
+            self.method,
+            &self.path,
+            &query,
+            &headers,
+            &["host".to_string()],
+            sigv4::UNSIGNED_PAYLOAD,
+        );
+        let key = sigv4::signing_key(&self.secret, date, REGION);
+        let scope = format!("{date}/{REGION}/s3/aws4_request");
+        let signature = sigv4::signature(&key, &timestamp, &scope, &canonical);
+        format!("{query}&X-Amz-Signature={signature}")
+    }
+}
+
+/// A request to `path?query` with only a host header: no Authorization.
+async fn send_raw(server: &Server, method: &str, uri: &str, host: &str, body: &str) -> Reply {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", host)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    send(server, request).await
+}
+
+async fn presigned(server: &Server, sign: &Presign, method: &str, path: &str) -> Reply {
+    let uri = format!("{path}?{}", sign.query());
+    send_raw(server, method, &uri, "localhost", "").await
+}
+
+#[tokio::test]
+async fn test_presigned_get_head_and_put_work() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+
+    let get = presigned(&server, &Presign::new("GET", "/bkt/k"), "GET", "/bkt/k").await;
+    let head = presigned(&server, &Presign::new("HEAD", "/bkt/k"), "HEAD", "/bkt/k").await;
+    let put_uri = format!("/bkt/new?{}", Presign::new("PUT", "/bkt/new").query());
+    let put_reply = send_raw(&server, "PUT", &put_uri, "localhost", "uploaded").await;
+
+    assert_eq!(get.status, StatusCode::OK, "{}", get.text());
+    assert_eq!(get.text(), "data");
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(put_reply.status, StatusCode::OK, "{}", put_reply.text());
+    assert_eq!(
+        run(&server, call("GET", "/bkt/new")).await.text(),
+        "uploaded"
+    );
+}
+
+#[tokio::test]
+async fn test_presigned_url_that_changed_is_refused() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+    put(&server, "other", "data").await;
+    let sign = Presign::new("GET", "/bkt/k");
+    let code = |reply: &Reply| (reply.status, reply.xml("Code").unwrap_or_default());
+    let mismatch = (StatusCode::FORBIDDEN, "SignatureDoesNotMatch".to_string());
+
+    let path = presigned(&server, &sign, "GET", "/bkt/other").await;
+    let method = presigned(&server, &sign, "HEAD", "/bkt/k").await;
+    let added = send_raw(
+        &server,
+        "GET",
+        &format!("/bkt/k?{}&a=b", sign.query()),
+        "localhost",
+        "",
+    )
+    .await;
+    let expires = sign
+        .query()
+        .replace("X-Amz-Expires=300", "X-Amz-Expires=600");
+    let longer = send_raw(
+        &server,
+        "GET",
+        &format!("/bkt/k?{expires}"),
+        "localhost",
+        "",
+    )
+    .await;
+    let host = send_raw(
+        &server,
+        "GET",
+        &format!("/bkt/k?{}", sign.query()),
+        "other",
+        "",
+    )
+    .await;
+    let secret = Presign {
+        secret: "wrong".into(),
+        ..sign.clone()
+    };
+    let wrong = presigned(&server, &secret, "GET", "/bkt/k").await;
+    let removed = Presign {
+        access: "NOSUCHKEY".into(),
+        ..sign.clone()
+    };
+    let unknown = presigned(&server, &removed, "GET", "/bkt/k").await;
+
+    for reply in [&path, &added, &longer, &host, &wrong] {
+        assert_eq!(code(reply), mismatch, "{}", reply.text());
+    }
+    // A HEAD has no body, so its error code is in the status only.
+    assert_eq!(method.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        code(&unknown),
+        (StatusCode::FORBIDDEN, "InvalidAccessKeyId".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_presigned_url_outside_its_time_is_refused() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+    let expired = Presign {
+        at: now() - 3600,
+        expires: "60".into(),
+        ..Presign::new("GET", "/bkt/k")
+    };
+    let early = Presign {
+        at: now() + 3600,
+        ..Presign::new("GET", "/bkt/k")
+    };
+
+    let late = presigned(&server, &expired, "GET", "/bkt/k").await;
+    let future = presigned(&server, &early, "GET", "/bkt/k").await;
+
+    assert_eq!(late.status, StatusCode::FORBIDDEN);
+    assert!(
+        late.text().contains("Request has expired"),
+        "{}",
+        late.text()
+    );
+    assert_eq!(future.status, StatusCode::FORBIDDEN);
+    assert!(future.text().contains("not valid yet"), "{}", future.text());
+}
+
+#[tokio::test]
+async fn test_presigned_parameters_must_come_once_and_be_valid() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+    let query = Presign::new("GET", "/bkt/k").query();
+    let names = [
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-SignedHeaders",
+        "X-Amz-Signature",
+    ];
+    let mut queries = Vec::new();
+    for name in names {
+        let pair = query
+            .split('&')
+            .find(|pair| pair.starts_with(&format!("{name}=")))
+            .unwrap();
+        let missing: Vec<&str> = query.split('&').filter(|p| *p != pair).collect();
+        queries.push(missing.join("&"));
+        queries.push(format!("{query}&{pair}"));
+    }
+    // A second copy in another case, or encoded, cannot stay out of the signed query.
+    let signature = query.rsplit_once("X-Amz-Signature=").unwrap().1;
+    queries.push(format!("{query}&x-amz-signature={signature}"));
+    queries.push(format!("{query}&X-Amz-%53ignature={signature}"));
+    queries.push(query.replace(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+        "X-Amz-Algorithm=AWS4-HMAC-SHA1",
+    ));
+    for expires in ["0", "604801", "%2B1", "0007", "1e3"] {
+        queries.push(query.replace("X-Amz-Expires=300", &format!("X-Amz-Expires={expires}")));
+    }
+    queries.push(format!("{query}&bad=%zz"));
+    queries.push(format!("{query}&X-Amz-Security-Token=t"));
+
+    for query in &queries {
+        let reply = send_raw(&server, "GET", &format!("/bkt/k?{query}"), "localhost", "").await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.xml("Code").unwrap(),
+            "AuthorizationQueryParametersError"
+        );
+        assert!(!reply.text().contains(signature), "the signature is echoed");
+    }
+}
+
+#[tokio::test]
+async fn test_presigned_url_covers_get_head_and_put_of_an_object_only() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+
+    let post = presigned(&server, &Presign::new("POST", "/bkt/k"), "POST", "/bkt/k").await;
+    let delete = presigned(
+        &server,
+        &Presign::new("DELETE", "/bkt/k"),
+        "DELETE",
+        "/bkt/k",
+    )
+    .await;
+    let bucket = presigned(&server, &Presign::new("GET", "/bkt"), "GET", "/bkt").await;
+    let both = Request::builder()
+        .method("GET")
+        .uri(format!("/bkt/k?{}", Presign::new("GET", "/bkt/k").query()))
+        .header("host", "localhost")
+        .header("authorization", "AWS4-HMAC-SHA256 Credential=x")
+        .body(Body::empty())
+        .unwrap();
+    let both = send(&server, both).await;
+
+    for reply in [&post, &delete, &bucket] {
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+        assert_eq!(reply.xml("Code").unwrap(), "AccessDenied");
+    }
+    assert_eq!(both.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_presigned_request_gets_503_while_the_clock_is_ahead() {
+    let server = with_bucket().await;
+    let real = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    // Acks two days ahead, then the wall clock comes back: the expiry has no trusted clock.
+    journal::set_manual_wall(Some(real + 2 * 24 * 3600 * 1_000_000_000));
+    put(&server, "k", "data").await;
+    journal::set_manual_wall(Some(real));
+
+    let reply = presigned(&server, &Presign::new("GET", "/bkt/k"), "GET", "/bkt/k").await;
+    journal::set_manual_wall(None);
+
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.text()
+    );
+    assert!(
+        reply.text().contains("writes resume in"),
+        "{}",
+        reply.text()
+    );
 }

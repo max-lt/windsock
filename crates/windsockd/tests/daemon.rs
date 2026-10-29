@@ -861,3 +861,86 @@ async fn test_read_budget_503_streak_logs_once() {
     assert!(daemon.logged("GETs get room in the read budget again"));
     assert!(daemon.stop());
 }
+
+/// The query of a presigned GET of `path`, valid for 300 s from now.
+fn presigned_query(
+    daemon: &common::Daemon,
+    keys: &(String, String),
+    path: &str,
+    expires: &str,
+) -> String {
+    use s3api::sigv4;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let timestamp = sigv4::timestamp(now);
+    let date = &timestamp[..8];
+    let credential = format!("{}/{date}/us-east-1/s3/aws4_request", keys.0);
+    let query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={timestamp}\
+         &X-Amz-Expires={expires}&X-Amz-SignedHeaders=host",
+        sigv4::uri_encode(credential.as_bytes(), sigv4::Slash::Encode),
+    );
+    let headers = [("host".to_string(), daemon.address.clone())];
+    let canonical = sigv4::canonical_request(
+        "GET",
+        path,
+        &query,
+        &headers,
+        &["host".to_string()],
+        sigv4::UNSIGNED_PAYLOAD,
+    );
+    let key = sigv4::signing_key(&keys.1, date, "us-east-1");
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let signature = sigv4::signature(&key, &timestamp, &scope, &canonical);
+    format!("{query}&X-Amz-Signature={signature}")
+}
+
+/// A GET with only a host header, and the status of its answer.
+async fn raw_status(daemon: &common::Daemon, uri: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(&daemon.address)
+        .await
+        .unwrap();
+    let request = format!(
+        "GET {uri} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\n\r\n",
+        daemon.address
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).await.unwrap();
+    String::from_utf8_lossy(&answer[9..12]).parse().unwrap()
+}
+
+/// The query of a presigned URL holds its signature: no log line shows it, also at debug level,
+/// for an accepted request, a refused signature, and a parameter that does not parse.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_presigned_signature_is_never_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 1000, "enabled = false");
+    let mut daemon = common::start(&config, "debug");
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", b"data").await;
+
+    let good = presigned_query(&daemon, &keys, "/demo/k", "300");
+    let signature = good.rsplit_once('=').unwrap().1.to_string();
+    let flipped = format!("{}0", &good[..good.len() - 1]);
+    let flipped_signature = flipped.rsplit_once('=').unwrap().1.to_string();
+    let malformed = presigned_query(&daemon, &keys, "/demo/k", "0");
+    let malformed_signature = malformed.rsplit_once('=').unwrap().1.to_string();
+
+    let accepted = raw_status(&daemon, &format!("/demo/k?{good}")).await;
+    let refused = raw_status(&daemon, &format!("/demo/k?{flipped}")).await;
+    let unparsed = raw_status(&daemon, &format!("/demo/k?{malformed}")).await;
+
+    assert_eq!((accepted, refused, unparsed), (200, 403, 400));
+    for secret in [&signature, &flipped_signature, &malformed_signature] {
+        assert_eq!(daemon.count_after(secret, Duration::from_millis(500)), 0);
+    }
+    assert!(daemon.stop());
+}

@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod list;
 mod multipart;
+mod presign;
 mod xml;
 
 use std::collections::HashMap;

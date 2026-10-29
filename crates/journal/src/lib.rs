@@ -102,6 +102,8 @@ pub struct Journal<R> {
     fake: BTreeSet<NodeId>,
     /// The fake chains that the last sync did not read.
     skipped: usize,
+    /// The broken chains that this process logged. A chain logs again after it reads well.
+    reported_broken: BTreeSet<NodeId>,
     /// Nanoseconds that an entry HLC may be ahead of the wall clock of this reader: R.
     max_ahead: u64,
     /// Entries already logged as too far ahead: one ERROR each.
@@ -135,6 +137,7 @@ impl<R: Remote> Journal<R> {
             own_read: false,
             fake: BTreeSet::new(),
             skipped: 0,
+            reported_broken: BTreeSet::new(),
             max_ahead: DEFAULT_MAX_AHEAD,
             reported_ahead: BTreeSet::new(),
         }
@@ -481,27 +484,19 @@ impl<R: Remote> Journal<R> {
                                 later: seq,
                                 key: entry_key(node, seq),
                             };
-                            warn!(%node, %source, "chain is broken: the other chains go on");
-                            self.broken.insert(node, source);
+                            self.mark_broken(node, source);
                         }
                         // A gap or a changed entry shows only in an audit: the mark stays until one passes.
                         _ if audit => {
                             self.broken.remove(&node);
+                            self.reported_broken.remove(&node);
                         }
                         _ => {}
                     }
                 }
                 // One bad chain must not stop the sync of every chain.
                 Err(JournalError::Chain { node, source }) => {
-                    let first = matches!(source, ChainError::BadMac { seq: 0 });
-                    if first && self.frontier(node) == Frontier::GENESIS && self.fake.insert(node) {
-                        warn!(
-                            key = entry_key(node, 0),
-                            "a chain with no valid first entry: read only at the open and GC audits"
-                        );
-                    }
-                    warn!(%node, %source, "chain is broken: the other chains go on");
-                    self.broken.insert(node, source);
+                    self.mark_broken(node, source);
                 }
                 Err(e) => return Err(e),
             }
@@ -510,6 +505,27 @@ impl<R: Remote> Journal<R> {
         self.audit = false;
         self.own_read = true;
         Ok(entries)
+    }
+
+    /// Marks a chain as broken, and logs it once per chain. A chain with no valid first entry
+    /// needs no repository key to make: a normal sync stops to read it.
+    fn mark_broken(&mut self, node: NodeId, source: ChainError) {
+        let first = matches!(
+            source,
+            ChainError::BadMac { seq: 0 }
+                | ChainError::Malformed { seq: 0 }
+                | ChainError::Gap { seq: 0, .. }
+        );
+        if first && self.frontier(node) == Frontier::GENESIS && self.fake.insert(node) {
+            warn!(
+                key = entry_key(node, 0),
+                "a chain with no valid first entry: read only at the open and GC audits"
+            );
+        }
+        if self.reported_broken.insert(node) {
+            warn!(%node, %source, "chain is broken: the other chains go on");
+        }
+        self.broken.insert(node, source);
     }
 
     /// Makes the node marker exist before the first entry of the chain. It is created once, as
@@ -1069,6 +1085,51 @@ mod tests {
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 5);
         assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
+    }
+
+    /// A chain with garbage at seq 0, or with seq 1 and no seq 0, needs no key either.
+    #[tokio::test]
+    async fn test_chains_with_no_valid_first_entry_cost_nothing_at_a_normal_sync() {
+        let remote = Arc::new(Counting::default());
+        let mut real = Journal::new(
+            remote.clone(),
+            key(1),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        real.append(vec![put("a")], Seen::new()).await.unwrap();
+        for seed in 60..66 {
+            let node = NodeId::from_bytes(key(seed).verifying_key().to_bytes());
+            let seq = if seed < 63 { 0 } else { 1 };
+            remote
+                .inner
+                .put(&entry_key(node, seq), Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            remote
+                .inner
+                .put(&node_key(node), Bytes::new())
+                .await
+                .unwrap();
+        }
+        let mut reader = Journal::new(
+            remote.clone(),
+            key(9),
+            entry::test_sealer(),
+            Frontiers::new(),
+        );
+        reader.sync_all().await.unwrap();
+        assert_eq!(reader.broken().len(), 6);
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        remote.gets.store(0, ordering);
+        remote.lists.store(0, ordering);
+
+        reader.sync_all().await.unwrap();
+
+        assert_eq!(remote.gets.load(ordering), 4);
+        assert_eq!(remote.lists.load(ordering), 0);
+        assert_eq!(reader.skipped(), 6);
+        assert_eq!(reader.broken().len(), 6, "the fake chains stay marked");
     }
 
     /// The operator removes the objects of a fake chain: the next normal sync drops its mark,

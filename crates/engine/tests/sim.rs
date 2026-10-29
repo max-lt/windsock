@@ -560,6 +560,22 @@ impl Sim {
             return;
         }
         let seed = 100 + self.rng.below(100) as u8;
+        // Garbage at seq 0, or seq 1 with no seq 0: no key is needed for these.
+        let shape = self.rng.below(3);
+        if shape > 0 {
+            let node = model::NodeId::from_bytes(
+                SigningKey::from_bytes(&[seed; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+            let keys = vec![journal::entry_key(node, shape - 1), journal::node_key(node)];
+            let garbage = Bytes::from_static(b"x");
+            self.remote.inner.put(&keys[0], garbage).await.unwrap();
+            self.remote.inner.put(&keys[1], Bytes::new()).await.unwrap();
+            self.keyless = Some((keys, *node.as_bytes()));
+            self.stats.keyless = true;
+            return;
+        }
         let other = RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
         let hlc = self.now + 10 * config().retention.as_nanos() as u64;
         let entry = journal::Entry::sign(

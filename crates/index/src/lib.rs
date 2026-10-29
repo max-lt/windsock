@@ -174,6 +174,11 @@ impl Index {
         })
     }
 
+    /// Bytes that the store takes on disk.
+    pub fn disk_bytes(&self) -> Result<u64> {
+        Ok(self.db.disk_space()?)
+    }
+
     /// True when a failed write made the store refuse every call until a restart.
     pub fn is_poisoned(&self) -> bool {
         matches!(

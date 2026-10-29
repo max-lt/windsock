@@ -121,7 +121,7 @@ impl Uploads {
         key: &str,
         number: &str,
         data: &[u8],
-    ) -> Result<String, S3Error> {
+    ) -> Result<(String, u64), S3Error> {
         let number: u16 = number
             .parse()
             .ok()
@@ -131,14 +131,55 @@ impl Uploads {
 
         let dir = self.upload_dir(upload_id)?;
         let etag = blake3::hash(data).to_hex().to_string();
-        for ((old, old_etag), _) in part_files(&dir).await? {
+        let mut replaced = 0;
+        for ((old, old_etag), (size, _)) in part_files(&dir).await? {
             if old == number {
                 remove_if_present(&dir.join(part_name(old, &old_etag))).await?;
+                replaced += size;
             }
         }
         write_file(&dir, &part_name(number, &etag), data).await?;
 
-        Ok(etag)
+        Ok((etag, replaced))
+    }
+
+    /// Bytes of part `number` of an upload, or 0 when there is no such part.
+    pub async fn part_size(&self, upload_id: &str, number: &str) -> u64 {
+        let (Ok(dir), Ok(number)) = (self.upload_dir(upload_id), number.parse::<u16>()) else {
+            return 0;
+        };
+        let Ok(parts) = part_files(&dir).await else {
+            return 0;
+        };
+        parts
+            .iter()
+            .filter(|((n, _), _)| *n == number)
+            .map(|(_, (size, _))| size)
+            .sum()
+    }
+
+    /// Bytes that the parts of an upload hold on disk.
+    pub async fn bytes(&self, upload_id: &str) -> Result<u64, S3Error> {
+        let parts = part_files(&self.upload_dir(upload_id)?).await?;
+        Ok(parts.values().map(|(size, _)| size).sum())
+    }
+
+    /// Bytes that the parts of all uploads hold on disk.
+    pub async fn all_bytes(&self) -> Result<u64, S3Error> {
+        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io(e)),
+        };
+        let mut total = 0;
+        while let Some(entry) = entries.next_entry().await.map_err(io)? {
+            if !entry.file_type().await.map_err(io)?.is_dir() {
+                continue;
+            }
+            let parts = part_files(&entry.path()).await?;
+            total += parts.values().map(|(size, _)| size).sum::<u64>();
+        }
+        Ok(total)
     }
 
     pub async fn parts(
@@ -159,14 +200,16 @@ impl Uploads {
     }
 
     /// Aborting an upload that does not exist is not an error, as in S3.
-    pub async fn abort(&self, upload_id: &str, bucket: &str, key: &str) -> Result<(), S3Error> {
+    pub async fn abort(&self, upload_id: &str, bucket: &str, key: &str) -> Result<u64, S3Error> {
         match self.meta(upload_id, bucket, key).await {
             Ok(_) => {}
-            Err(e) if e.code == "NoSuchUpload" => return Ok(()),
+            Err(e) if e.code == "NoSuchUpload" => return Ok(0),
             Err(e) => return Err(e),
         }
 
-        remove_dir(&self.upload_dir(upload_id)?).await
+        let freed = self.bytes(upload_id).await?;
+        remove_dir(&self.upload_dir(upload_id)?).await?;
+        Ok(freed)
     }
 
     /// Joins the requested parts, in ascending order, each with the ETag it was given.
@@ -340,11 +383,13 @@ mod tests {
         let first = uploads
             .put_part(&id, "b", "k", "1", b"hello ")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let second = uploads
             .put_part(&id, "b", "k", "2", b"world")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         let result = uploads
             .assemble(&id, "b", "k", &[(1, first), (2, second)], 10)
@@ -364,11 +409,13 @@ mod tests {
         let second = uploads
             .put_part(&id, "b", "k", "2", b"world")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let first = uploads
             .put_part(&id, "b", "k", "1", b"hello ")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
 
         let assembled = uploads
             .assemble(&id, "b", "k", &[(1, first), (2, second)], u64::MAX)
@@ -383,8 +430,16 @@ mod tests {
     async fn test_part_sent_again_replaces_the_old_one() {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
-        let old = uploads.put_part(&id, "b", "k", "1", b"old").await.unwrap();
-        let new = uploads.put_part(&id, "b", "k", "1", b"new").await.unwrap();
+        let old = uploads
+            .put_part(&id, "b", "k", "1", b"old")
+            .await
+            .unwrap()
+            .0;
+        let new = uploads
+            .put_part(&id, "b", "k", "1", b"new")
+            .await
+            .unwrap()
+            .0;
 
         let parts = uploads.parts(&id, "b", "k").await.unwrap();
         let stale = uploads.assemble(&id, "b", "k", &[(1, old)], u64::MAX).await;
@@ -398,7 +453,7 @@ mod tests {
     async fn test_bad_requests_are_rejected() {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
-        let etag = uploads.put_part(&id, "b", "k", "1", b"x").await.unwrap();
+        let etag = uploads.put_part(&id, "b", "k", "1", b"x").await.unwrap().0;
         let code = |r: Result<Assembled, S3Error>| r.err().unwrap().code;
 
         assert_eq!(

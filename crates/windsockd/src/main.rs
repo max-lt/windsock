@@ -6,6 +6,7 @@
 //! ```
 
 mod config;
+mod disk;
 mod listener;
 mod quarantine;
 
@@ -362,6 +363,21 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
     }
 
     let s3 = s3api::S3Config::new(config.keys(), config.data_dir.join("uploads"));
+    let parts = s3api::reserve_waiting_parts(&engine, &s3.uploads_dir)
+        .await
+        .context("cannot read the multipart uploads")?;
+    if parts > 0 {
+        info!(bytes = parts, "multipart parts wait for a complete");
+    }
+    let usage = engine
+        .local_usage()
+        .await
+        .context("cannot measure the local disk")?;
+    let limits = disk::Limits {
+        cache: config.engine.cache_bytes,
+        buffer: config.engine.buffer_limit_bytes,
+    };
+    disk::check(&config.data_dir, usage, limits);
     let router = s3api::router(engine.clone(), s3).layer(axum::middleware::from_fn(track_requests));
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await

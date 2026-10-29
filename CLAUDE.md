@@ -185,7 +185,7 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | XML                          | `quick-xml` 0.41 with `serialize`                                                     |
 | SigV4                        | `hmac`, `sha2`, `subtle`                                                              |
 | URL form encoding            | `form_urlencoded`                                                                     |
-| fd limit                     | `rustix` (`process`)                                                                  |
+| fd limit, free disk space    | `rustix` (`fs`, `process`)                                                            |
 | HTTP body type (`windsockd`) | `http-body` 1                                                                         |
 | TLS (feature `tls` only)     | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
 | HTTP tests                   | `tower` (`util`), `http-body-util`                                                    |

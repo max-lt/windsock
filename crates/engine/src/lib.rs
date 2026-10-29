@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -152,6 +152,16 @@ pub enum WriteMode {
     CreateOnly,
 }
 
+/// Bytes on the local disk, by use. Only the cache can shrink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocalUsage {
+    pub index: u64,
+    pub cache: u64,
+    pub buffer: u64,
+    /// Accepted data outside the buffer, such as multipart parts.
+    pub reserved: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub key: String,
@@ -240,6 +250,8 @@ pub struct Engine<R> {
     quarantined: AtomicBool,
     /// The last buffer append failed: logged once until an append works.
     buffer_failing: AtomicBool,
+    /// Accepted bytes outside the buffer, such as multipart parts. They count against `buffer_limit`.
+    reserved: AtomicU64,
     /// When this process first saw each object that waits for a GC delete.
     gc_waits: gc::Waits,
     /// Snapshot bases with parts and no head, and when this node first listed each one
@@ -498,6 +510,7 @@ impl<R: Remote + 'static> Engine<R> {
             draining: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
+            reserved: AtomicU64::new(0),
             gc_waits: gc::Waits::default(),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),

@@ -61,7 +61,7 @@ pub struct Config {
     pub own_pack_threshold: usize,
     /// The flusher uploads buffered writes at least this often.
     pub flush_delay: Duration,
-    /// Puts fail once the local buffer holds this many bytes.
+    /// Puts fail once the local buffer and the reserved bytes hold this many bytes.
     pub buffer_limit: u64,
     /// Bound of the local chunk cache. Zero turns the cache off.
     pub cache_bytes: u64,

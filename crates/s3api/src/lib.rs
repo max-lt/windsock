@@ -70,6 +70,17 @@ impl<R> Clone for AppState<R> {
     }
 }
 
+/// Counts the parts that uploads in `uploads_dir` hold against the buffer limit. Call it once,
+/// before [`router`], or the parts of an earlier process take disk with no limit.
+pub async fn reserve_waiting_parts<R: Remote + 'static>(
+    engine: &Engine<R>,
+    uploads_dir: &std::path::Path,
+) -> Result<u64, S3Error> {
+    let bytes = Uploads::new(uploads_dir).all_bytes().await?;
+    engine.reserve_unchecked(bytes);
+    Ok(bytes)
+}
+
 /// The S3 routes. Serve it with `axum::serve`.
 pub fn router<R: Remote + 'static>(engine: Arc<Engine<R>>, config: S3Config) -> Router {
     let state = AppState {

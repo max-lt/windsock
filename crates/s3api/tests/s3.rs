@@ -26,14 +26,21 @@ struct Server {
 }
 
 async fn server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    server_with(Config::default()).await
+}
+
+async fn server_with(config: Config) -> Server {
+    server_in(tempfile::tempdir().unwrap(), config).await
+}
+
+async fn server_in(dir: TempDir, config: Config) -> Server {
     let remote = Arc::new(DirRemote::open(dir.path().join("remote")).unwrap());
     let engine = Engine::open(
         dir.path().join("engine"),
         remote,
         SigningKey::from_bytes(&[1u8; 32]),
         engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
-        Config::default(),
+        config,
     )
     .await
     .unwrap();
@@ -42,6 +49,9 @@ async fn server() -> Server {
         HashMap::from([(ACCESS.to_string(), SECRET.to_string())]),
         dir.path().join("uploads"),
     );
+    s3api::reserve_waiting_parts(&engine, &config.uploads_dir)
+        .await
+        .unwrap();
     let app = s3api::router(engine.clone(), config);
 
     Server {
@@ -199,7 +209,10 @@ async fn run(server: &Server, call: Call<'_>) -> Reply {
 }
 
 async fn with_bucket() -> Server {
-    let server = server().await;
+    bucket_on(server().await).await
+}
+
+async fn bucket_on(server: Server) -> Server {
     let reply = run(&server, call("PUT", "/bkt")).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     server
@@ -1365,4 +1378,105 @@ async fn test_xml_with_many_duplicate_attributes_answers_quickly() {
         started.elapsed()
     );
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+}
+
+async fn small_buffer() -> Server {
+    let config = Config {
+        buffer_limit: 1000,
+        ..Config::default()
+    };
+    bucket_on(server_with(config).await).await
+}
+
+#[tokio::test]
+async fn test_parts_count_against_the_buffer_limit() {
+    let server = small_buffer().await;
+    let id = run(&server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap();
+
+    let first = upload_part(&server, &id, 1, &"x".repeat(600)).await;
+    let second = upload_part(&server, &id, 2, &"x".repeat(600)).await;
+    let plain = put(&server, "other", &"x".repeat(600)).await;
+
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_replaced_and_aborted_parts_free_their_room() {
+    let server = small_buffer().await;
+    let id = run(&server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap();
+    upload_part(&server, &id, 1, &"x".repeat(600)).await;
+
+    let replaced = upload_part(&server, &id, 1, &"x".repeat(400)).await;
+    let beside = upload_part(&server, &id, 2, &"x".repeat(400)).await;
+    run(&server, call("DELETE", &format!("/bkt/big?uploadId={id}"))).await;
+    let after_abort = put(&server, "other", &"x".repeat(600)).await;
+
+    assert_eq!(replaced.status, StatusCode::OK);
+    assert_eq!(beside.status, StatusCode::OK);
+    assert_eq!(after_abort.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_complete_does_not_count_its_parts_twice() {
+    let server = small_buffer().await;
+    let id = run(&server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap();
+    let etag = upload_part(&server, &id, 1, &"x".repeat(600))
+        .await
+        .header("etag")
+        .unwrap()
+        .to_string();
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+
+    let completed = run(
+        &server,
+        call("POST", &format!("/bkt/big?uploadId={id}")).body(body),
+    )
+    .await;
+
+    assert_eq!(completed.status, StatusCode::OK, "{}", completed.text());
+    assert_eq!(
+        run(&server, call("GET", "/bkt/big")).await.text().len(),
+        600
+    );
+}
+
+#[tokio::test]
+async fn test_parts_of_an_earlier_process_count_against_the_buffer_limit() {
+    let config = || Config {
+        buffer_limit: 1000,
+        ..Config::default()
+    };
+    let server = bucket_on(server_with(config()).await).await;
+    let id = run(&server, call("POST", "/bkt/big?uploads"))
+        .await
+        .xml("UploadId")
+        .unwrap();
+    upload_part(&server, &id, 1, &"x".repeat(600)).await;
+    server.engine.flush().await.unwrap();
+    let Server {
+        _dir: dir,
+        engine,
+        app,
+    } = server;
+    drop(app);
+    drop(engine);
+
+    let server = server_in(dir, config()).await;
+    let plain = put(&server, "other", &"x".repeat(600)).await;
+
+    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
 }

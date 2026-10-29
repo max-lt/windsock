@@ -16,10 +16,22 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         if headers.contains_key("x-amz-copy-source") {
             return Err(S3Error::not_implemented("UploadPartCopy is not supported"));
         }
-        let part_etag = state
+        let size = body.len() as u64;
+        // A new part replaces the part with its number, so only the growth needs room.
+        let grow = size.saturating_sub(state.uploads.part_size(upload_id, number).await);
+        state.engine.reserve(grow).await?;
+        let (part_etag, replaced) = match state
             .uploads
             .put_part(upload_id, &bucket, &key, number, &body)
-            .await?;
+            .await
+        {
+            Ok(done) => done,
+            Err(e) => {
+                state.engine.release(grow);
+                return Err(e);
+            }
+        };
+        state.engine.release((grow + replaced).saturating_sub(size));
         return Ok(reply(StatusCode::OK)
             .header("etag", xml::quoted(&part_etag))
             .body(Body::empty())
@@ -186,7 +198,8 @@ pub(crate) async fn object_delete<R: Remote + 'static>(
     reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
 
     if let Some(upload_id) = params.get("uploadId") {
-        state.uploads.abort(upload_id, &bucket, &key).await?;
+        let freed = state.uploads.abort(upload_id, &bucket, &key).await?;
+        state.engine.release(freed);
         return empty(StatusCode::NO_CONTENT);
     }
 
@@ -228,6 +241,9 @@ pub(crate) async fn object_post<R: Remote + 'static>(
             state.engine.max_object_size(),
         )
         .await?;
+    // The put counts the object in the buffer, so its parts must stop to count first.
+    let parts = state.uploads.bytes(upload_id).await?;
+    state.engine.release(parts);
     let info = state
         .engine
         .put(
@@ -237,7 +253,14 @@ pub(crate) async fn object_post<R: Remote + 'static>(
             assembled.metadata,
             WriteMode::Overwrite,
         )
-        .await?;
+        .await;
+    let info = match info {
+        Ok(info) => info,
+        Err(e) => {
+            state.engine.reserve_unchecked(parts);
+            return Err(e.into());
+        }
+    };
     state.uploads.finish(upload_id).await?;
 
     info!(

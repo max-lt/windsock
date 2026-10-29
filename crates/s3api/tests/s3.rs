@@ -2063,7 +2063,7 @@ async fn test_presigned_request_gets_503_while_the_clock_is_ahead() {
         reply.text()
     );
     assert!(
-        reply.text().contains("writes resume in"),
+        reply.text().contains("presigned requests resume in"),
         "{}",
         reply.text()
     );

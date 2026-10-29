@@ -236,8 +236,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   of its wall clock, a presigned request gets `503 SlowDown`: the expiry needs a trusted wall
   clock. A step back of the wall clock under R can make an expired URL valid again for the length
   of the step.
-- The holder of a presigned URL has the rights of the key that signed it, on every bucket, until
-  the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
+- Every key reaches every bucket: there are no rights per key. So the holder of a presigned URL
+  has the rights of the key that signed it, on every bucket, until the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
   metadata, If-Match and If-None-Match. Sign Content-Type when it matters. A PUT URL works many
   times until its expiry, each time for an object up to the buffer limit, and each PUT takes
   about 3 times its object in memory (see below).

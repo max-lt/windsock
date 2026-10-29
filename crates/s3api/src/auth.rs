@@ -196,7 +196,13 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
     let (access_key, signer) = match presign::is_presigned(parts.uri.query()) {
         true => {
             // The expiry needs a wall clock that the proxy trusts.
-            state.engine.check_clock()?;
+            if let Err(engine::EngineError::ClockAhead { wait_secs }) = state.engine.check_clock() {
+                return Err(S3Error::new(
+                    "SlowDown",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("the clock is ahead, presigned requests resume in {wait_secs} s"),
+                ));
+            }
             let presigned = presign::verify(&parts, &state.keys, unix_now(), MAX_SKEW_SECS)?;
             (presigned.access_key, None)
         }

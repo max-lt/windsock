@@ -53,7 +53,14 @@ pub fn connection_limit(soft: Option<u64>) -> Result<usize, String> {
 
 /// Checks a `max_connections` from the configuration against the soft limit `soft`.
 pub fn check_connections(max: usize, soft: Option<u64>) -> Result<usize, String> {
-    let needed = 2 * max as u64 + FD_RESERVE;
+    if max == 0 {
+        return Err("max_connections = 0 takes no client".to_string());
+    }
+    let needed = (max as u64)
+        .checked_mul(2)
+        .and_then(|fds| fds.checked_add(FD_RESERVE))
+        .filter(|_| max <= Semaphore::MAX_PERMITS)
+        .ok_or_else(|| format!("max_connections = {max} is too large"))?;
     match soft {
         Some(soft) if needed > soft => Err(format!(
             "max_connections = {max} needs {needed} descriptors (2 for each connection, and \
@@ -377,6 +384,17 @@ mod tests {
         let error = check_connections(500, Some(1024)).unwrap_err();
 
         assert!(error.contains("500") && error.contains("1256") && error.contains("1024"));
+    }
+
+    #[test]
+    fn test_zero_or_huge_max_connections_is_refused() {
+        assert!(
+            check_connections(0, None)
+                .unwrap_err()
+                .contains("max_connections = 0")
+        );
+        assert!(check_connections(usize::MAX, Some(1024)).is_err());
+        assert!(check_connections(usize::MAX, None).is_err());
     }
 
     #[tokio::test]

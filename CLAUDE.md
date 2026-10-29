@@ -3,23 +3,21 @@
 S3-compatible proxy and cache. The remote object store (Backblaze B2 or any
 S3-compatible store) holds the only durable copy of the data.
 
-Design, decisions and milestones: `../windsock-todo.md`. State: milestones 0 to 14 are done. The
-section "Hand-over" of that file lists the open decisions and the known limits: read it first.
+Design: `docs/storage.md` (storage contract, formats, startup) and `docs/encryption.md`.
 
 ## Build and test
 
 ```bash
 cargo build                                  # build everything
-cargo test                                   # all tests (about 280; windsockd cluster tests ~85 s)
+just test                                    # all tests
 cargo test -p model                          # one crate
-cargo clippy --all-targets -- -D warnings    # lint, zero warnings, tests included
-cargo fmt --check                            # format check
+just check                                   # fmt, clippy (default, tls, fuzz/), zero warnings
 npx --yes prettier@3 --check '**/*.md'       # Markdown format check (--write to fix)
-scripts/bench.sh                             # bench, release build, a few minutes
+just fuzz 60                                 # each fuzz target for 60 s (nightly)
+just bench                                   # bench, release build, a few minutes
 ```
 
-A milestone is complete only when `cargo clippy --all-targets -- -D warnings` and
-`cargo fmt --check` pass. `README.md` shows how to run the daemon locally.
+A milestone is complete only when `just check` passes. `README.md` shows how to run the daemon locally.
 
 ## Layout
 
@@ -62,7 +60,7 @@ The daemon crate is `windsockd`.
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
   `README.md` has the steps to run it locally.
 - `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with
-  `scripts/bench.sh`; the numbers are in `../windsock-todo.md`, milestone 14.
+  `just bench`.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
   pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
   never on the laptop.

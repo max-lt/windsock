@@ -16,6 +16,8 @@ pub const PROBE_PREFIX: &str = "probe/";
 
 /// Complete probes that end in an ambiguous error before a node starts with no check.
 pub const STARTUP_ATTEMPTS: usize = 3;
+/// The largest probe object that the probe reads: it writes a few bytes.
+const PROBE_MAX: u64 = 1024;
 
 const RANGE_BODY: &[u8] = b"windsock-range-probe";
 const RANGE: std::ops::Range<u64> = 9..14;
@@ -92,7 +94,7 @@ async fn create_contract(remote: &impl Sweep, key: &str) -> Result<Verdict, Remo
         Err(error) => return Err(error),
     }
 
-    if remote.get(key).await?.as_deref() != Some(b"first".as_slice()) {
+    if remote.get(key, PROBE_MAX).await?.as_deref() != Some(b"first".as_slice()) {
         return violation("a read after a write did not return the first write");
     }
 
@@ -181,8 +183,8 @@ mod tests {
             }
         }
 
-        async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
-            self.0.get(key).await
+        async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
+            self.0.get(key, max_len).await
         }
 
         async fn get_range(
@@ -191,7 +193,7 @@ mod tests {
             range: Range<u64>,
         ) -> Result<Option<Bytes>, RemoteError> {
             match self.1 {
-                Fault::RangeReturnsAll => self.0.get(key).await,
+                Fault::RangeReturnsAll => self.0.get(key, u64::MAX).await,
                 _ => self.0.get_range(key, range).await,
             }
         }

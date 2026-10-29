@@ -120,7 +120,7 @@ async fn forged_entry(remote: &MemoryRemote, seed: u8, hlc: u64, actions: Vec<Ac
 async fn entries(remote: &MemoryRemote) -> Vec<Entry> {
     let mut out = Vec::new();
     for key in remote.list(journal::LOG_PREFIX).await.unwrap() {
-        let bytes = remote.get(&key).await.unwrap().unwrap();
+        let bytes = remote.get(&key, u64::MAX).await.unwrap().unwrap();
         out.push(Entry::from_wire(&bytes, keys().sealer()).unwrap());
     }
     out
@@ -406,8 +406,11 @@ async fn test_changed_copy_of_a_read_entry_is_found_at_the_gc() {
     let (a, b) = chain_of(&remote, 2).await;
     b.engine.sync().await.unwrap();
     let last = journal::entry_key(a.engine.node(), 1);
-    let read =
-        Entry::from_wire(&remote.get(&last).await.unwrap().unwrap(), keys().sealer()).unwrap();
+    let read = Entry::from_wire(
+        &remote.get(&last, u64::MAX).await.unwrap().unwrap(),
+        keys().sealer(),
+    )
+    .unwrap();
     let changed = Entry::sign(
         &SigningKey::from_bytes(&[1; 32]),
         1,
@@ -505,8 +508,11 @@ async fn test_bad_signature_mid_chain_names_node_and_seq() {
     let remote = Arc::new(MemoryRemote::default());
     let (a, b) = chain_of(&remote, 3).await;
     let key = journal::entry_key(a.engine.node(), 1);
-    let read =
-        Entry::from_wire(&remote.get(&key).await.unwrap().unwrap(), keys().sealer()).unwrap();
+    let read = Entry::from_wire(
+        &remote.get(&key, u64::MAX).await.unwrap().unwrap(),
+        keys().sealer(),
+    )
+    .unwrap();
     let forged = Entry::sign(
         &SigningKey::from_bytes(&[7; 32]),
         1,
@@ -544,7 +550,7 @@ async fn test_extreme_and_duplicate_seqs_break_the_chain_with_no_panic() {
     let (a, _b) = chain_of(&remote, 2).await;
     let node = a.engine.node();
     let first = remote
-        .get(&journal::entry_key(node, 0))
+        .get(&journal::entry_key(node, 0), u64::MAX)
         .await
         .unwrap()
         .unwrap();
@@ -562,7 +568,7 @@ async fn test_extreme_and_duplicate_seqs_break_the_chain_with_no_panic() {
         let (a, _b) = chain_of(&remote, 1).await;
         let node = a.engine.node();
         let bytes = remote
-            .get(&journal::entry_key(node, 0))
+            .get(&journal::entry_key(node, 0), u64::MAX)
             .await
             .unwrap()
             .unwrap();
@@ -923,7 +929,10 @@ async fn test_broken_mark_clears_with_no_gc_run() {
     let mut held = Vec::new();
     for seq in [1, 2] {
         let key = journal::entry_key(a.engine.node(), seq);
-        held.push((key.clone(), remote.get(&key).await.unwrap().unwrap()));
+        held.push((
+            key.clone(),
+            remote.get(&key, u64::MAX).await.unwrap().unwrap(),
+        ));
         remote.delete(&key).await.unwrap();
     }
     let c = proxy(&remote, 3).await;

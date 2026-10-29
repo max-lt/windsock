@@ -127,7 +127,7 @@ async fn test_certificate_from_an_unknown_ca_is_refused() {
     let (_dir, endpoint) = tls_server().await;
     let remote = S3Remote::new(config(&endpoint, "", None)).unwrap();
 
-    assert!(remote.get("any").await.is_err());
+    assert!(remote.get("any", u64::MAX).await.is_err());
 }
 
 #[tokio::test]
@@ -143,7 +143,7 @@ async fn test_self_signed_certificate_is_refused() {
     let (_dir, endpoint) = tls_server_with(SELF_CERT, SELF_KEY).await;
     let remote = S3Remote::new(config(&endpoint, "", None)).unwrap();
 
-    let error = remote.get("any").await.unwrap_err();
+    let error = remote.get("any", u64::MAX).await.unwrap_err();
 
     assert!(error.to_string().contains("UnknownIssuer"), "{error}");
 }
@@ -154,7 +154,7 @@ async fn test_certificate_for_another_hostname_is_refused() {
     let (_dir, endpoint) = tls_server_with(OTHER_CERT, OTHER_KEY).await;
     let remote = S3Remote::new(config(&endpoint, "", Some(OTHER_CA))).unwrap();
 
-    let error = remote.get("any").await.unwrap_err();
+    let error = remote.get("any", u64::MAX).await.unwrap_err();
 
     assert!(error.to_string().contains("not valid for name"), "{error}");
 }

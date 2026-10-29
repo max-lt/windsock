@@ -27,6 +27,7 @@ webpki-roots = { workspace = true, optional = true }
 tls = ["dep:hyper-rustls", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
+futures-util.workspace = true
 remote = { workspace = true, features = ["contract"] }
 engine.workspace = true
 s3api.workspace = true

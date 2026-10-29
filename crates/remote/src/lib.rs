@@ -31,6 +31,8 @@ pub enum RemoteError {
     },
     #[error("object already exists: {0:?}")]
     AlreadyExists(String),
+    #[error("{key:?} has {len} bytes, over the limit of {max} bytes for this read")]
+    TooLarge { key: String, len: u64, max: u64 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     /// A remote service answered with an error that a retry does not fix.
@@ -53,8 +55,9 @@ pub trait Remote: Send + Sync {
     /// Stores `data` at `key` when no object exists there. Two concurrent creates have one winner.
     async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError>;
 
-    /// Returns the object at `key`, or `None` if it does not exist.
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError>;
+    /// Returns the object at `key`, or `None` if it does not exist. An object larger than
+    /// `max_len` gives `TooLarge`, and no byte of its body is read: the remote is not trusted.
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError>;
 
     /// Returns `range` of the object at `key`, or `None` if it does not exist.
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError>;
@@ -154,7 +157,10 @@ mod tests {
 
         let reopened = DirRemote::open(dir.path()).unwrap();
 
-        assert_eq!(reopened.get("packs/a").await.unwrap().unwrap(), "data");
+        assert_eq!(
+            reopened.get("packs/a", u64::MAX).await.unwrap().unwrap(),
+            "data"
+        );
     }
 
     #[tokio::test]

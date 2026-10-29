@@ -192,7 +192,7 @@ async fn test_wrong_secret_is_a_service_error() {
     wrong.secret_key = "other".into();
     let remote = S3Remote::new(wrong).unwrap();
 
-    let result = remote.get("packs/a").await;
+    let result = remote.get("packs/a", u64::MAX).await;
 
     assert!(matches!(
         result,
@@ -256,7 +256,10 @@ async fn test_transient_errors_are_retried() {
     .await;
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    assert_eq!(remote.get("packs/a").await.unwrap().unwrap(), "data");
+    assert_eq!(
+        remote.get("packs/a", u64::MAX).await.unwrap().unwrap(),
+        "data"
+    );
     assert_eq!(count.load(Ordering::SeqCst), 3);
 }
 
@@ -285,7 +288,7 @@ async fn test_client_errors_are_not_retried() {
     .await;
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    assert!(remote.get("packs/a").await.is_err());
+    assert!(remote.get("packs/a", u64::MAX).await.is_err());
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
@@ -310,7 +313,7 @@ async fn test_a_silent_server_hits_the_time_limit() {
     let remote = S3Remote::new(slow).unwrap();
     let start = Instant::now();
 
-    let result = remote.get("packs/a").await;
+    let result = remote.get("packs/a", u64::MAX).await;
 
     assert!(
         matches!(result, Err(RemoteError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut)
@@ -339,7 +342,7 @@ async fn test_ranged_read_with_a_huge_answer_fails() {
     let message = error.to_string();
     assert!(message.contains("packs/p"), "{message}");
     assert!(
-        message.contains("larger than the limit of 65546 bytes"),
+        message.contains("over the limit of 65546 bytes"),
         "{message}"
     );
 }
@@ -394,7 +397,7 @@ async fn test_reply_shorter_than_its_content_length_fails() {
     let endpoint = raw_server(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort").await;
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    assert!(remote.get("log/x").await.is_err());
+    assert!(remote.get("log/x", u64::MAX).await.is_err());
 }
 
 #[tokio::test]
@@ -480,7 +483,7 @@ async fn test_dropped_connections_retry_to_the_limit() {
     });
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    let result = remote.get("packs/a").await;
+    let result = remote.get("packs/a", u64::MAX).await;
 
     assert!(matches!(result, Err(RemoteError::Io(_))), "{result:?}");
     assert_eq!(count.load(Ordering::SeqCst), 3);
@@ -492,7 +495,7 @@ async fn test_clock_skew_error_names_its_code_and_is_not_retried() {
     let (endpoint, count) = always(StatusCode::FORBIDDEN, "RequestTimeTooSkewed").await;
     let remote = S3Remote::new(config(&endpoint, "")).unwrap();
 
-    let error = remote.get("packs/a").await.unwrap_err();
+    let error = remote.get("packs/a", u64::MAX).await.unwrap_err();
 
     assert!(
         error.to_string().contains("RequestTimeTooSkewed"),
@@ -523,7 +526,7 @@ async fn test_redirect_is_an_error_and_is_not_followed() {
         });
         let remote = S3Remote::new(config(&serve(app).await, "")).unwrap();
 
-        let get = remote.get("packs/a").await;
+        let get = remote.get("packs/a", u64::MAX).await;
         let put = remote.put("packs/a", Bytes::from("x")).await;
 
         assert!(
@@ -560,7 +563,7 @@ async fn test_keys_that_need_encoding_round_trip() {
 
     for key in keys {
         assert_eq!(
-            remote.get(key).await.unwrap().unwrap(),
+            remote.get(key, u64::MAX).await.unwrap().unwrap(),
             key.as_bytes(),
             "{key}"
         );
@@ -632,7 +635,7 @@ async fn test_slow_and_endless_bodies_hit_the_attempt_timeout() {
         let remote = S3Remote::new(config).unwrap();
         let start = Instant::now();
 
-        let result = remote.get("packs/a").await;
+        let result = remote.get("packs/a", u64::MAX).await;
 
         assert!(matches!(result, Err(RemoteError::Io(_))), "{result:?}");
         assert!(
@@ -670,7 +673,7 @@ async fn test_a_burst_of_reads_opens_a_capped_number_of_connections() {
     let reads: Vec<_> = (0..1000)
         .map(|_| {
             let remote = remote.clone();
-            tokio::spawn(async move { remote.get("packs/a").await })
+            tokio::spawn(async move { remote.get("packs/a", u64::MAX).await })
         })
         .collect();
     for read in reads {
@@ -760,7 +763,7 @@ async fn test_slow_remote_with_a_full_cap_still_acknowledges_puts() {
     let reads: Vec<_> = (0..s3remote::MAX_IN_FLIGHT + 1)
         .map(|_| {
             let remote = remote.clone();
-            tokio::spawn(async move { remote.get("packs/none").await })
+            tokio::spawn(async move { remote.get("packs/none", u64::MAX).await })
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -830,7 +833,11 @@ async fn test_service_error_names_the_host_and_the_key() {
     wrong.secret_key = "other".into();
     let remote = S3Remote::new(wrong).unwrap();
 
-    let error = remote.get("log/n1/7").await.unwrap_err().to_string();
+    let error = remote
+        .get("log/n1/7", u64::MAX)
+        .await
+        .unwrap_err()
+        .to_string();
 
     let host = server.endpoint.trim_start_matches("http://");
     assert!(error.contains("SignatureDoesNotMatch"), "{error}");
@@ -847,7 +854,11 @@ async fn test_refused_connection_names_the_host_and_the_key() {
     refused.retry = quick_retry();
     let remote = S3Remote::new(refused).unwrap();
 
-    let error = remote.get("log/n1/7").await.unwrap_err().to_string();
+    let error = remote
+        .get("log/n1/7", u64::MAX)
+        .await
+        .unwrap_err()
+        .to_string();
 
     assert!(
         error.contains(endpoint.trim_start_matches("http://")),
@@ -872,7 +883,7 @@ async fn test_wait_for_a_slot_does_not_use_up_the_attempt_time() {
     let reads: Vec<_> = (0..s3remote::MAX_IN_FLIGHT + 1)
         .map(|_| {
             let remote = remote.clone();
-            tokio::spawn(async move { remote.get("packs/none").await })
+            tokio::spawn(async move { remote.get("packs/none", u64::MAX).await })
         })
         .collect();
 
@@ -897,13 +908,13 @@ async fn test_wait_for_a_slot_ends_at_the_call_time_limit() {
     let busy: Vec<_> = (0..s3remote::MAX_IN_FLIGHT)
         .map(|_| {
             let remote = remote.clone();
-            tokio::spawn(async move { remote.get("packs/none").await })
+            tokio::spawn(async move { remote.get("packs/none", u64::MAX).await })
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let start = Instant::now();
-    let result = remote.get("packs/other").await;
+    let result = remote.get("packs/other", u64::MAX).await;
     let waited = start.elapsed();
 
     assert!(waited < Duration::from_millis(1500), "waited {waited:?}");
@@ -945,7 +956,7 @@ async fn test_attempts_that_time_out_do_not_keep_their_connections() {
     let before = open_fds();
 
     for n in 0..200 {
-        assert!(remote.get(&format!("packs/{n}")).await.is_err());
+        assert!(remote.get(&format!("packs/{n}"), u64::MAX).await.is_err());
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -955,4 +966,59 @@ async fn test_attempts_that_time_out_do_not_keep_their_connections() {
         client <= 64,
         "{client} client connections stay open after 200 timeouts"
     );
+}
+
+/// A server whose GET answers with `chunks` pieces of 64 KiB, with or without a length. Returns
+/// the endpoint and the count of pieces that the body stream gave.
+async fn large_reply_server(chunks: usize, with_length: bool) -> (String, Arc<AtomicU32>) {
+    use futures_util::StreamExt;
+
+    let given = Arc::new(AtomicU32::new(0));
+    let counter = given.clone();
+    let app = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            let pieces = futures_util::stream::iter(0..chunks).map(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(Bytes::from(vec![0u8; 64 * 1024]))
+            });
+            let mut reply = Response::builder().status(StatusCode::OK);
+            if with_length {
+                reply = reply.header("content-length", chunks * 64 * 1024);
+            }
+            reply.body(Body::from_stream(pieces)).unwrap()
+        }
+    });
+    (serve(app).await, given)
+}
+
+#[tokio::test]
+async fn test_get_over_the_limit_reads_no_body_when_the_length_is_known() {
+    let (endpoint, given) = large_reply_server(1024, true).await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let result = remote.get("packs/big", 1 << 20).await;
+
+    let Err(RemoteError::TooLarge { len, max, .. }) = result else {
+        panic!("a 64 MiB reply over a limit of 1 MiB: {result:?}");
+    };
+    assert_eq!((len, max), (64 << 20, 1 << 20));
+    // The server fills the socket buffers at most: far from the 1024 pieces of the body.
+    let given = given.load(Ordering::SeqCst);
+    assert!(given < 128, "the server gave {given} pieces of 64 KiB");
+}
+
+#[tokio::test]
+async fn test_get_over_the_limit_stops_a_body_with_no_length() {
+    let (endpoint, given) = large_reply_server(1024, false).await;
+    let remote = S3Remote::new(config(&endpoint, "")).unwrap();
+
+    let result = remote.get("packs/big", 1 << 20).await;
+
+    let Err(RemoteError::TooLarge { len, max, .. }) = result else {
+        panic!("a chunked reply over a limit of 1 MiB: {result:?}");
+    };
+    assert_eq!((len, max), ((1 << 20) + 1, 1 << 20));
+    let given = given.load(Ordering::SeqCst);
+    assert!(given < 128, "the server gave {given} pieces of 64 KiB");
 }

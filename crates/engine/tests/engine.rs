@@ -37,8 +37,8 @@ impl Remote for AmbiguousRemote {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
-        self.inner.get(key).await
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -452,7 +452,7 @@ async fn test_remote_holds_no_bucket_key_or_data_in_clear() {
     assert!(!remote.list("snapshots/").await.unwrap().is_empty());
 
     for key in remote.list("").await.unwrap() {
-        let stored = remote.get(&key).await.unwrap().unwrap();
+        let stored = remote.get(&key, u64::MAX).await.unwrap().unwrap();
         for needle in [
             b"tenant-bucket".as_slice(),
             b"secret-object-name",
@@ -522,7 +522,7 @@ async fn test_remote_holds_no_etag_metadata_or_size_and_names_show_nothing() {
         ] {
             assert!(!key.contains(word), "the name {key} holds {word}");
         }
-        let stored = remote.get(key).await.unwrap().unwrap();
+        let stored = remote.get(key, u64::MAX).await.unwrap().unwrap();
         for (what, needle) in &needles {
             assert!(
                 !stored.windows(needle.len()).any(|w| w == needle.as_slice()),
@@ -542,7 +542,7 @@ async fn test_manifest_on_the_remote_is_sealed() {
 
     let key = remote.list("manifests/").await.unwrap().remove(0);
     let id: model::ObjectId = key.trim_start_matches("manifests/").parse().unwrap();
-    let stored = remote.get(&key).await.unwrap().unwrap();
+    let stored = remote.get(&key, u64::MAX).await.unwrap().unwrap();
     let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
 
     assert!(engine::Manifest::decode(id, &stored).is_err());
@@ -824,7 +824,7 @@ async fn test_uncompressed_policy_stores_raw_chunks() {
     a.engine.flush().await.unwrap();
 
     let packs = remote.list("packs/").await.unwrap();
-    let pack = remote.get(&packs[0]).await.unwrap().unwrap();
+    let pack = remote.get(&packs[0], u64::MAX).await.unwrap().unwrap();
     assert!(pack.len() > data.len());
     assert_eq!(get(&a.engine, "k").await.unwrap(), data);
 }
@@ -1076,7 +1076,7 @@ async fn test_reader_fails_on_a_bad_chunk_and_does_not_end_early() {
 
     let mut reader = a.engine.get_reader(BUCKET, "k", None).await.unwrap();
     let first = a.engine.next_piece(&mut reader).await.unwrap().unwrap();
-    let mut bytes = remote.get(pack).await.unwrap().unwrap().to_vec();
+    let mut bytes = remote.get(pack, u64::MAX).await.unwrap().unwrap().to_vec();
     let late = bytes.len() * 3 / 4;
     bytes[late] ^= 1;
     remote.put(pack, Bytes::from(bytes)).await.unwrap();
@@ -1107,7 +1107,7 @@ impl Remote for ManifestGate {
         self.inner.create(key, data).await
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         if key.starts_with(engine::MANIFESTS_PREFIX) {
             match self.mode.load(Ordering::SeqCst) {
                 1 => return Ok(Some(Bytes::from_static(b"garbage"))),
@@ -1115,7 +1115,7 @@ impl Remote for ManifestGate {
                 _ => {}
             }
         }
-        self.inner.get(key).await
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -1221,8 +1221,8 @@ impl Remote for SyncCounter {
         self.inner.create(key, data).await
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
-        self.inner.get(key).await
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {

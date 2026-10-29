@@ -36,6 +36,8 @@ pub use clock::{set_manual_monotonic, set_manual_wall, suspend_manual};
 
 /// Appends that lose the seq to another process before `append` gives up.
 const MAX_ATTEMPTS: u32 = 8;
+/// The largest journal entry that a reader takes. A writer keeps its actions under half of it.
+pub const MAX_ENTRY: u64 = 1 << 30;
 
 /// R by default: 24 h in nanoseconds.
 const DEFAULT_MAX_AHEAD: u64 = 24 * 3600 * 1_000_000_000;
@@ -257,7 +259,7 @@ impl<R: Remote> Journal<R> {
         let read = self.sync_node(self.node).await?;
         self.stashed.extend(read);
 
-        let stored = self.remote.get(&entry.remote_key()).await?;
+        let stored = self.remote.get(&entry.remote_key(), MAX_ENTRY).await?;
         Ok(stored
             .and_then(|bytes| Entry::from_wire(&bytes, &self.sealer).ok())
             .is_some_and(|stored| stored.hash() == entry.hash()))
@@ -283,7 +285,19 @@ impl<R: Remote> Journal<R> {
 
         loop {
             let key = entry_key(node, frontier.next_seq);
-            let Some(bytes) = self.remote.get(&key).await? else {
+            let read = match self.remote.get(&key, MAX_ENTRY).await {
+                Err(RemoteError::TooLarge { len, .. }) => {
+                    return Err(JournalError::Chain {
+                        node,
+                        source: ChainError::TooLarge {
+                            seq: frontier.next_seq,
+                            len,
+                        },
+                    });
+                }
+                read => read?,
+            };
+            let Some(bytes) = read else {
                 // A writer creates seq n before n + 1: a later entry with no entry here is a gap,
                 // and the chain would end here for this reader only.
                 let next = frontier
@@ -291,7 +305,7 @@ impl<R: Remote> Journal<R> {
                     .checked_add(1)
                     .map(|seq| entry_key(node, seq));
                 if let Some(next) = next
-                    && self.remote.get(&next).await?.is_some()
+                    && self.remote.get_range(&next, 0..0).await?.is_some()
                 {
                     return Err(JournalError::Chain {
                         node,
@@ -371,7 +385,7 @@ impl<R: Remote> Journal<R> {
         let Some(last) = frontier.next_seq.checked_sub(1) else {
             return Ok(highest);
         };
-        let same = match self.remote.get(&entry_key(node, last)).await? {
+        let same = match self.remote.get(&entry_key(node, last), MAX_ENTRY).await? {
             Some(bytes) => Entry::from_wire(&bytes, &self.sealer)
                 .is_ok_and(|entry| entry.hash() == frontier.last_hash),
             None => false,
@@ -525,6 +539,7 @@ impl<R: Remote> Journal<R> {
             source,
             ChainError::BadMac { seq: 0 }
                 | ChainError::Malformed { seq: 0 }
+                | ChainError::TooLarge { seq: 0, .. }
                 | ChainError::Gap { seq: 0, .. }
         );
         if first && self.frontier(node) == Frontier::GENESIS && self.fake.insert(node) {
@@ -550,16 +565,17 @@ impl<R: Remote> Journal<R> {
         for _ in 0..2 {
             match self.remote.create(&key, Bytes::new()).await {
                 Ok(()) => {}
-                Err(RemoteError::AlreadyExists(_)) => match self.remote.get(&key).await? {
-                    None => continue,
-                    // The marker only says that the node exists: its content is never read.
-                    Some(bytes) if !bytes.is_empty() => {
+                // The marker only says that the node exists: a limit of 0 reads none of its content.
+                Err(RemoteError::AlreadyExists(_)) => match self.remote.get(&key, 0).await {
+                    Ok(None) => continue,
+                    Ok(Some(_)) => {}
+                    Err(RemoteError::TooLarge { .. }) => {
                         warn!(
                             key,
                             "the node marker holds data that this node did not write"
                         );
                     }
-                    Some(_) => {}
+                    Err(e) => return Err(e.into()),
                 },
                 Err(e) => return Err(e.into()),
             }
@@ -623,14 +639,24 @@ mod tests {
 
         let entry = a.append(vec![put("k")], Seen::new()).await.unwrap();
 
-        let stored = remote.get(&entry.remote_key()).await.unwrap().unwrap();
+        let stored = remote
+            .get(&entry.remote_key(), u64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
         let decoded = Entry::from_wire(&stored, &entry::test_sealer()).unwrap();
         assert_eq!(decoded, entry);
         assert!(decoded.signature_is_valid());
         assert_eq!(entry.seq, 0);
         assert!(entry.seen.is_empty());
         assert_eq!(a.frontier(a.node()).next_seq, 1);
-        assert!(remote.get(&node_key(a.node())).await.unwrap().is_some());
+        assert!(
+            remote
+                .get(&node_key(a.node()), u64::MAX)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -981,6 +1007,8 @@ mod tests {
         }
     }
 
+    const OVERSIZE: &[u8] = b"oversize";
+
     /// A remote that counts the log keys that its listings return, and the log listings.
     #[derive(Default)]
     struct Counting {
@@ -1010,11 +1038,19 @@ mod tests {
             self.inner.create(key, data).await
         }
 
-        async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
             if key.starts_with(LOG_PREFIX) {
                 self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            self.inner.get(key).await
+            // The bytes OVERSIZE stand for an object larger than any limit, as a backend reports it.
+            if self.inner.get(key, u64::MAX).await?.as_deref() == Some(OVERSIZE) {
+                return Err(RemoteError::TooLarge {
+                    key: key.to_string(),
+                    len: max_len + 1,
+                    max: max_len,
+                });
+            }
+            self.inner.get(key, max_len).await
         }
 
         async fn get_range(
@@ -1091,8 +1127,8 @@ mod tests {
 
         reader.sync_all().await.unwrap();
 
-        // The real chain and the own chain: the next seq and the gap probe each.
-        assert_eq!(remote.gets.load(ordering), 4);
+        // The real chain and the own chain: one GET of the next seq each. The gap probe reads no body.
+        assert_eq!(remote.gets.load(ordering), 2);
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 5);
         assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
@@ -1137,7 +1173,8 @@ mod tests {
         }
     }
 
-    /// A chain with garbage at seq 0, or with seq 1 and no seq 0, needs no key either.
+    /// A chain with garbage or an object over the entry limit at seq 0, or with seq 1 and no
+    /// seq 0, needs no key either.
     #[tokio::test]
     async fn test_chains_with_no_valid_first_entry_cost_nothing_at_a_normal_sync() {
         let remote = Arc::new(Counting::default());
@@ -1150,10 +1187,14 @@ mod tests {
         real.append(vec![put("a")], Seen::new()).await.unwrap();
         for seed in 60..66 {
             let node = NodeId::from_bytes(key(seed).verifying_key().to_bytes());
-            let seq = if seed < 63 { 0 } else { 1 };
+            let (seq, bytes) = match seed {
+                60 => (0, OVERSIZE),
+                61..63 => (0, b"x".as_slice()),
+                _ => (1, b"x".as_slice()),
+            };
             remote
                 .inner
-                .put(&entry_key(node, seq), Bytes::from_static(b"x"))
+                .put(&entry_key(node, seq), Bytes::from_static(bytes))
                 .await
                 .unwrap();
             remote
@@ -1176,7 +1217,7 @@ mod tests {
 
         reader.sync_all().await.unwrap();
 
-        assert_eq!(remote.gets.load(ordering), 4);
+        assert_eq!(remote.gets.load(ordering), 2);
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 6);
         assert_eq!(reader.broken().len(), 6, "the fake chains stay marked");

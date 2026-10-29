@@ -67,7 +67,7 @@ fn unavailable() -> RemoteError {
 impl Remote for FaultRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         if self.write_once.load(std::sync::atomic::Ordering::SeqCst)
-            && self.inner.get(key).await?.is_some()
+            && self.inner.get(key, u64::MAX).await?.is_some()
         {
             return Err(unavailable());
         }
@@ -93,7 +93,7 @@ impl Remote for FaultRemote {
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         if key.starts_with("log/") {
             self.log_gets
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -102,7 +102,7 @@ impl Remote for FaultRemote {
         if failing.is_some_and(|prefix| key.starts_with(prefix)) {
             return Err(unavailable());
         }
-        self.inner.get(key).await
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -396,8 +396,8 @@ async fn test_apply_error_does_not_read_the_chains_again_at_each_sync() {
     let read = gets() - before;
 
     // Three chains: the writer, the forged node, and the own empty chain that the open read. For
-    // each one the read of the next seq and the gap probe.
-    assert_eq!(read, 6, "entry reads at one sync; {second:?}");
+    // each one the read of the next seq. The gap probe reads no body.
+    assert_eq!(read, 3, "entry reads at one sync; {second:?}");
 }
 
 /// Two processes share one identity. The second one commits after the first, so its commit reads
@@ -1016,7 +1016,7 @@ async fn test_commit_never_goes_on_with_no_node_marker() {
 
     let flushed = writer.engine.flush().await;
 
-    let marked = remote.inner.get(&marker).await.unwrap().is_some();
+    let marked = remote.inner.get(&marker, u64::MAX).await.unwrap().is_some();
     assert!(flushed.is_err() || marked, "a commit with no node marker");
 }
 

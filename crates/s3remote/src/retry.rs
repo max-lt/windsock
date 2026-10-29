@@ -81,6 +81,8 @@ impl Retry {
             drop(slot);
             let error = match result {
                 Ok(Ok(value)) => return Ok(value),
+                // The object stays as large: a retry reads nothing new.
+                Ok(Err(e @ RemoteError::TooLarge { .. })) => return Err(e),
                 Ok(Err(e)) => e,
                 Err(_) => RemoteError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,

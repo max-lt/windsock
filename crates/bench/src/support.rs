@@ -77,9 +77,9 @@ impl Remote for CountingRemote {
         self.inner.create(key, data).await
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         bump(&self.counts.get);
-        self.inner.get(key).await
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {

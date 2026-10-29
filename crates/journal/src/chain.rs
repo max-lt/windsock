@@ -118,6 +118,8 @@ pub enum ChainError {
     FutureHlc { seq: u64 },
     #[error("entry {seq} differs from the copy that this proxy read before, or is gone")]
     Changed { seq: u64 },
+    #[error("entry {seq} has {len} bytes, over the entry limit")]
+    TooLarge { seq: u64, len: u64 },
 }
 
 #[cfg(test)]

@@ -112,6 +112,9 @@ pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 /// and each one costs a read: the load fails closed after this many.
 const MAX_CANDIDATES: usize = 3;
 
+/// The largest head that a load reads: 4096 parts and the frontiers of many nodes fit.
+const MAX_HEAD: u64 = 16 * 1024 * 1024;
+
 /// Why no snapshot loads: each skipped key with its cause.
 #[derive(Debug, Default)]
 pub(crate) struct NoSnapshot(Vec<String>);
@@ -226,10 +229,13 @@ impl<R: Remote + 'static> Engine<R> {
     /// The head of a snapshot in parts, opened and checked against the cap.
     async fn read_head(&self, base: &str) -> Result<std::result::Result<Head, String>> {
         let key = format!("{base}{HEAD}");
-        let read = self.remote.get(&key).await;
-        let read = read.map_err(|e| EngineError::Corrupt(format!("{key}: {e}")))?;
-        let Some(sealed) = read else {
-            return Ok(Err("the head is gone".to_string()));
+        let sealed = match self.remote.get(&key, MAX_HEAD).await {
+            Ok(Some(sealed)) => sealed,
+            Ok(None) => return Ok(Err("the head is gone".to_string())),
+            Err(RemoteError::TooLarge { len, .. }) => {
+                return Ok(Err(format!("the head has {len} bytes, over {MAX_HEAD}")));
+            }
+            Err(e) => return Err(EngineError::Corrupt(format!("{key}: {e}"))),
         };
         let plain = match self
             .keys
@@ -465,7 +471,7 @@ impl<R: Remote + 'static> Engine<R> {
 
             for seq in from..frontier.next_seq {
                 let key = entry_key(*node, seq);
-                let Some(bytes) = self.remote.get(&key).await? else {
+                let Some(bytes) = self.remote.get(&key, journal::MAX_ENTRY).await? else {
                     continue;
                 };
                 let without_actions = journal::redact_wire(&bytes)

@@ -62,8 +62,8 @@ impl Remote for TestRemote {
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
-        self.inner.get(key).await
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -301,7 +301,7 @@ async fn test_orphan_pack_is_deleted() {
     past_horizon().await;
 
     assert_eq!(a.engine.gc().await.unwrap().deleted_packs, 1);
-    assert!(remote.get(&orphan).await.unwrap().is_none());
+    assert!(remote.get(&orphan, u64::MAX).await.unwrap().is_none());
 }
 
 /// Large metadata pushes the manifest past the inline limit, with a small object.
@@ -460,7 +460,7 @@ async fn test_broken_chain_fails_alone_and_recovers() {
     }
     let broken = writers[2].engine.node();
     let key = journal::entry_key(broken, 0);
-    let good = remote.get(&key).await.unwrap().unwrap();
+    let good = remote.get(&key, u64::MAX).await.unwrap().unwrap();
     let mut tampered = good.to_vec();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;

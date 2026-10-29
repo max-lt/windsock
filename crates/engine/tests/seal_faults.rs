@@ -66,7 +66,7 @@ async fn keys(remote: &MemoryRemote, prefix: &str) -> Vec<String> {
 }
 
 async fn flip(remote: &MemoryRemote, key: &str, at: impl Fn(usize) -> usize) {
-    let mut bytes = remote.get(key).await.unwrap().unwrap().to_vec();
+    let mut bytes = remote.get(key, u64::MAX).await.unwrap().unwrap().to_vec();
     let i = at(bytes.len());
     bytes[i] ^= 1;
     remote.put(key, Bytes::from(bytes)).await.unwrap();
@@ -140,7 +140,7 @@ async fn test_manifest_moved_to_another_key_does_not_open() {
     let remote = Arc::new(MemoryRemote::default());
     written(&remote).await;
     let manifests = keys(&remote, "manifests/").await;
-    let first = remote.get(&manifests[0]).await.unwrap().unwrap();
+    let first = remote.get(&manifests[0], u64::MAX).await.unwrap().unwrap();
     remote.put(&manifests[1], first).await.unwrap();
 
     let reader = proxy(&remote, 2).await;
@@ -160,7 +160,7 @@ async fn test_pack_moved_to_another_key_does_not_open() {
     let remote = Arc::new(MemoryRemote::default());
     written(&remote).await;
     let packs = keys(&remote, "packs/").await;
-    let first = remote.get(&packs[0]).await.unwrap().unwrap();
+    let first = remote.get(&packs[0], u64::MAX).await.unwrap().unwrap();
     remote.put(&packs[1], first).await.unwrap();
 
     let reader = proxy(&remote, 2).await;
@@ -180,7 +180,7 @@ async fn test_journal_entry_moved_to_another_seq_breaks_the_chain() {
     let remote = Arc::new(MemoryRemote::default());
     written(&remote).await;
     let entries = keys(&remote, "log/").await;
-    let first = remote.get(&entries[0]).await.unwrap().unwrap();
+    let first = remote.get(&entries[0], u64::MAX).await.unwrap().unwrap();
     remote.put(&entries[1], first).await.unwrap();
 
     let reader = proxy(&remote, 2).await;
@@ -211,7 +211,7 @@ async fn test_key_check_moved_or_changed_refuses_the_open() {
             KeyCheckChange::LastByte => flip(&remote, "repo/key-check", |len| len - 1).await,
             KeyCheckChange::Moved => {
                 let pack = keys(&remote, "packs/").await.remove(0);
-                let other = remote.get(&pack).await.unwrap().unwrap();
+                let other = remote.get(&pack, u64::MAX).await.unwrap().unwrap();
                 remote.put("repo/key-check", other).await.unwrap();
             }
         }
@@ -290,8 +290,8 @@ impl Remote for ShortRanges {
         self.0.create(key, data).await
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, remote::RemoteError> {
-        self.0.get(key).await
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, remote::RemoteError> {
+        self.0.get(key, max_len).await
     }
 
     async fn get_range(
@@ -316,7 +316,7 @@ async fn ranged_read_with(answer: Answer) -> Result<engine::Object, EngineError>
     written(&memory).await;
     let short = Arc::new(ShortRanges(MemoryRemote::default(), answer));
     for key in memory.list("").await.unwrap() {
-        let bytes = memory.get(&key).await.unwrap().unwrap();
+        let bytes = memory.get(&key, u64::MAX).await.unwrap().unwrap();
         short.0.put(&key, bytes).await.unwrap();
     }
     let dir = tempfile::tempdir().unwrap();

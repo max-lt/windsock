@@ -17,6 +17,7 @@ where
 {
     put_get_roundtrip(&fresh().await).await;
     missing_object_is_none(&fresh().await).await;
+    get_over_the_limit_is_too_large(&fresh().await).await;
     put_replaces_object(&fresh().await).await;
     get_range_returns_slice(&fresh().await).await;
     get_range_outside_object_is_rejected(&fresh().await).await;
@@ -33,11 +34,42 @@ where
 pub async fn put_get_roundtrip(remote: &impl Sweep) {
     remote.put("packs/a", Bytes::from("data")).await.unwrap();
 
-    assert_eq!(remote.get("packs/a").await.unwrap().unwrap(), "data");
+    assert_eq!(
+        remote.get("packs/a", u64::MAX).await.unwrap().unwrap(),
+        "data"
+    );
+}
+
+pub async fn get_over_the_limit_is_too_large(remote: &impl Sweep) {
+    remote
+        .put("packs/a", Bytes::from("0123456789"))
+        .await
+        .unwrap();
+    remote.put("nodes/a", Bytes::new()).await.unwrap();
+
+    let over = remote.get("packs/a", 9).await;
+
+    assert!(
+        matches!(
+            &over,
+            Err(RemoteError::TooLarge {
+                len: 10,
+                max: 9,
+                ..
+            })
+        ),
+        "{over:?}"
+    );
+    assert_eq!(
+        remote.get("packs/a", 10).await.unwrap().unwrap(),
+        "0123456789"
+    );
+    assert_eq!(remote.get("nodes/a", 0).await.unwrap().unwrap(), "");
+    assert!(remote.get("packs/none", 0).await.unwrap().is_none());
 }
 
 pub async fn missing_object_is_none(remote: &impl Sweep) {
-    assert!(remote.get("packs/a").await.unwrap().is_none());
+    assert!(remote.get("packs/a", u64::MAX).await.unwrap().is_none());
     assert!(remote.get_range("packs/a", 0..1).await.unwrap().is_none());
 }
 
@@ -45,7 +77,10 @@ pub async fn put_replaces_object(remote: &impl Sweep) {
     remote.put("heads/a", Bytes::from("old")).await.unwrap();
     remote.put("heads/a", Bytes::from("new")).await.unwrap();
 
-    assert_eq!(remote.get("heads/a").await.unwrap().unwrap(), "new");
+    assert_eq!(
+        remote.get("heads/a", u64::MAX).await.unwrap().unwrap(),
+        "new"
+    );
 }
 
 pub async fn get_range_returns_slice(remote: &impl Sweep) {
@@ -111,7 +146,10 @@ pub async fn list_after_returns_the_next_keys_under_prefix(remote: &impl Sweep) 
 pub async fn create_writes_a_new_key(remote: &impl Sweep) {
     remote.create("log/a", Bytes::from("data")).await.unwrap();
 
-    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "data");
+    assert_eq!(
+        remote.get("log/a", u64::MAX).await.unwrap().unwrap(),
+        "data"
+    );
 }
 
 pub async fn create_keeps_the_existing_object(remote: &impl Sweep) {
@@ -120,7 +158,7 @@ pub async fn create_keeps_the_existing_object(remote: &impl Sweep) {
     let result = remote.create("log/a", Bytes::from("new")).await;
 
     assert!(matches!(result, Err(RemoteError::AlreadyExists(_))));
-    assert_eq!(remote.get("log/a").await.unwrap().unwrap(), "old");
+    assert_eq!(remote.get("log/a", u64::MAX).await.unwrap().unwrap(), "old");
 }
 
 pub async fn concurrent_creates_have_one_winner<R: Sweep + 'static>(remote: Arc<R>) {
@@ -147,7 +185,7 @@ pub async fn concurrent_creates_have_one_winner<R: Sweep + 'static>(remote: Arc<
 
     assert_eq!(winners.len(), 1);
     assert_eq!(
-        remote.get("log/a").await.unwrap().unwrap(),
+        remote.get("log/a", u64::MAX).await.unwrap().unwrap(),
         vec![winners[0]]
     );
 }
@@ -183,7 +221,7 @@ pub async fn delete_removes_the_object(remote: &impl Sweep) {
 
     remote.delete("packs/a").await.unwrap();
 
-    assert!(remote.get("packs/a").await.unwrap().is_none());
+    assert!(remote.get("packs/a", u64::MAX).await.unwrap().is_none());
     assert_eq!(remote.list("packs/").await.unwrap(), ["packs/b"]);
 }
 

@@ -71,7 +71,7 @@ impl Remote for TestRemote {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         if key.starts_with(engine::SNAPSHOTS_PREFIX)
             && !key.ends_with("/head")
             && self.refuse_snapshot_get.load(Ordering::SeqCst)
@@ -83,7 +83,7 @@ impl Remote for TestRemote {
         if key.starts_with(journal::LOG_PREFIX) {
             self.log_gets.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.get(key).await
+        self.inner.get(key, max_len).await
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -136,7 +136,11 @@ impl TestRemote {
         range: Range<u64>,
         tamper: Tamper,
     ) -> Result<Option<Bytes>, RemoteError> {
-        let whole = self.inner.get(key).await?.expect("the snapshot exists");
+        let whole = self
+            .inner
+            .get(key, u64::MAX)
+            .await?
+            .expect("the snapshot exists");
         if let Tamper::Resize(len) = tamper
             && range.start == 0
         {
@@ -283,7 +287,7 @@ async fn keys(engine: &Engine<TestRemote>) -> Vec<String> {
 async fn entries(remote: &TestRemote) -> Vec<Entry> {
     let mut out = Vec::new();
     for key in remote.inner.list(journal::LOG_PREFIX).await.unwrap() {
-        let bytes = remote.inner.get(&key).await.unwrap().unwrap();
+        let bytes = remote.inner.get(&key, u64::MAX).await.unwrap().unwrap();
         let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
         out.push(Entry::from_wire(&bytes, keys.sealer()).unwrap());
     }
@@ -538,7 +542,13 @@ async fn latest(remote: &TestRemote) -> (String, u64) {
         .into_iter()
         .rfind(|key| key.ends_with("/000000"))
         .unwrap();
-    let len = remote.inner.get(&key).await.unwrap().unwrap().len() as u64;
+    let len = remote
+        .inner
+        .get(&key, u64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .len() as u64;
     (key, len)
 }
 
@@ -832,7 +842,13 @@ async fn test_snapshot_with_a_corrupt_part_fails_with_the_part_key() {
     let (base, redacted) = history_in_parts(&remote, 100, 0).await;
     assert!(redacted > 0);
     let part = format!("{base}/000001");
-    let mut bytes = remote.inner.get(&part).await.unwrap().unwrap().to_vec();
+    let mut bytes = remote
+        .inner
+        .get(&part, u64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_vec();
     bytes[10] ^= 1;
     remote.inner.put(&part, Bytes::from(bytes)).await.unwrap();
 
@@ -848,7 +864,7 @@ async fn test_snapshot_with_a_short_part_fails_with_the_part_key() {
     let (base, redacted) = history_in_parts(&remote, 100, 0).await;
     assert!(redacted > 0);
     let part = format!("{base}/000001");
-    let bytes = remote.inner.get(&part).await.unwrap().unwrap();
+    let bytes = remote.inner.get(&part, u64::MAX).await.unwrap().unwrap();
     remote.inner.put(&part, bytes.slice(..50)).await.unwrap();
 
     let error = load_after_prune(&remote).await.unwrap();
@@ -914,7 +930,7 @@ async fn test_snapshot_in_one_object_still_loads() {
     assert!(redacted > 0);
     let whole = remote
         .inner
-        .get(&format!("{base}/000000"))
+        .get(&format!("{base}/000000"), u64::MAX)
         .await
         .unwrap()
         .unwrap();
@@ -992,7 +1008,7 @@ async fn parts_with_no_head(remote: &TestRemote, time: u64) -> Vec<String> {
         .filter(|key| key.starts_with(&format!("{base}/0")))
     {
         let part = key.rsplit_once('/').unwrap().1;
-        let bytes = remote.inner.get(key).await.unwrap().unwrap();
+        let bytes = remote.inner.get(key, u64::MAX).await.unwrap().unwrap();
         let copy = format!("{orphan}/{part}");
         remote.inner.put(&copy, bytes).await.unwrap();
         out.push(copy);
@@ -1123,7 +1139,7 @@ async fn test_newest_snapshot_in_parts_that_fails_falls_back_to_an_older_single_
     let b = proxy(&remote, 2).await;
 
     let older = older.strip_suffix("/head").unwrap().to_string();
-    assert!(remote.inner.get(&older).await.unwrap().is_some());
+    assert!(remote.inner.get(&older, u64::MAX).await.unwrap().is_some());
     assert!(
         remote.snapshot_ranges.load(Ordering::SeqCst) >= 4,
         "the newest parts, then the older object"
@@ -1161,7 +1177,13 @@ async fn test_two_proxies_that_write_a_snapshot_at_once_get_two_keys_that_load()
 /// Flips one byte of a part and keeps its key.
 async fn flip_part(remote: &TestRemote, head: &str, n: usize) {
     let part = format!("{}/{n:06}", head.strip_suffix("/head").unwrap());
-    let mut bytes = remote.inner.get(&part).await.unwrap().unwrap().to_vec();
+    let mut bytes = remote
+        .inner
+        .get(&part, u64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_vec();
     bytes[0] ^= 1;
     remote.inner.put(&part, Bytes::from(bytes)).await.unwrap();
 }
@@ -1206,7 +1228,7 @@ async fn test_gc_keeps_the_older_snapshot_when_the_newer_does_not_load() {
     a.engine.gc().await.unwrap();
 
     assert!(
-        remote.inner.get(&older).await.unwrap().is_some(),
+        remote.inner.get(&older, u64::MAX).await.unwrap().is_some(),
         "the older head stays"
     );
     let b = proxy(&remote, 2).await;
@@ -1219,7 +1241,7 @@ async fn to_one_object(remote: &TestRemote, head: &str) {
     let mut whole = Vec::new();
     for key in remote.list(&format!("{base}/")).await.unwrap() {
         if !key.ends_with("/head") {
-            whole.extend_from_slice(&remote.inner.get(&key).await.unwrap().unwrap());
+            whole.extend_from_slice(&remote.inner.get(&key, u64::MAX).await.unwrap().unwrap());
         }
         remote.inner.delete(&key).await.unwrap();
     }

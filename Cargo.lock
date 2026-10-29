@@ -1462,6 +1462,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "engine",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-rustls",

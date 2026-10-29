@@ -19,6 +19,8 @@ pub const MANIFESTS_PREFIX: &str = "manifests/";
 
 /// Manifests up to this size travel inside the journal entry.
 pub const INLINE_MAX: usize = 4096;
+/// The largest manifest that a proxy reads. A 5 GiB object in chunks of 16 KiB needs about 30 MiB.
+pub const MAX_MANIFEST: u64 = 64 * 1024 * 1024;
 
 /// One chunk of an object and where it is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

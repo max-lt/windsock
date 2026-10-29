@@ -110,14 +110,30 @@ impl DirRemote {
         }
     }
 
-    async fn get_at(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get_at(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
 
-        match tokio::fs::read(self.root.join(key)).await {
-            Ok(data) => Ok(Some(Bytes::from(data))),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let Some(file) = open_file(&self.root.join(key)).await? else {
+            return Ok(None);
+        };
+        let too_large = |len| RemoteError::TooLarge {
+            key: key.to_string(),
+            len,
+            max: max_len,
+        };
+        let len = file.metadata().await?.len();
+        if len > max_len {
+            return Err(too_large(len));
         }
+        // The file can grow after the size check.
+        let mut data = Vec::with_capacity(len as usize);
+        file.take(max_len.saturating_add(1))
+            .read_to_end(&mut data)
+            .await?;
+        if data.len() as u64 > max_len {
+            return Err(too_large(data.len() as u64));
+        }
+        Ok(Some(Bytes::from(data)))
     }
 
     async fn get_range_at(
@@ -195,9 +211,9 @@ impl Remote for DirRemote {
         self.create_at(key, data).await.map_err(|e| at(&path, e))
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         let path = self.root.join(key);
-        self.get_at(key).await.map_err(|e| at(&path, e))
+        self.get_at(key, max_len).await.map_err(|e| at(&path, e))
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
@@ -238,7 +254,11 @@ mod tests {
         let remote = DirRemote::open(dir.path()).unwrap();
         remote.put("log/a", Bytes::from_static(b"x")).await.unwrap();
 
-        let error = remote.get("log/a/1").await.unwrap_err().to_string();
+        let error = remote
+            .get("log/a/1", u64::MAX)
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains(&dir.path().join("log/a/1").display().to_string()),

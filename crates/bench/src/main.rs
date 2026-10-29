@@ -117,7 +117,7 @@ async fn round_trip(remote: &CountingRemote, m: &mut Measures) -> Result<(), Err
     let mut latencies = Vec::with_capacity(RTT_SAMPLES);
     for _ in 0..RTT_SAMPLES {
         let sent = Instant::now();
-        remote.get("no-such-key").await?;
+        remote.get("no-such-key", 1024).await?;
         latencies.push(sent.elapsed());
     }
     latencies.sort();

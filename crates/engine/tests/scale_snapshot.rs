@@ -86,7 +86,7 @@ async fn test_snapshot_scale_by_part_size() {
         let mut bytes = 0;
         for n in 0..parts {
             bytes += remote
-                .get(&format!("{base}/{n:06}"))
+                .get(&format!("{base}/{n:06}"), u64::MAX)
                 .await
                 .unwrap()
                 .unwrap()

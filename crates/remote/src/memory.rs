@@ -38,17 +38,24 @@ impl Remote for MemoryRemote {
         Ok(())
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
         let objects = self
             .objects
             .read()
             .expect("no panic while the lock is held");
-        Ok(objects.get(key).cloned())
+        match objects.get(key) {
+            Some(data) if data.len() as u64 > max_len => Err(RemoteError::TooLarge {
+                key: key.to_string(),
+                len: data.len() as u64,
+                max: max_len,
+            }),
+            data => Ok(data.cloned()),
+        }
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
-        let Some(data) = self.get(key).await? else {
+        let Some(data) = self.get(key, u64::MAX).await? else {
             return Ok(None);
         };
 

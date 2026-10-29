@@ -252,7 +252,11 @@ impl<R: Remote + 'static> Engine<R> {
             return Manifest::decode(id, &bytes);
         }
 
-        let Some(sealed) = self.remote.get(&manifest_key(id)).await? else {
+        let Some(sealed) = self
+            .remote
+            .get(&manifest_key(id), manifest::MAX_MANIFEST)
+            .await?
+        else {
             return Err(EngineError::Corrupt(format!("manifest {id} is missing")));
         };
 

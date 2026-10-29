@@ -333,16 +333,34 @@ impl S3Remote {
                     .map_err(|e| RemoteError::Io(std::io::Error::other(with_causes(&e))))?;
                 let status = response.status();
                 let headers = response.headers().clone();
-                let body = http_body_util::Limited::new(response.into_body(), call.max_reply)
+                let key = call.key.unwrap_or("the bucket");
+                // An error reply is XML: it gets this room whatever the limit of the object.
+                let max = match status.is_success() {
+                    true => call.max_reply,
+                    false => call.max_reply.max(ERROR_ROOM),
+                } as u64;
+                let too_large = |len| RemoteError::TooLarge {
+                    key: key.to_string(),
+                    len,
+                    max,
+                };
+                // The response drops here, so the connection closes before its body. A HEAD gives the
+                // size of the object and no body.
+                let declared = headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                if let Some(len) = declared.filter(|len| *len > max && call.method != Method::HEAD)
+                {
+                    return Err(too_large(len));
+                }
+                let body = http_body_util::Limited::new(response.into_body(), max as usize)
                     .collect()
                     .await
                     .map_err(|e| {
+                        // A body with no length stops at the limit: at least one byte more.
                         if e.is::<http_body_util::LengthLimitError>() {
-                            let key = call.key.unwrap_or("the bucket");
-                            let limit = call.max_reply;
-                            return RemoteError::Io(std::io::Error::other(format!(
-                                "the reply for {key} is larger than the limit of {limit} bytes"
-                            )));
+                            return too_large(max + 1);
                         }
                         RemoteError::Io(std::io::Error::other(e))
                     })?
@@ -435,9 +453,11 @@ impl Remote for S3Remote {
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         check_key(key)?;
-        let reply = self.send(Call::new(Method::GET, Some(key))).await?;
+        let mut call = Call::new(Method::GET, Some(key));
+        call.max_reply = usize::try_from(max_len).unwrap_or(usize::MAX);
+        let reply = self.send(call).await?;
 
         match reply.status {
             StatusCode::NOT_FOUND => Ok(None),

@@ -65,9 +65,11 @@ const CACHE_DIR: &str = "cache";
 /// A known value, sealed under the repository key: it tells whether a key is the key of a remote.
 pub const KEY_CHECK_KEY: &str = "repo/key-check";
 const KEY_CHECK: &str = "windsock repository key check";
-/// The largest actions of one entry that a proxy writes. Half of the 1 GiB that a reader takes in
-/// one reply, so every proxy reads every entry whatever its own setting.
-pub const MAX_ENTRY_ACTIONS: u64 = 512 * 1024 * 1024;
+/// The largest key check that a proxy reads: a sealed value and the rules of the remote.
+const MAX_KEY_CHECK: u64 = 64 * 1024;
+/// The largest actions of one entry that a proxy writes. Half of the entry that a reader takes, so
+/// every proxy reads every entry whatever its own setting.
+pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
 /// The remote format of this build: journal actions carry their ack HLC.
 const REMOTE_FORMAT: u32 = 3;
 
@@ -614,7 +616,7 @@ impl<R: Remote + 'static> Engine<R> {
         let check = sealer.seal(seal::Kind::KeyCheck, KEY_CHECK.as_bytes(), text.as_bytes());
 
         // A journal with no key check is not encrypted, or another tool wrote it.
-        if self.remote.get(KEY_CHECK_KEY).await?.is_none()
+        if self.remote.get_range(KEY_CHECK_KEY, 0..0).await?.is_none()
             && !self.remote.list(journal::LOG_PREFIX).await?.is_empty()
         {
             return Err(EngineError::WrongRepoKey(format!(
@@ -630,10 +632,18 @@ impl<R: Remote + 'static> Engine<R> {
             Err(e) => return Err(e.into()),
         }
 
-        let Some(stored) = self.remote.get(KEY_CHECK_KEY).await? else {
-            return Err(EngineError::WrongRepoKey(format!(
-                "{KEY_CHECK_KEY} is gone"
-            )));
+        let stored = match self.remote.get(KEY_CHECK_KEY, MAX_KEY_CHECK).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return Err(EngineError::WrongRepoKey(format!(
+                    "{KEY_CHECK_KEY} is gone"
+                )));
+            }
+            // No proxy writes a key check that large: it is not the key check of this key.
+            Err(e @ RemoteError::TooLarge { .. }) => {
+                return Err(EngineError::WrongRepoKey(e.to_string()));
+            }
+            Err(e) => return Err(e.into()),
         };
         // The AEAD tag proves the key. The text gives the format and the rules.
         let plain = sealer

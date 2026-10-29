@@ -97,6 +97,11 @@ pub enum EngineError {
     Draining,
     #[error("local buffer is full ({limit} bytes)")]
     BufferFull { limit: u64 },
+    #[error(
+        "the clock of this proxy is more than the retention ahead of its wall clock: writes \
+         resume in {wait_secs} s"
+    )]
+    ClockAhead { wait_secs: u64 },
     #[error("configuration: {0}")]
     Config(String),
     /// A crash point of the simulation test fired: drop the engine.
@@ -256,6 +261,10 @@ pub struct Engine<R> {
     quarantined: AtomicBool,
     /// The last buffer append failed: logged once until an append works.
     buffer_failing: AtomicBool,
+    /// The clock was more than R ahead of the wall clock at the last check: logged once.
+    clock_ahead: AtomicBool,
+    /// The highest own HLC that the open found, and where: the operator sees what holds the clock.
+    own_high: Mutex<(u64, &'static str)>,
     /// Accepted bytes outside the buffer, such as multipart parts. They count against `buffer_limit`.
     reserved: AtomicU64,
     /// When this process first saw each object that waits for a GC delete.
@@ -473,20 +482,27 @@ impl<R: Remote + 'static> Engine<R> {
         );
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
-        // The wall clock can step back across a restart: an ack never goes under an earlier one.
-        // No value moves the clock more than R ahead of the wall clock.
+        // The wall clock can step back across a restart: an ack never goes under an earlier
+        // one, so own values move the clock with no cap. Values of other nodes stop at R ahead.
         let mut journal = journal;
         journal.set_max_ahead(config.retention);
         let clock = journal.clock();
         let ahead = config.retention.as_nanos() as u64;
-        for frontier in index.frontiers()?.values() {
-            clock.witness_at_most(frontier.last_hlc, ahead);
+        let own = journal.node();
+        let mut own_high = (0, "none");
+        for (node, frontier) in index.frontiers()? {
+            if node == own {
+                own_high = own_high.max((frontier.last_hlc, "the own chain"));
+            } else {
+                clock.witness_at_most(frontier.last_hlc, ahead);
+            }
         }
-        clock.witness_at_most(buffer.latest_time(), ahead);
+        own_high = own_high.max((buffer.latest_time(), "a buffer record"));
         // An entry in the intent can be in the remote with no apply: the next one must rise.
         if let Some(intent) = buffer::read_intent(&buffer_dir).await? {
-            clock.witness_at_most(intent.entry.hlc, ahead);
+            own_high = own_high.max((intent.entry.hlc, "the intent"));
         }
+        clock.witness(own_high.0);
         let cache = match config.cache_bytes {
             0 => None,
             bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),
@@ -516,6 +532,8 @@ impl<R: Remote + 'static> Engine<R> {
             draining: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
+            clock_ahead: AtomicBool::new(false),
+            own_high: Mutex::new(own_high),
             reserved: AtomicU64::new(0),
             gc_waits: gc::Waits::default(),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
@@ -541,6 +559,14 @@ impl<R: Remote + 'static> Engine<R> {
         // the newest own entries. One full sync reads every chain, the own one included, through
         // the checks of a normal read, so the clock passes them before the first ack.
         let report = engine.sync().await?;
+        let chain = engine.journal.lock().await.frontier(engine.node).last_hlc;
+        {
+            let mut high = engine
+                .own_high
+                .lock()
+                .expect("no panic while the lock is held");
+            *high = (*high).max((chain, "the own chain"));
+        }
         // This sync does not count for the debounce of a sync on a miss.
         *engine
             .last_sync

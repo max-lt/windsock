@@ -222,6 +222,8 @@ struct Stats {
     stale_plan: bool,
     marker_fault: bool,
     far_ahead: bool,
+    /// The wall clocks stepped back more than R with writes in a buffer.
+    step_back: bool,
     keyless: bool,
     slow_stale_plan: bool,
     /// Chunks that a flush found stored and did not upload again.
@@ -292,6 +294,10 @@ struct Sim {
     /// The latest HLC that a clock more than R ahead gave: until the clock of proxy 0 is
     /// within R of it, its chain is broken there and a GC or a snapshot may fail.
     far_until: u64,
+    /// The nodes whose clock ran more than R ahead: their chains may be broken elsewhere.
+    far_nodes: BTreeSet<[u8; 32]>,
+    /// The largest step back of the wall clocks: the run waits this long at the end.
+    max_step_back: u64,
     /// The highest bound that a version prune of the GC could use: (stable HLC - R).
     prune_bound: u64,
     /// The highest wall clock of any proxy so far: no HLC is above it, also after a step back.
@@ -322,17 +328,37 @@ impl Sim {
             self.highest_clock = self.highest_clock.max(clock);
             if proxy.offset > r {
                 self.far_until = self.far_until.max(clock);
+                self.far_nodes.insert(proxy.node);
             }
         }
     }
 
-    /// A GC or snapshot error that a chain more than R ahead of proxy 0 explains.
+    /// A GC or snapshot error that a clock more than R ahead explains: proxy 0 waits for its
+    /// own wall clock, or proxy 0 reads a chain of a far node as more than R ahead.
     fn far_ahead_explains(&self, e: &EngineError) -> bool {
         let r = config().retention.as_nanos() as u64;
-        let clock = self.now + self.proxies[0].offset;
-        let ahead = clock.saturating_add(r) < self.far_until;
-        ahead && e.to_string().contains("more than the retention ahead")
-            || ahead && matches!(e, EngineError::BrokenChains(_))
+        let wall = self.now + self.proxies[0].offset;
+        if matches!(e, EngineError::ClockAhead { .. }) {
+            let clock = self.proxies[0]
+                .engine
+                .as_ref()
+                .map_or(0, |engine| engine.last_hlc());
+            return clock > wall.saturating_add(r);
+        }
+        let ahead = wall.saturating_add(r) < self.far_until;
+        // A chain reads as more than R ahead when its node ran far ahead, or when its clock is
+        // more than R past this wall clock after a step back.
+        let far = |node: &model::NodeId| {
+            let past_wall = self.proxies.iter().any(|proxy| {
+                let clock = proxy.engine.as_ref().map_or(0, |engine| engine.last_hlc());
+                proxy.node == *node.as_bytes() && proxy.last_ack.max(clock) > wall.saturating_add(r)
+            });
+            self.far_nodes.contains(node.as_bytes()) && ahead || past_wall
+        };
+        match e {
+            EngineError::BrokenChains(nodes) => nodes.iter().all(far),
+            _ => ahead && e.to_string().contains("more than the retention ahead"),
+        }
     }
 
     /// The wall and the monotonic clock of proxy `i`. Each host has its own monotonic clock:
@@ -387,15 +413,6 @@ impl Sim {
                 // A remote error at open: the supervisor starts the proxy again.
                 Err(e) if e.to_string().contains("injected") => {
                     self.log.push(format!("p{i} open failed: {e}"));
-                }
-                // After a clock more than R ahead, an own entry can be more than R ahead of this
-                // clock: the start waits until the clock passes it, as the refusal table says.
-                Err(e)
-                    if self.far_until > 0
-                        && e.to_string().contains("more than the retention ahead") =>
-                {
-                    self.log.push(format!("p{i} open waits for its clock: {e}"));
-                    self.pass(60 * SECOND);
                 }
                 Err(e) => return Err(format!("p{i} open: {e}")),
             }
@@ -525,13 +542,8 @@ impl Sim {
     /// Records an ack of proxy `i` at `hlc` and checks that its acks rise.
     fn acked(&mut self, i: usize, hlc: u64) -> Result<(), String> {
         self.log.push(format!("p{i} ack {hlc}"));
-        // The open caps the clock at wall + R. After a clock more than R ahead, the clock of a
-        // proxy can hold an HLC above that cap: then, and only then, a restart lowers the acks.
-        let r = config().retention.as_nanos() as u64;
-        let cap = self.now + self.proxies[i].offset + r;
-        let capped = self.far_until > 0 && self.proxies[i].last_ack > cap;
         let proxy = &mut self.proxies[i];
-        if hlc <= proxy.last_ack && !capped {
+        if hlc <= proxy.last_ack {
             // The last steps show how the ack went down.
             let tail: Vec<_> = self.log.iter().rev().take(25).rev().cloned().collect();
             let tail = tail.join("\n");
@@ -632,7 +644,15 @@ impl Sim {
             }
             Err(EngineError::Quarantined(_)) => Ok(()),
             Err(e) if hit || self.far_ahead_explains(&e) => Ok(()),
-            Err(e) => Err(format!("gc: {e}")),
+            Err(e) => {
+                let tail: Vec<_> = self.log.iter().rev().take(40).rev().cloned().collect();
+                let causes = self
+                    .engine(0)
+                    .sync()
+                    .await
+                    .map(|report| report.broken_causes);
+                Err(format!("gc: {e}\ncauses {causes:?}\n{}", tail.join("\n")))
+            }
         }
     }
 
@@ -854,6 +874,17 @@ impl Sim {
             86 => {
                 self.proxies[i].offset = self.rng.below(config().late_margin.as_nanos() as u64);
             }
+            87..=88 if self.rng.chance(5) => {
+                // A host boots with a wall clock more than R behind, writes in its buffer: no
+                // ack goes down, and writes wait for the wall clock.
+                let r = config().retention.as_nanos() as u64;
+                let step = r + self.rng.below(r);
+                self.proxies[i].engine = None;
+                self.now = self.now.saturating_sub(step);
+                self.open(i).await?;
+                self.max_step_back = self.max_step_back.max(step);
+                self.stats.step_back = true;
+            }
             87..=88 => {
                 // A step of the wall clock, back or ahead, inside the bound R - M.
                 let step = self.rng.below(120 * SECOND);
@@ -903,7 +934,7 @@ impl Sim {
         for proxy in &mut self.proxies {
             proxy.offset = 0;
         }
-        self.pass(self.max_offset);
+        self.pass(self.max_offset + self.max_step_back);
         for i in 0..3 {
             if self.proxies[i].engine.is_none() {
                 self.open(i).await?;
@@ -1136,6 +1167,8 @@ async fn run(seed: u64) -> Result<Stats, String> {
         log: Vec::new(),
         stats: Stats::default(),
         far_until: 0,
+        far_nodes: BTreeSet::new(),
+        max_step_back: 0,
         prune_bound: 0,
         highest_clock: 0,
         keyless: None,
@@ -1196,6 +1229,7 @@ struct Totals {
     stale_plan: u64,
     marker_fault: u64,
     far_ahead: u64,
+    step_back: u64,
     keyless: u64,
     slow_stale_plan: u64,
     dedup_hits: u64,
@@ -1217,6 +1251,7 @@ impl Totals {
         self.stale_plan += u64::from(stats.stale_plan);
         self.marker_fault += u64::from(stats.marker_fault);
         self.far_ahead += u64::from(stats.far_ahead);
+        self.step_back += u64::from(stats.step_back);
         self.slow_stale_plan += u64::from(stats.slow_stale_plan);
         self.keyless += u64::from(stats.keyless);
         self.dedup_hits += stats.dedup_hits;
@@ -1246,6 +1281,7 @@ impl Totals {
             ("a StalePlan", self.stale_plan),
             ("a failed marker write", self.marker_fault),
             ("a clock more than R ahead", self.far_ahead),
+            ("a wall step back over R with a buffer", self.step_back),
             ("a StalePlan after a slow upload", self.slow_stale_plan),
             ("a chain from a writer with no repo key", self.keyless),
             ("a dedup hit", self.dedup_hits),

@@ -190,9 +190,19 @@ impl<R: Remote> Journal<R> {
     /// Signs actions as the next entry of the own chain, without writing it.
     pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Result<Entry, JournalError> {
         let frontier = self.frontier(self.node);
-        // A chain needs a rising HLC: the clock passes the last own entry, with no cap.
+        // A chain needs a rising HLC, and an entry HLC above each ack in it: no cap.
         self.clock.witness(frontier.last_hlc);
+        let acks = actions.iter().filter_map(Action::hlc).max();
+        self.clock.witness(acks.unwrap_or(0));
         let hlc = self.clock.tick().ok_or(JournalError::ClockOverflow)?;
+        if acks.is_some_and(|ack| ack >= hlc) {
+            return Err(JournalError::Chain {
+                node: self.node,
+                source: ChainError::ActionAfterEntry {
+                    seq: frontier.next_seq,
+                },
+            });
+        }
         Ok(Entry::sign(
             &self.signing_key,
             frontier.next_seq,
@@ -309,8 +319,9 @@ impl<R: Remote> Journal<R> {
             frontier = frontier
                 .extend(node, &entry)
                 .map_err(|source| JournalError::Chain { node, source })?;
-            // The chain reads again once this clock passes the HLC less R.
-            if entry.hlc > clock::limit(self.max_ahead) {
+            // The chain reads again once this clock passes the HLC less R. The own chain passed the
+            // signature and MAC checks above: its HLCs are acks of this node, never a forged value.
+            if node != self.node && entry.hlc > clock::limit(self.max_ahead) {
                 if self.reported_ahead.insert((node, seq)) {
                     error!(%node, seq, hlc = entry.hlc, "entry HLC more than R ahead of this clock");
                 }
@@ -1085,6 +1096,45 @@ mod tests {
         assert_eq!(remote.lists.load(ordering), 0);
         assert_eq!(reader.skipped(), 5);
         assert_eq!(reader.broken().len(), 5, "the fake chains stay marked");
+    }
+
+    /// The own chain is exempt from the FutureHlc check only after the signature and MAC checks:
+    /// a far own entry that fails them moves no clock, and its chain is broken and named.
+    #[tokio::test]
+    async fn test_far_own_entry_with_a_bad_signature_or_mac_moves_no_clock() {
+        for tamper in [entry::with_bad_signature, entry::with_bad_mac] {
+            let remote = Arc::new(MemoryRemote::default());
+            let far = clock::wall_clock_nanos() + 365 * 24 * 3600 * 1_000_000_000;
+            let entry = Entry::sign(
+                &key(1),
+                0,
+                [0; 32],
+                far,
+                Seen::new(),
+                vec![put("a")],
+                &entry::test_sealer(),
+            );
+            let entry = tamper(entry);
+            remote
+                .put(&entry.remote_key(), Bytes::from(entry.to_wire()))
+                .await
+                .unwrap();
+            remote
+                .put(&node_key(entry.node), Bytes::new())
+                .await
+                .unwrap();
+            let mut own = Journal::new(
+                remote.clone(),
+                key(1),
+                entry::test_sealer(),
+                Frontiers::new(),
+            );
+
+            own.sync_all().await.unwrap();
+
+            assert!(own.clock().last() < far, "the clock took a far HLC");
+            assert!(own.broken().contains_key(&entry.node));
+        }
     }
 
     /// A chain with garbage at seq 0, or with seq 1 and no seq 0, needs no key either.

@@ -149,6 +149,37 @@ impl<R: Remote + 'static> Engine<R> {
         self.index().is_poisoned()
     }
 
+    /// Fails while the clock is more than R ahead of the wall clock. A reader refuses an entry
+    /// that far ahead, so this proxy takes no write and signs no entry until the wall catches up.
+    pub(crate) fn check_clock(&self) -> Result<()> {
+        let wall = journal::wall_clock_nanos();
+        let limit = wall.saturating_add(self.config.retention.as_nanos() as u64);
+        let last = self.clock.last();
+        if last <= limit {
+            if self.clock_ahead.swap(false, Ordering::SeqCst) {
+                info!("the wall clock caught up with the clock: writes resume");
+            }
+            return Ok(());
+        }
+        let wait_secs = (last - limit).div_ceil(1_000_000_000);
+        if !self.clock_ahead.swap(true, Ordering::SeqCst) {
+            let (hlc, source) = *self
+                .own_high
+                .lock()
+                .expect("no panic while the lock is held");
+            warn!(
+                clock = last,
+                wall,
+                wait_secs,
+                own_hlc = hlc,
+                source,
+                "the clock is more than R ahead of the wall clock: no write and no flush until \
+                 the wall catches up"
+            );
+        }
+        Err(EngineError::ClockAhead { wait_secs })
+    }
+
     /// Takes `bytes` of the buffer limit for data that waits outside the buffer.
     pub async fn reserve(&self, bytes: u64) -> Result<()> {
         let limit = self.config.buffer_limit;
@@ -221,6 +252,7 @@ impl<R: Remote + 'static> Engine<R> {
                 "restart the proxy to move the buffer to quarantine".to_string(),
             ));
         }
+        self.check_clock()?;
 
         let limit = self.config.buffer_limit;
 

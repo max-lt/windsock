@@ -359,6 +359,20 @@ impl Entry {
     }
 }
 
+/// The entry with one bit of its signature changed. The MAC stays valid.
+#[cfg(test)]
+pub(crate) fn with_bad_signature(mut entry: Entry) -> Entry {
+    entry.signature.0[0] ^= 1;
+    entry
+}
+
+/// The entry with one bit of its MAC changed. The signature stays valid.
+#[cfg(test)]
+pub(crate) fn with_bad_mac(mut entry: Entry) -> Entry {
+    entry.mac[0] ^= 1;
+    entry
+}
+
 /// A fixed repository key for tests.
 #[cfg(test)]
 pub(crate) fn test_sealer() -> Sealer {

@@ -79,6 +79,8 @@ impl<R: Sweep + 'static> Engine<R> {
     /// Runs the GC once. Run it on one proxy only: the model check covers one runner.
     pub async fn gc(&self) -> Result<GcReport> {
         let started = buffer::unix_nanos();
+        // A condemn entry is a write: it waits for the wall clock as a flush does.
+        self.check_clock()?;
         // A broken chain can hold puts of packs that look dead, and it pins the stable HLC.
         self.journal.lock().await.audit_next_sync();
         let sync = self.sync().await?;

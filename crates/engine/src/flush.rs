@@ -31,6 +31,7 @@ impl<R: Remote + 'static> Engine<R> {
     /// Uploads every buffered write and commits it to the journal.
     pub async fn flush(&self) -> Result<()> {
         let _flushing = self.flushing.lock().await;
+        self.check_clock()?;
         self.recover().await?;
 
         let sealed = self.buffer.lock().await.seal().await?;
@@ -62,7 +63,10 @@ impl<R: Remote + 'static> Engine<R> {
                 }
                 // The first pass runs at once: writes replayed after a crash do not wait.
                 if let Err(e) = engine.flush().await {
-                    warn!(%e, "flush failed");
+                    // check_clock logs the start and the end of a wait for the wall clock.
+                    if !matches!(e, EngineError::ClockAhead { .. }) {
+                        warn!(%e, "flush failed");
+                    }
                     // Without a pause, a full buffer retries on every put while the remote is down.
                     tokio::time::sleep(engine.config.flush_delay).await;
                 }

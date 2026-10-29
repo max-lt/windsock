@@ -2,11 +2,101 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+
+use tokio::io::AsyncReadExt;
+
+use crate::plan::Fetch;
+
+/// The largest piece that [`Engine::next_piece`] gives, so a read holds this much data at a time.
+pub const READ_STEP: usize = 4 * 1024 * 1024;
+
+/// An open read of an object. [`Engine::next_piece`] gives its data.
+pub struct ObjectReader {
+    pub info: ObjectInfo,
+    source: Source,
+}
+
+enum Source {
+    /// The open segment of a buffered put, at the next byte to give.
+    Buffered {
+        file: tokio::fs::File,
+        remaining: u64,
+    },
+    /// The fetches still to read, the bytes to drop before the range, and the bytes to give.
+    Stored {
+        fetches: VecDeque<Fetch>,
+        skip: u64,
+        remaining: u64,
+        mode: CacheMode,
+    },
+}
+
 impl<R: Remote + 'static> Engine<R> {
-    /// Reads `range` of an object, or all of it.
+    /// Reads `range` of an object, or all of it, into one buffer. [`Engine::get_reader`] reads it
+    /// in pieces.
     pub async fn get(&self, bucket: &str, key: &str, range: Option<Range<u64>>) -> Result<Object> {
-        self.retry_after_sync(|| self.get_once(bucket, key, range.clone()))
+        let mut reader = self.get_reader(bucket, key, range).await?;
+        let mut data = Vec::new();
+        while let Some(piece) = self.next_piece(&mut reader).await? {
+            data.extend_from_slice(&piece);
+        }
+        Ok(Object {
+            info: reader.info,
+            data: Bytes::from(data),
+        })
+    }
+
+    /// A reader of the object, or of `range` of it. [`Engine::next_piece`] gives the data.
+    pub async fn get_reader(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<ObjectReader> {
+        self.retry_after_sync(|| self.reader_once(bucket, key, range.clone()))
             .await
+    }
+
+    /// The next piece of the data, at most [`READ_STEP`] bytes. `None` at the end.
+    pub async fn next_piece(&self, reader: &mut ObjectReader) -> Result<Option<Bytes>> {
+        match &mut reader.source {
+            Source::Buffered { file, remaining } => {
+                if *remaining == 0 {
+                    return Ok(None);
+                }
+                let mut piece = vec![0u8; (*remaining).min(READ_STEP as u64) as usize];
+                file.read_exact(&mut piece).await?;
+                *remaining -= piece.len() as u64;
+                Ok(Some(Bytes::from(piece)))
+            }
+            Source::Stored {
+                fetches,
+                skip,
+                remaining,
+                mode,
+            } => loop {
+                if *remaining == 0 {
+                    return Ok(None);
+                }
+                let Some(fetch) = fetches.pop_front() else {
+                    return Err(EngineError::Corrupt(
+                        "the chunks of a manifest end before its size".to_string(),
+                    ));
+                };
+                let mut raw = Vec::new();
+                for chunk in self.read_fetch(&fetch, *mode).await? {
+                    raw.extend(chunk);
+                }
+                let start = (*skip).min(raw.len() as u64);
+                *skip -= start;
+                let end = (start + *remaining).min(raw.len() as u64);
+                *remaining -= end - start;
+                if end > start {
+                    return Ok(Some(Bytes::from(raw).slice(start as usize..end as usize)));
+                }
+            },
+        }
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<ObjectInfo> {
@@ -47,12 +137,12 @@ impl<R: Remote + 'static> Engine<R> {
         Ok(self.index().object(bucket, key)?)
     }
 
-    pub(crate) async fn get_once(
+    async fn reader_once(
         &self,
         bucket: &str,
         key: &str,
         range: Option<Range<u64>>,
-    ) -> Result<Object> {
+    ) -> Result<ObjectReader> {
         loop {
             let current = self
                 .read_settled(|buffer| {
@@ -65,13 +155,16 @@ impl<R: Remote + 'static> Engine<R> {
                 Current::Absent => return Err(no_such_key(bucket, key)),
                 Current::Buffered(put) => {
                     let range = check_range(range.clone(), put.size)?;
-                    let Some(data) = buffer::read_put(&self.buffer_dir, &put, range).await? else {
+                    let Some(file) =
+                        buffer::open_put(&self.buffer_dir, &put, range.clone()).await?
+                    else {
                         // A flush released the segment: the index already holds the write.
                         continue;
                     };
-                    return Ok(Object {
+                    let remaining = range.end - range.start;
+                    return Ok(ObjectReader {
                         info: buffered_info(key, put),
-                        data: Bytes::from(data),
+                        source: Source::Buffered { file, remaining },
                     });
                 }
                 Current::Stored {
@@ -82,10 +175,16 @@ impl<R: Remote + 'static> Engine<R> {
                     let manifest = self.manifest(manifest_id).await?;
                     let range = check_range(range, manifest.size)?;
                     let mode = self.config.policy(bucket, key).cache;
-                    let data = self.read_range(&manifest, range, mode).await?;
-                    return Ok(Object {
+                    let remaining = range.end - range.start;
+                    let (fetches, skip) = plan::plan_read(&manifest.chunks, range);
+                    return Ok(ObjectReader {
                         info: stored_info(key, manifest, hlc, conflicted),
-                        data: Bytes::from(data),
+                        source: Source::Stored {
+                            fetches: split_fetches(fetches),
+                            skip,
+                            remaining,
+                            mode,
+                        },
                     });
                 }
             }
@@ -166,26 +265,6 @@ impl<R: Remote + 'static> Engine<R> {
         let manifest = Manifest::decode(id, bytes)?;
         self.index().put_manifest(id, bytes)?;
         Ok(manifest)
-    }
-
-    pub(crate) async fn read_range(
-        &self,
-        manifest: &Manifest,
-        range: Range<u64>,
-        mode: CacheMode,
-    ) -> Result<Vec<u8>> {
-        let len = (range.end - range.start) as usize;
-        let (fetches, skip) = plan::plan_read(&manifest.chunks, range);
-        let mut raw = Vec::new();
-
-        for fetch in &fetches {
-            for chunk in self.read_fetch(fetch, mode).await? {
-                raw.extend(chunk);
-            }
-        }
-
-        let skip = skip as usize;
-        Ok(raw[skip..skip + len].to_vec())
     }
 
     /// The raw chunks of one fetch, in order: from the cache when it holds
@@ -366,4 +445,35 @@ pub(crate) fn check_range(range: Option<Range<u64>>, size: u64) -> Result<Range<
     }
 
     Ok(range)
+}
+
+/// Splits each fetch into fetches of at most [`READ_STEP`] raw bytes. A chunk is never larger.
+fn split_fetches(fetches: Vec<Fetch>) -> VecDeque<Fetch> {
+    let mut out = VecDeque::new();
+    for fetch in fetches {
+        let mut entries: Vec<PackEntry> = Vec::new();
+        let mut raw = 0;
+        for entry in fetch.entries {
+            if !entries.is_empty() && raw + entry.raw_len as usize > READ_STEP {
+                out.push_back(fetch_of(fetch.pack, std::mem::take(&mut entries)));
+                raw = 0;
+            }
+            raw += entry.raw_len as usize;
+            entries.push(entry);
+        }
+        if !entries.is_empty() {
+            out.push_back(fetch_of(fetch.pack, entries));
+        }
+    }
+    out
+}
+
+fn fetch_of(pack: PackId, entries: Vec<PackEntry>) -> Fetch {
+    let start = entries.first().expect("a fetch has entries").offset;
+    let end = entries.last().expect("a fetch has entries").range().end;
+    Fetch {
+        pack,
+        range: start..end,
+        entries,
+    }
 }

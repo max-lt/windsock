@@ -27,6 +27,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 form_urlencoded = "1"
+futures-util = { version = "0.3", default-features = false }
 hmac = "0.12"
 http-body = "1"
 http-body-util = "0.1"

@@ -35,6 +35,7 @@ use journal::{Action, Commit, Entry, HybridClock, Journal, JournalError};
 pub use list::{ListAfter, ListEntry, ListPage, ListQuery};
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
+pub use read::{ObjectReader, READ_STEP};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
 use tokio::sync::Notify;
@@ -42,7 +43,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use buffer::{Buffer, BufferedObject, BufferedPut, Durability, Head, Intent, Op, SegmentReader};
-use plan::{Fetch, Nonces, Planner};
+use plan::{Nonces, Planner};
 
 pub use buffer::{QuarantineReader, QuarantinedRecord, QuarantinedWrite};
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};

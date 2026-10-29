@@ -986,3 +986,105 @@ async fn test_if_match_on_two_proxies_both_pass_and_the_race_is_a_conflict() {
     assert!(seen_by_a.conflicted);
     assert_eq!(seen_by_a, seen_by_b, "both proxies pick the same winner");
 }
+
+/// The pieces of a reader, each one checked against the bound.
+async fn pieces<R: Remote + 'static>(
+    engine: &Engine<R>,
+    mut reader: engine::ObjectReader,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(piece) = engine.next_piece(&mut reader).await.unwrap() {
+        assert!(!piece.is_empty());
+        assert!(
+            piece.len() <= engine::READ_STEP,
+            "a piece of {} bytes",
+            piece.len()
+        );
+        out.extend_from_slice(&piece);
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_reader_gives_bounded_pieces_from_the_buffer_and_the_remote() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let data = random_bytes(3, 3 * engine::READ_STEP + 123);
+    put(&a.engine, "k", &data).await;
+    let ranges = [
+        None,
+        Some(5..data.len() as u64 - 7),
+        Some(engine::READ_STEP as u64..engine::READ_STEP as u64 + 1),
+    ];
+
+    for flushed in [false, true] {
+        if flushed {
+            a.engine.flush().await.unwrap();
+        }
+        for range in ranges.clone() {
+            let reader = a
+                .engine
+                .get_reader(BUCKET, "k", range.clone())
+                .await
+                .unwrap();
+            let range = range.unwrap_or(0..data.len() as u64);
+            let expected = &data[range.start as usize..range.end as usize];
+
+            assert_eq!(reader.info.size, data.len() as u64);
+            assert_eq!(
+                pieces(&a.engine, reader).await,
+                expected,
+                "flushed: {flushed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_reader_of_a_buffered_object_survives_its_flush() {
+    let remote = Arc::new(MemoryRemote::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let data = random_bytes(4, 2 * engine::READ_STEP + 1);
+    put(&a.engine, "k", &data).await;
+
+    let mut reader = a.engine.get_reader(BUCKET, "k", None).await.unwrap();
+    let first = a.engine.next_piece(&mut reader).await.unwrap().unwrap();
+    a.engine.flush().await.unwrap();
+    let rest = pieces(&a.engine, reader).await;
+
+    assert_eq!([first.to_vec(), rest].concat(), data);
+}
+
+#[tokio::test]
+async fn test_reader_fails_on_a_bad_chunk_and_does_not_end_early() {
+    let remote = Arc::new(MemoryRemote::default());
+    let no_cache = Config {
+        cache_bytes: 0,
+        ..Config::default()
+    };
+    let a = proxy_with(&remote, 1, no_cache).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let data = random_bytes(6, 2 * engine::READ_STEP);
+    put(&a.engine, "k", &data).await;
+    a.engine.flush().await.unwrap();
+    let packs = remote.list("packs/").await.unwrap();
+    let [pack] = packs.as_slice() else {
+        panic!("one pack, not {packs:?}");
+    };
+
+    let mut reader = a.engine.get_reader(BUCKET, "k", None).await.unwrap();
+    let first = a.engine.next_piece(&mut reader).await.unwrap().unwrap();
+    let mut bytes = remote.get(pack).await.unwrap().unwrap().to_vec();
+    let late = bytes.len() * 3 / 4;
+    bytes[late] ^= 1;
+    remote.put(pack, Bytes::from(bytes)).await.unwrap();
+    let rest = a.engine.next_piece(&mut reader).await;
+
+    assert!(first[..] == data[..first.len()]);
+    assert!(
+        matches!(rest, Err(EngineError::Corrupt(_))),
+        "a bad chunk fails the read: {rest:?}"
+    );
+}

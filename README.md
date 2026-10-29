@@ -225,9 +225,16 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   key as a conflict. The check costs one manifest read when the manifest is not in the index.
 - Presigned URLs, object tags, bucket lifecycle rules and ACLs are not supported.
 - A multipart upload must complete on the proxy that started it.
-- The proxy holds the whole body of a request in memory, up to 5 GiB per request. No limit
-  covers all requests together: 10 parallel PUTs of 5 GiB need 50 GiB of memory. Size the memory
-  for the largest objects times the parallel uploads, or put a limit in front of the proxy.
+- A GET streams the object in pieces of at most 4 MiB. One GET holds at most about 16 MiB: the
+  stored bytes, the raw chunks and the piece. The peak for GETs is `max_connections` times 16 MiB.
+  A failure in the middle of a GET cuts the response: the client never gets a short body with a
+  clean end. A GET of an object that a client deletes or overwrites keeps working until the GC
+  deletes its packs, at least R + H after the delete (48 h by default). A GET that runs longer is
+  cut.
+- A PUT, a CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB
+  per request. No limit covers all requests together: 10 parallel PUTs of 5 GiB need 50 GiB of
+  memory. Size the memory for the largest objects times the parallel uploads, or put a limit in
+  front of the proxy.
 
 ## Scale
 

@@ -1578,3 +1578,114 @@ async fn test_complete_takes_the_conditional_write_headers() {
     assert_eq!(any.status, StatusCode::OK);
     assert_eq!(run(&server, call("GET", "/bkt/big")).await.text(), "part");
 }
+
+fn large_object() -> Vec<u8> {
+    let mut data = vec![0; 3 * engine::READ_STEP + 17];
+    blake3::Hasher::new().finalize_xof().fill(&mut data);
+    data
+}
+
+/// A server with no chunk cache, so each GET of a flushed object reads the remote.
+async fn uncached() -> Server {
+    let config = Config {
+        cache_bytes: 0,
+        ..Config::default()
+    };
+    bucket_on(server_with(config).await).await
+}
+
+/// The response of a GET, with its body not read yet.
+async fn get_response(server: &Server, uri: &str) -> Response<Body> {
+    server
+        .app
+        .clone()
+        .oneshot(call("GET", uri).request())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_get_streams_a_large_object_in_pieces() {
+    let server = uncached().await;
+    let data = large_object();
+    run(&server, call("PUT", "/bkt/big").body(data.clone())).await;
+    server.engine.flush().await.unwrap();
+
+    let response = get_response(&server, "/bkt/big").await;
+    let length = response.headers()["content-length"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut body = response.into_body();
+    let mut frames = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let piece = frame.unwrap().into_data().unwrap();
+        // A slow client: the next piece waits for the client.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        frames.push(piece);
+    }
+    let ranged = run(
+        &server,
+        call("GET", "/bkt/big").header("range", "bytes=10-5000000"),
+    )
+    .await;
+
+    assert_eq!(length, data.len().to_string());
+    assert!(frames.len() >= 4, "{} frames", frames.len());
+    assert!(frames.iter().all(|piece| piece.len() <= engine::READ_STEP));
+    assert!(frames.concat() == data);
+    assert_eq!(ranged.status, StatusCode::PARTIAL_CONTENT);
+    assert!(ranged.body == data[10..=5_000_000]);
+}
+
+#[tokio::test]
+async fn test_get_that_the_client_cuts_leaves_the_server_working() {
+    let server = uncached().await;
+    let data = large_object();
+    run(&server, call("PUT", "/bkt/big").body(data.clone())).await;
+    server.engine.flush().await.unwrap();
+
+    let mut body = get_response(&server, "/bkt/big").await.into_body();
+    body.frame().await.unwrap().unwrap();
+    drop(body);
+
+    assert!(run(&server, call("GET", "/bkt/big")).await.body == data);
+}
+
+#[tokio::test]
+async fn test_get_with_a_bad_chunk_ends_with_an_error_not_a_short_body() {
+    let server = uncached().await;
+    let data = large_object();
+    run(&server, call("PUT", "/bkt/big").body(data.clone())).await;
+    server.engine.flush().await.unwrap();
+    let remote = server._dir.path().join("remote");
+    let pack = walk(&remote)
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains("packs"))
+        .unwrap();
+    let mut bytes = std::fs::read(&pack).unwrap();
+    let late = bytes.len() * 3 / 4;
+    bytes[late] ^= 1;
+    std::fs::write(&pack, bytes).unwrap();
+
+    let response = get_response(&server, "/bkt/big").await;
+    let status = response.status();
+    let body = response.into_body().collect().await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_err(), "the body ends with an error");
+}
+
+/// Every file under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

@@ -814,3 +814,38 @@ async fn test_restart_of_the_gc_runner_starts_the_wait_again() {
 
     assert_eq!(late.deleted_packs, 1);
 }
+
+#[tokio::test]
+async fn test_reader_outlives_a_delete_until_the_gc_deletes_its_packs() {
+    let remote = Arc::new(TestRemote::new());
+    let no_cache = Config {
+        cache_bytes: 0,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, no_cache).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    let data = random_bytes(5, 4 * engine::READ_STEP);
+    put(&a.engine, "k", &data).await;
+    a.engine.flush().await.unwrap();
+    let mut reader = a.engine.get_reader(BUCKET, "k", None).await.unwrap();
+    let first = a.engine.next_piece(&mut reader).await.unwrap().unwrap();
+
+    a.engine.delete(BUCKET, "k").await.unwrap();
+    a.engine.flush().await.unwrap();
+    past_retention().await;
+    let condemn = a.engine.gc().await.unwrap();
+    let second = a.engine.next_piece(&mut reader).await.unwrap().unwrap();
+    past_horizon().await;
+    let sweep = a.engine.gc().await.unwrap();
+    let after_sweep = a.engine.next_piece(&mut reader).await;
+
+    assert!(condemn.condemned_packs > 0);
+    let (one, two) = (first.len(), second.len());
+    assert!(first[..] == data[..one]);
+    assert!(second[..] == data[one..one + two]);
+    assert!(sweep.deleted_packs > 0);
+    assert!(
+        matches!(after_sweep, Err(EngineError::Corrupt(_))),
+        "a read past the sweep fails, it does not end early: {after_sweep:?}"
+    );
+}

@@ -11,14 +11,15 @@ pub(crate) use object::{object_delete, object_get, object_head, object_post, obj
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
-use engine::{ObjectInfo, WriteMode};
+use engine::{Engine, ObjectInfo, ObjectReader, WriteMode};
 use remote::Remote;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::xml::{self, ListPage, ListedObject};
 use crate::{AppState, Caller, S3Error};

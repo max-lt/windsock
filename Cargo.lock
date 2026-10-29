@@ -1425,6 +1425,7 @@ dependencies = [
  "ed25519-dalek",
  "engine",
  "form_urlencoded",
+ "futures-util",
  "hex",
  "http-body",
  "http-body-util",

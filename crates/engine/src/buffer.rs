@@ -788,22 +788,35 @@ pub(crate) async fn remove_intent(dir: &Path) -> Result<(), EngineError> {
 }
 
 /// Reads `range` of a buffered put. `None` when a flush deleted the segment.
+#[cfg(test)]
 pub(crate) async fn read_put(
     dir: &Path,
     put: &BufferedPut,
     range: Range<u64>,
 ) -> Result<Option<Vec<u8>>, EngineError> {
+    let Some(mut file) = open_put(dir, put, range.clone()).await? else {
+        return Ok(None);
+    };
+    let mut data = vec![0u8; (range.end - range.start) as usize];
+    file.read_exact(&mut data).await?;
+    Ok(Some(data))
+}
+
+/// Opens the segment of a buffered put at `range.start` of its data. `None` when a flush released
+/// the segment. The open file keeps its data readable after a release.
+pub(crate) async fn open_put(
+    dir: &Path,
+    put: &BufferedPut,
+    range: Range<u64>,
+) -> Result<Option<File>, EngineError> {
     let mut file = match File::open(segment_path(dir, put.segment)).await {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-
-    let mut data = vec![0u8; (range.end - range.start) as usize];
     file.seek(SeekFrom::Start(put.data_offset + range.start))
         .await?;
-    file.read_exact(&mut data).await?;
-    Ok(Some(data))
+    Ok(Some(file))
 }
 
 pub(crate) fn segment_path(dir: &Path, seq: u64) -> PathBuf {

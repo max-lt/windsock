@@ -139,13 +139,19 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         }
 
         let range = byte_range(&headers, info.size)?;
-        let object = state.engine.get(&bucket, &key, range.clone()).await?;
-        if object.info.content_hash != info.content_hash {
+        let reader = state
+            .engine
+            .get_reader(&bucket, &key, range.clone())
+            .await?;
+        if reader.info.content_hash != info.content_hash {
             continue;
         }
 
-        let mut builder = object_headers(reply(StatusCode::OK), &object.info)
-            .header("content-length", object.data.len().to_string());
+        let length = range
+            .as_ref()
+            .map_or(info.size, |range| range.end - range.start);
+        let mut builder = object_headers(reply(StatusCode::OK), &reader.info)
+            .header("content-length", length.to_string());
         if let Some(range) = range {
             builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
                 "content-range",
@@ -154,7 +160,7 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         }
 
         return Ok(builder
-            .body(Body::from(object.data))
+            .body(object_body(state.engine.clone(), reader, bucket, key))
             .expect("object headers are valid"));
     }
 }
@@ -259,4 +265,27 @@ pub(crate) async fn object_post<R: Remote + 'static>(
         "complete multipart upload"
     );
     xml_reply(xml::complete(&bucket, &key, &etag(&info)))
+}
+
+/// The body of a GET, one piece at a time. An error ends the body with an error, so the client
+/// sees a cut response and never a short object.
+fn object_body<R: Remote + 'static>(
+    engine: Arc<Engine<R>>,
+    reader: ObjectReader,
+    bucket: String,
+    key: String,
+) -> Body {
+    let pieces = futures_util::stream::try_unfold((engine, reader), move |(engine, mut reader)| {
+        let (bucket, key) = (bucket.clone(), key.clone());
+        async move {
+            match engine.next_piece(&mut reader).await {
+                Ok(piece) => Ok(piece.map(|piece| (piece, (engine, reader)))),
+                Err(e) => {
+                    warn!(bucket, key, %e, "GET body cut");
+                    Err(e)
+                }
+            }
+        }
+    });
+    Body::from_stream(pieces)
 }

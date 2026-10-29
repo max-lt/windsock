@@ -189,6 +189,7 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 | HTTP body type (`windsockd`) | `http-body` 1                                                                         |
 | TLS (feature `tls` only)     | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
 | HTTP tests                   | `tower` (`util`), `http-body-util`                                                    |
+| Streamed bodies (`s3api`)    | `futures-util` (no default features)                                                  |
 
 Add a crate to this table when a milestone adds it.
 

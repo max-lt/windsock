@@ -34,12 +34,16 @@ pub const FD_RESERVE: u64 = 256;
 pub const FD_TARGET: u64 = 8192;
 /// Below this soft limit the daemon does not start: the reserve would leave too few connections.
 pub const FD_MINIMUM: u64 = 512;
+/// The default connection limit at most. Each GET can hold some MiB, so the default also bounds
+/// the memory: a host with a high descriptor limit must not get a limit that bounds nothing.
+pub const MAX_DEFAULT_CONNECTIONS: usize = 4096;
 
-/// The connection limit for a soft descriptor limit `soft` (`None`: no limit). A connection can
+/// The default connection limit for a soft descriptor limit `soft` (`None`: no limit), at most
+/// MAX_DEFAULT_CONNECTIONS. A connection can
 /// hold its socket and one file at once: a buffer segment, a cache file or a multipart part.
 pub fn connection_limit(soft: Option<u64>) -> Result<usize, String> {
     let limit = match soft {
-        None => u64::MAX,
+        None => MAX_DEFAULT_CONNECTIONS as u64,
         Some(soft) if soft < FD_MINIMUM => {
             return Err(format!(
                 "the soft descriptor limit is {soft}, under {FD_MINIMUM}: raise it with \
@@ -48,7 +52,7 @@ pub fn connection_limit(soft: Option<u64>) -> Result<usize, String> {
         }
         Some(soft) => (soft - FD_RESERVE) / 2,
     };
-    Ok(usize::try_from(limit).map_or(Semaphore::MAX_PERMITS, |l| l.min(Semaphore::MAX_PERMITS)))
+    Ok(usize::try_from(limit).map_or(MAX_DEFAULT_CONNECTIONS, |l| l.min(MAX_DEFAULT_CONNECTIONS)))
 }
 
 /// Checks a `max_connections` from the configuration against the soft limit `soft`.
@@ -374,7 +378,8 @@ mod tests {
                 .unwrap_err()
                 .contains("ulimit -n")
         );
-        assert_eq!(connection_limit(None), Ok(Semaphore::MAX_PERMITS));
+        assert_eq!(connection_limit(Some(1 << 20)), Ok(MAX_DEFAULT_CONNECTIONS));
+        assert_eq!(connection_limit(None), Ok(MAX_DEFAULT_CONNECTIONS));
     }
 
     #[test]

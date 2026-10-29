@@ -41,8 +41,8 @@ pub struct Config {
     pub keys: Vec<KeyConfig>,
     #[serde(default = "default_sync_interval")]
     pub sync_interval_secs: u64,
-    /// Open S3 connections at most. Default: (soft descriptor limit - 256) / 2, as a connection
-    /// can hold a socket and a file. A value that needs more descriptors refuses the start.
+    /// Open S3 connections at most. Default: (soft descriptor limit - 256) / 2, at most 4096, as a
+    /// connection can hold a socket and a file. A value that needs more descriptors refuses the start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
     /// Seconds before a connection with no request in progress closes.

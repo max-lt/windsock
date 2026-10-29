@@ -108,6 +108,10 @@ fn stored(keys: &[String]) -> Vec<Stored> {
 /// The largest snapshot a proxy loads. The remote is not trusted with the size of the buffer.
 pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 
+/// The newest snapshots that a load tries. A writer without the key can put forged snapshots,
+/// and each one costs a read: the load fails closed after this many.
+const MAX_CANDIDATES: usize = 3;
+
 /// Why no snapshot loads: each skipped key with its cause.
 #[derive(Debug, Default)]
 pub(crate) struct NoSnapshot(Vec<String>);
@@ -303,7 +307,8 @@ impl<R: Remote + 'static> Engine<R> {
     ) -> Result<std::result::Result<(Snapshot, u64), NoSnapshot>> {
         let mut skipped = NoSnapshot::default();
         let keys = self.remote.list(SNAPSHOTS_PREFIX).await?;
-        for snapshot in stored(&keys).iter().rev() {
+        let all = stored(&keys);
+        for snapshot in all.iter().rev().take(MAX_CANDIDATES) {
             let (time, hash) = (snapshot.time, snapshot.hash);
             let key = snapshot.key();
             let mut skip = |cause: String| {
@@ -311,7 +316,11 @@ impl<R: Remote + 'static> Engine<R> {
                 skipped.0.push(format!("{key}: {cause}"));
             };
             let read = match snapshot.form {
-                Form::Single => self.read_snapshot(&key, MAX_SNAPSHOT).await?,
+                // The GC writes parts: one object larger than a part is not one of its snapshots.
+                Form::Single => {
+                    self.read_snapshot(&key, self.config.snapshot_object)
+                        .await?
+                }
                 Form::Parts => self.read_parts(&snapshot.base).await?,
             };
             let sealed = match read {
@@ -345,6 +354,13 @@ impl<R: Remote + 'static> Engine<R> {
                 Ok(snapshot) => return Ok(Ok((snapshot, time))),
                 Err(e) => skip(format!("it does not decode: {e}")),
             }
+        }
+        let untried = all.len().saturating_sub(MAX_CANDIDATES);
+        if untried > 0 {
+            skipped.0.push(format!(
+                "{untried} older snapshot{} not tried",
+                if untried == 1 { "" } else { "s" }
+            ));
         }
 
         Ok(Err(skipped))

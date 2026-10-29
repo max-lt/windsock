@@ -212,13 +212,21 @@ async fn proxy(remote: &Arc<TestRemote>, seed: u8) -> Proxy {
 
 /// Opens a proxy, then syncs it. The open syncs too, so a load error shows at either step.
 async fn open_and_sync(remote: &Arc<TestRemote>, seed: u8) -> Result<Proxy, String> {
+    open_and_sync_with(remote, seed, Config::default()).await
+}
+
+async fn open_and_sync_with(
+    remote: &Arc<TestRemote>,
+    seed: u8,
+    config: Config,
+) -> Result<Proxy, String> {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::open(
         dir.path(),
         remote.clone(),
         SigningKey::from_bytes(&[seed; 32]),
         engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
-        Config::default(),
+        config,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1330,4 +1338,74 @@ async fn test_sync_that_races_a_new_snapshot_loads_it() {
 
     assert!(report.broken.is_empty(), "{:?}", report.broken_causes);
     assert_eq!(keys(&b.engine).await, ["w", "x", "y"]);
+}
+
+/// Puts `count` forged snapshots, each one newer than `base`, of `len` bytes. Returns their keys.
+async fn forge_snapshots(
+    remote: &Arc<TestRemote>,
+    base: &str,
+    count: u64,
+    len: usize,
+) -> Vec<String> {
+    let (time, _) = base
+        .strip_prefix(engine::SNAPSHOTS_PREFIX)
+        .unwrap()
+        .split_once('-')
+        .unwrap();
+    let time = time.parse::<u64>().unwrap();
+    let mut keys = Vec::new();
+    for n in 1..=count {
+        let bytes = vec![n as u8; len];
+        let key = format!(
+            "{}{:020}-{}",
+            engine::SNAPSHOTS_PREFIX,
+            time + n,
+            blake3::hash(&bytes)
+        );
+        remote.inner.put(&key, Bytes::from(bytes)).await.unwrap();
+        keys.push(key);
+    }
+    keys
+}
+
+#[tokio::test]
+async fn test_load_tries_at_most_three_snapshots_and_names_each_one() {
+    for (forged, loads) in [(2, true), (3, false)] {
+        let remote = Arc::new(TestRemote::default());
+        let (base, redacted) = history_in_parts(&remote, 1 << 30, 0).await;
+        assert!(redacted > 0);
+        let keys = forge_snapshots(&remote, &base, forged, 10).await;
+
+        let error = load_after_prune(&remote).await;
+
+        if loads {
+            assert_eq!(error, None, "{forged} forged snapshots");
+            continue;
+        }
+        let error = error.expect("three forged snapshots fail the load");
+        for key in &keys {
+            assert!(error.contains(key.as_str()), "{key} in {error}");
+        }
+        assert!(error.contains("1 older snapshot not tried"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn test_snapshot_in_one_object_over_one_part_is_not_read() {
+    let remote = Arc::new(TestRemote::default());
+    let (base, _) = history_in_parts(&remote, 1 << 30, 0).await;
+    let config = Config {
+        snapshot_object: 100,
+        ..Config::default()
+    };
+    let keys = forge_snapshots(&remote, &base, 3, 101).await;
+
+    let Err(error) = open_and_sync_with(&remote, 2, config).await else {
+        panic!("the pruned journal needs a snapshot");
+    };
+
+    for key in &keys {
+        let cause = format!("{key}: it is larger than 100 bytes");
+        assert!(error.contains(&cause), "{error}");
+    }
 }

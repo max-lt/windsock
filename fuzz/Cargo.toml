@@ -11,8 +11,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 blake3 = { version = "1", features = ["pure"] }
 engine = { path = "../crates/engine" }
+chunking = { path = "../crates/chunking" }
 index = { path = "../crates/index" }
-journal = { path = "../crates/journal" }
+journal = { path = "../crates/journal", features = ["fuzz"] }
 model = { path = "../crates/model" }
 pack = { path = "../crates/pack" }
 s3proto = { path = "../crates/s3proto" }

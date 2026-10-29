@@ -19,6 +19,8 @@ tracing.workspace = true
 [features]
 # A manual wall clock for deterministic tests. Never on in a release build.
 sim = []
+# Helpers for the fuzz targets in fuzz/. Never on in a release build.
+fuzz = []
 
 [dev-dependencies]
 async-trait.workspace = true

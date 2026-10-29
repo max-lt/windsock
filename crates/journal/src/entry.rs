@@ -265,6 +265,29 @@ impl Entry {
         postcard::to_allocvec(&wire).expect("an entry always serializes")
     }
 
+    /// Wire bytes with the actions sealed and the MAC that `sealer` gives, from wire bytes whose
+    /// `sealed` field holds the plain actions. The fuzz target reaches the code after the MAC and
+    /// the seal with it. `None` when the bytes are not a wire entry.
+    #[cfg(feature = "fuzz")]
+    pub fn fuzz_wire(bytes: &[u8], sealer: &Sealer) -> Option<Vec<u8>> {
+        let mut wire: Wire = postcard::from_bytes(bytes).ok()?;
+        if let Some(plain) = &wire.sealed {
+            let sealed = sealer.seal(Kind::Actions, &seal_context(wire.node, wire.seq), plain);
+            wire.actions_hash = actions_hash(&sealed);
+            wire.sealed = Some(sealed);
+        }
+        let content = content_hash(
+            wire.node,
+            wire.seq,
+            &wire.prev,
+            wire.hlc,
+            &wire.seen,
+            &wire.actions_hash,
+        );
+        wire.mac = sealer.entry_mac(&content);
+        Some(postcard::to_allocvec(&wire).expect("an entry always serializes"))
+    }
+
     /// Reads an entry from the remote and opens its actions.
     pub fn from_wire(bytes: &[u8], sealer: &Sealer) -> Result<Self, WireError> {
         let wire: Wire = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
@@ -386,6 +409,39 @@ pub(crate) fn test_sealer() -> Sealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the bytes that the MAC covers and the key that it uses: a change here makes
+    /// every entry in every remote fail its MAC.
+    #[test]
+    fn test_entry_mac_known_answer() {
+        let mut seen = Seen::new();
+        seen.insert(
+            NodeId::from_bytes([4; 32]),
+            Link {
+                seq: 5,
+                hash: [6; 32],
+            },
+        );
+        let content = content_hash(
+            NodeId::from_bytes([1; 32]),
+            7,
+            &[2; 32],
+            42,
+            &seen,
+            &[3; 32],
+        );
+        let mac = test_sealer().entry_mac(&content);
+
+        let hex = |bytes: [u8; 32]| blake3::Hash::from_bytes(bytes).to_hex().to_string();
+        assert_eq!(
+            hex(content),
+            "dddd3575e1aeba5c1d8307f10483012a8235cff5f882f11b88a0a0f2432131f0"
+        );
+        assert_eq!(
+            hex(mac),
+            "75e81c9aae019447f50483f19a192f7b8e4107cb235787d38a1ab2ccb027f26a"
+        );
+    }
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[7u8; 32])

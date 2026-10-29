@@ -136,3 +136,31 @@ async fn test_own_chain_a_year_ahead_waits_for_the_wall_then_writes() {
     late.unwrap();
     b.flush().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_own_acks_under_a_snapshot_stay_above_the_next_ack_after_an_index_loss() {
+    let year = 365 * 24 * 3600 * 1_000_000_000u64;
+    let remote = Arc::new(MemoryRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    set_wall(START + year);
+    let a = open(dir.path(), &remote).await.unwrap();
+    a.create_bucket(BUCKET, None).await.unwrap();
+    put(&a, "k").await.unwrap();
+    a.flush().await.unwrap();
+    // The snapshot covers the own entries, and the prune redacts them.
+    let report = a.gc().await.unwrap();
+    assert!(report.snapshot_written && report.redacted_entries > 0);
+    let high = a.last_hlc();
+    drop(a);
+
+    set_wall(START);
+    let fresh = tempfile::tempdir().unwrap();
+    let b = open(fresh.path(), &remote).await.unwrap();
+    let write = put(&b, "later").await;
+
+    assert!(b.last_hlc() >= high, "the clock went under an own ack");
+    assert!(
+        matches!(write, Err(EngineError::ClockAhead { .. })),
+        "{write:?}"
+    );
+}

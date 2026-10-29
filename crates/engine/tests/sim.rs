@@ -296,8 +296,6 @@ struct Sim {
     far_until: u64,
     /// The nodes whose clock ran more than R ahead: their chains may be broken elsewhere.
     far_nodes: BTreeSet<[u8; 32]>,
-    /// The largest step back of the wall clocks: the run waits this long at the end.
-    max_step_back: u64,
     /// The highest bound that a version prune of the GC could use: (stable HLC - R).
     prune_bound: u64,
     /// The highest wall clock of any proxy so far: no HLC is above it, also after a step back.
@@ -882,7 +880,6 @@ impl Sim {
                 self.proxies[i].engine = None;
                 self.now = self.now.saturating_sub(step);
                 self.open(i).await?;
-                self.max_step_back = self.max_step_back.max(step);
                 self.stats.step_back = true;
             }
             87..=88 => {
@@ -934,12 +931,18 @@ impl Sim {
         for proxy in &mut self.proxies {
             proxy.offset = 0;
         }
-        self.pass(self.max_offset + self.max_step_back);
+        self.pass(self.max_offset);
         for i in 0..3 {
             if self.proxies[i].engine.is_none() {
                 self.open(i).await?;
             }
         }
+        // After steps back of the wall clocks, a clock can still be more than R ahead: time passes
+        // until every proxy can sign again.
+        let r = config().retention.as_nanos() as u64;
+        let highest = (0..3).map(|i| self.engine(i).last_hlc()).max().unwrap_or(0);
+        // A minute more: the last flushes sign entries just above the highest clock.
+        self.pass(highest.saturating_sub(self.now + r) + 60 * SECOND);
         for i in 0..3 {
             self.proxies[i].outage.store(false, Ordering::SeqCst);
             // A quarantined proxy needs a restart to move its late writes aside.
@@ -1168,7 +1171,6 @@ async fn run(seed: u64) -> Result<Stats, String> {
         stats: Stats::default(),
         far_until: 0,
         far_nodes: BTreeSet::new(),
-        max_step_back: 0,
         prune_bound: 0,
         highest_clock: 0,
         keyless: None,

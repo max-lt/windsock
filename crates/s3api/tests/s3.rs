@@ -1689,3 +1689,27 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn test_conditional_header_that_is_not_ascii_is_refused() {
+    let server = with_bucket().await;
+    put(&server, "k", "v1").await;
+
+    for (name, value) in [("if-match", "\"é\""), ("if-none-match", "*é")] {
+        let reply = run(
+            &server,
+            call("PUT", "/bkt/k").header(name, value).body("v2"),
+        )
+        .await;
+        let read = run(&server, call("GET", "/bkt/k").header(name, value)).await;
+        assert_eq!(read.status, StatusCode::BAD_REQUEST, "GET {name}");
+
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{name}: {}",
+            reply.text()
+        );
+    }
+    assert_eq!(run(&server, call("GET", "/bkt/k")).await.text(), "v1");
+}

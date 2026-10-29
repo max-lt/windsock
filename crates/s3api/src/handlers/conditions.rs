@@ -20,8 +20,31 @@ pub(super) fn etag_matches(list: &str, etag: &str) -> bool {
     })
 }
 
+/// Refuses a conditional header that is not visible ASCII. Read as absent, it would drop the
+/// condition and write or read with none.
+pub(super) fn check_conditions(headers: &HeaderMap) -> Result<(), S3Error> {
+    const NAMES: [&str; 4] = [
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ];
+    for name in NAMES {
+        if headers
+            .get(name)
+            .is_some_and(|value| value.to_str().is_err())
+        {
+            return Err(S3Error::invalid_argument(format!(
+                "{name} must be visible ASCII"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The check that the conditional write headers ask of the current object.
 pub(super) fn write_mode(headers: &HeaderMap) -> Result<WriteMode, S3Error> {
+    check_conditions(headers)?;
     match (
         header(headers, "if-match"),
         header(headers, "if-none-match"),

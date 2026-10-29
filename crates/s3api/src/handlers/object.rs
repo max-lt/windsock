@@ -1,6 +1,8 @@
 //! Object operations and multipart uploads.
 
-use super::conditions::{Precondition, byte_range, not_modified, precondition, write_mode};
+use super::conditions::{
+    Precondition, byte_range, check_conditions, not_modified, precondition, write_mode,
+};
 use super::*;
 
 pub(crate) async fn object_put<R: Remote + 'static>(
@@ -129,6 +131,7 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         return xml_reply(xml::list_parts(&bucket, &key, upload_id, &parts));
     }
 
+    check_conditions(&headers)?;
     // The head decides the preconditions and the range; the read must return the same object.
     loop {
         let info = state.engine.head(&bucket, &key).await?;
@@ -170,6 +173,7 @@ pub(crate) async fn object_head<R: Remote + 'static>(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Reply {
+    check_conditions(&headers)?;
     let info = state.engine.head(&bucket, &key).await?;
     match precondition(&headers, &info) {
         Precondition::Failed => return Err(S3Error::precondition_failed()),

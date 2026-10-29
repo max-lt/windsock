@@ -240,6 +240,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   17 MiB; 64 readers peak at 664 MiB, 250 readers at 1.6 GiB, and 288 connected readers at
   2.2 GiB, so 5 to 10 MiB per reader. After the readers stop, the allocator keeps about 1.3 GiB,
   and three more runs of 250 readers do not raise it.
+- With the read budget at 64 MiB, of 250 readers 16 get 200 and 234 get `503 SlowDown`, and the
+  daemon peaks at 253 MiB. At the default budget of 1 GiB, 250 readers all get 200, at 1.6 GiB.
 - A client that stops reading a GET body holds its stream until `idle_timeout_secs` (60 s by
   default) after the last write that made progress. Stalled readers can hold the whole read budget for that time: the 503 then protects the memory, not the service. Then the daemon closes the connection. A client
   that reads slowly keeps it open: there is no minimum rate.

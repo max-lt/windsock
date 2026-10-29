@@ -70,7 +70,7 @@ const MAX_KEY_CHECK: u64 = 64 * 1024;
 /// The largest actions of one entry that a proxy writes. Half of the entry that a reader takes, so
 /// every proxy reads every entry whatever its own setting.
 pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
-/// The remote format of this build: journal actions carry their ack HLC.
+/// The remote format of this build: each journal entry carries a MAC under the repository key.
 const REMOTE_FORMAT: u32 = 3;
 
 pub fn pack_key(id: PackId) -> String {

@@ -45,7 +45,7 @@ GC keeps the MAC, because the MAC does not cover the sealed actions.
 
 ## What the key does
 
-blake3 `derive_key` makes two subkeys from `repo.key`:
+blake3 `derive_key` makes three subkeys from `repo.key`:
 
 - The chunk ID key. A chunk ID is a keyed blake3 hash of the chunk. The same subkey gives the
   FastCDC seed, so the chunk sizes do not show the structure of an object. Dedup works across all
@@ -53,6 +53,9 @@ blake3 `derive_key` makes two subkeys from `repo.key`:
 - The seal key. It encrypts with XChaCha20-Poly1305, with a random 24-byte nonce for each object.
   The associated data is the kind of object and its identity, so the bytes of one object do not
   open as another object.
+- The entry MAC key. Each journal entry carries a keyed blake3 MAC of its signed content, so a
+  writer without `repo.key` cannot make an entry that a proxy applies. The MAC stays when a
+  prune redacts the entry.
 
 A sealed object is `version | key ID (4 bytes) | nonce | ciphertext | tag`. It is 45 bytes
 longer than its content.
@@ -63,7 +66,7 @@ longer than its content.
 | --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
 | `packs/<id>`                | Each chunk, and the footer with the chunk IDs and offsets | The header (format and nonce), the total size and the footer size |
 | `manifests/<id>`            | All the content                                           | The key name                                                      |
-| `log/<node>/<seq>`          | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, and the signature                     |
+| `log/<node>/<seq>`          | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, the signature and the MAC             |
 | `snapshots/<time>-<h>/<n>`  | Part n of the sealed snapshot                             | The write time in the key name, the part number and size          |
 | `snapshots/<time>-<h>/head` | The size and hash of each part, the frontiers             | The write time in the key name                                    |
 | `snapshots/<time>-<h>`      | All the content (one object, read only)                   | The write time in the key name                                    |

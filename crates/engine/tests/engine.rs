@@ -1203,3 +1203,69 @@ async fn test_if_match_on_a_proxy_behind_syncs_before_it_refuses() {
 
     assert_eq!(get(&b.engine, "k").await.unwrap(), b"v3");
 }
+
+/// A remote that counts the listings of the node markers: one per sync.
+#[derive(Default)]
+struct SyncCounter {
+    inner: MemoryRemote,
+    syncs: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Remote for SyncCounter {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.create(key, data).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+        if prefix == journal::NODES_PREFIX {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.list(prefix).await
+    }
+}
+
+#[tokio::test]
+async fn test_failed_if_match_requests_force_one_sync_per_second_at_most() {
+    let remote = Arc::new(SyncCounter::default());
+    let a = proxy(&remote, 1).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "k", b"v1").await;
+    a.engine.sync().await.unwrap();
+    let before = remote.syncs.load(Ordering::SeqCst);
+
+    for _ in 0..100 {
+        let result = a
+            .engine
+            .put(
+                BUCKET,
+                "k",
+                Bytes::from("v2"),
+                BTreeMap::new(),
+                WriteMode::IfMatch(vec![[9u8; 32]]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::PreconditionFailed { .. })
+        ));
+    }
+
+    let forced = remote.syncs.load(Ordering::SeqCst) - before;
+    assert!(
+        forced <= 1,
+        "{forced} syncs for 100 failed If-Match requests"
+    );
+}

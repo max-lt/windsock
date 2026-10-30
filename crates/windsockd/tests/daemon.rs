@@ -979,15 +979,23 @@ async fn test_cache_trim_empties_the_cache_of_the_running_daemon() {
     let config = common::cluster_config(dir.path(), &remote, 100, "enabled = false");
     let daemon = start(&config, "info");
     let keys = common::test_keys();
+    // A flush caches the written chunks before it writes its log entry. A trim during the flush
+    // could count a chunk that an insert in flight writes, then evicts: wait for the entry.
+    let entries = || common::chains(&remote).iter().map(Vec::len).sum::<usize>();
+    let wait_entries_above = |count: usize| async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while entries() <= count {
+            assert!(Instant::now() < deadline, "no flush within 10 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     call(&daemon, &keys, "PUT", "/demo", b"").await;
+    wait_entries_above(0).await;
+    let before = entries();
     call(&daemon, &keys, "PUT", "/demo/k", &vec![7; 300_000]).await;
+    wait_entries_above(before).await;
     let cache = dir.path().join("data/engine/cache");
     let admin = dir.path().join("data/admin");
-    // The flush puts the written chunks in the cache.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while files_under(&cache) == 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let cached = files_under(&cache);
 
     let refused = cache_trim(&config, Some("1000000000000000"));

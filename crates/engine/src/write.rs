@@ -218,7 +218,7 @@ impl<R: Remote + 'static> Engine<R> {
         let index = self.index().disk_bytes()?;
         Ok(LocalUsage {
             index,
-            cache: self.cache.as_ref().map_or(0, ChunkCache::bytes),
+            cache: self.cache.as_ref().map_or(0, |cache| cache.bytes()),
             buffer: self.buffered_bytes().await,
         })
     }

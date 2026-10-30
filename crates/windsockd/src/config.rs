@@ -110,6 +110,8 @@ pub struct EngineConfig {
     pub parts_limit_bytes: u64,
     /// The bytes of GET pieces in flight on all connections together.
     pub read_budget_bytes: u64,
+    /// Pieces that a GET of the remote reads ahead at most. 0 turns read-ahead off.
+    pub read_ahead: usize,
 }
 
 impl Default for EngineConfig {
@@ -121,6 +123,7 @@ impl Default for EngineConfig {
             buffer_limit_bytes: engine.buffer_limit,
             parts_limit_bytes: s3api::DEFAULT_PARTS_LIMIT,
             read_budget_bytes: engine.read_budget,
+            read_ahead: engine.read_ahead,
         }
     }
 }
@@ -242,6 +245,7 @@ impl Config {
             flush_delay: Duration::from_millis(self.engine.flush_delay_ms),
             buffer_limit: self.engine.buffer_limit_bytes,
             read_budget: self.engine.read_budget_bytes,
+            read_ahead: self.engine.read_ahead,
             gc_horizon: Duration::from_secs(self.gc.horizon_secs),
             retention: Duration::from_secs(self.gc.retention_secs),
             late_margin: Duration::from_secs(self.gc.late_margin_secs),

@@ -36,7 +36,9 @@ use journal::{Action, Commit, Entry, HybridClock, Journal, JournalError};
 pub use list::{ListAfter, ListEntry, ListPage, ListQuery};
 use model::{ChunkId, NodeId, ObjectId, PackId};
 use pack::{Pack, PackEntry, PackError};
-pub use read::{ObjectReader, READ_STEP, ReadRoom};
+pub use read::{
+    MAX_READ_AHEAD, ObjectReader, READ_AHEAD_IN_FLIGHT, READ_STEP, ReadRoom, ReadState,
+};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
 pub use spool::PutSpool;
@@ -261,7 +263,9 @@ pub struct Engine<R> {
     clock: Arc<HybridClock>,
     index: Mutex<Index>,
     buffer: tokio::sync::Mutex<Buffer>,
-    cache: Option<ChunkCache>,
+    cache: Option<Arc<ChunkCache>>,
+    /// The remote, the keys and the cache again, for the read-ahead tasks.
+    chunks: Arc<read::Chunks<R>>,
     /// The repository keys: chunk IDs, the FastCDC seed, and the seal of remote objects.
     keys: Keys,
     /// One flush at a time.
@@ -292,6 +296,12 @@ pub struct Engine<R> {
     read_budget: Arc<tokio::sync::Semaphore>,
     /// A GET got no room at its first piece since the last one that got room: logged once.
     read_budget_short: AtomicBool,
+    /// One read-ahead takes room at a time: its check of the room in use stays true.
+    read_ahead_lock: Mutex<()>,
+    /// Remote reads that read-ahead runs at one time, on all GETs together.
+    read_ahead_fetches: Arc<tokio::sync::Semaphore>,
+    /// Read-ahead tasks that run, and that started since the open.
+    read_ahead_tasks: Arc<read::TaskCounts>,
     /// The highest own HLC that the open found, and where: the operator sees what holds the clock.
     own_high: Mutex<(u64, &'static str)>,
     /// When this process first saw each object that waits for a GC delete.
@@ -496,6 +506,13 @@ impl<R: Remote + 'static> Engine<R> {
                 config.max_entry_actions
             )));
         }
+        if config.read_ahead > read::MAX_READ_AHEAD {
+            return Err(EngineError::Config(format!(
+                "read_ahead ({}) is over {}",
+                config.read_ahead,
+                read::MAX_READ_AHEAD
+            )));
+        }
         if config.read_budget < MIN_READ_BUDGET {
             return Err(EngineError::Config(format!(
                 "read_budget ({}) is under {MIN_READ_BUDGET}: GETs would wait for each other with \
@@ -565,8 +582,15 @@ impl<R: Remote + 'static> Engine<R> {
         clock.witness(own_high.0);
         let cache = match config.cache_bytes {
             0 => None,
-            bytes => Some(ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?),
+            bytes => Some(Arc::new(
+                ChunkCache::open(dir.join(CACHE_DIR), bytes, keys.clone()).await?,
+            )),
         };
+        let chunks = Arc::new(read::Chunks {
+            remote: remote.clone(),
+            keys: keys.clone(),
+            cache: cache.clone(),
+        });
 
         if !buffer.is_empty() {
             info!(bytes = buffer.bytes(), "replayed buffered writes");
@@ -584,6 +608,7 @@ impl<R: Remote + 'static> Engine<R> {
             index: Mutex::new(index),
             buffer: tokio::sync::Mutex::new(buffer),
             cache,
+            chunks,
             flushing: tokio::sync::Mutex::new(()),
             syncing: tokio::sync::Mutex::new(()),
             last_sync: Mutex::new(None),
@@ -595,6 +620,9 @@ impl<R: Remote + 'static> Engine<R> {
             bad_data: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
             clock_ahead: AtomicBool::new(false),
+            read_ahead_lock: Mutex::new(()),
+            read_ahead_fetches: Arc::new(tokio::sync::Semaphore::new(read::READ_AHEAD_IN_FLIGHT)),
+            read_ahead_tasks: Arc::default(),
             read_budget,
             read_budget_short: AtomicBool::new(false),
             spooled: Arc::new(AtomicU64::new(0)),

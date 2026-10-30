@@ -135,7 +135,7 @@ async fn copy_object<R: Remote + 'static>(
     loop {
         let held = match room.take() {
             Some(room) => room,
-            None => state.engine.read_room(None).await?,
+            None => state.engine.piece_room(&mut reader).await?,
         };
         let Some(piece) = state.engine.next_piece(&mut reader).await? else {
             break;
@@ -364,7 +364,7 @@ fn object_body<R: Remote + 'static>(
                 drop::<Option<ReadRoom>>(held);
                 let room = match first {
                     Some(room) => room,
-                    None => engine.read_room(None).await?,
+                    None => engine.piece_room(&mut reader).await?,
                 };
                 match engine.next_piece(&mut reader).await {
                     Ok(piece) => Ok(piece.map(|piece| (piece, (engine, reader, None, Some(room))))),

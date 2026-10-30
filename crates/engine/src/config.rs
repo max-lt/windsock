@@ -83,6 +83,9 @@ pub struct Config {
     pub max_entry_actions: u64,
     /// The bytes of GET pieces in flight on all connections together. A GET waits for its room.
     pub read_budget: u64,
+    /// Pieces that a GET of the remote reads ahead of the piece that it sends. 0 turns read-ahead
+    /// off; at most [`crate::MAX_READ_AHEAD`].
+    pub read_ahead: usize,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -105,6 +108,7 @@ impl Default for Config {
             // Far under the 1 GiB that a remote reply can hold.
             max_entry_actions: 256 * 1024 * 1024,
             read_budget: 1024 * 1024 * 1024,
+            read_ahead: 3,
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

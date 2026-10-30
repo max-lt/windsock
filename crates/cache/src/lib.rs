@@ -161,6 +161,11 @@ impl ChunkCache {
         self.lru.lock().expect("no panic while the lock is held")
     }
 
+    /// True when the cache holds `id`. The LRU order does not change.
+    pub fn contains(&self, id: ChunkId) -> bool {
+        self.lru().entries.contains_key(&id)
+    }
+
     /// Bytes the cache holds.
     pub fn bytes(&self) -> u64 {
         self.lru().bytes

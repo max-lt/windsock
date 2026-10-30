@@ -210,6 +210,7 @@ the configuration file.
 | `engine.buffer_limit_bytes` | 8 GiB                                | Writes fail with `503 SlowDown` above this                                                                                                                                                                                                                                                                                                                                                                                         |
 | `engine.parts_limit_bytes`  | 4 GiB                                | The parts of all open multipart uploads together. A part fails with `503 SlowDown` above this, and plain writes go on. Clients free the room with ListMultipartUploads and AbortMultipartUpload, or the expiry removes the uploads                                                                                                                                                                                                 |
 | `engine.read_budget_bytes`  | 1 GiB                                | The pieces of GETs in flight on all connections together, 4 MiB each. A GET whose first piece finds no room in 5 s gets `503 SlowDown`. Later pieces wait. The minimum is 64 MiB                                                                                                                                                                                                                                                   |
+| `engine.read_ahead`         | `3`                                  | Pieces that a GET of the remote reads ahead at most, `0` to `8`. `0` turns read-ahead off                                                                                                                                                                                                                                                                                                                                          |
 | `gc.enabled`                | `false`                              | Set to `true` on one proxy per remote. Windsock does not enforce this: see Limits                                                                                                                                                                                                                                                                                                                                                  |
 | `gc.interval_secs`          | `3600`                               | How often the GC runs                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `gc.horizon_secs`           | `86400`                              | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning                                                                                                                                                                                                                                                                                      |
@@ -276,6 +277,25 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   clean end. A GET of an object that a client deletes or overwrites keeps working until the GC
   deletes its packs, at least R + H after the delete (48 h by default). A GET that runs longer is
   cut.
+- A GET of the remote reads up to `engine.read_ahead` pieces (default 3) ahead of the piece that
+  it sends, each in its own task. The depth follows the client. The reader keeps the time that
+  the client took to ask for each of its last two pieces (the gap; the first gap does not count)
+  and the time of each of its last two fetches. With the larger of each, the depth is
+  `ceil(fetch / gap)`, at least 1 and at most `engine.read_ahead`. A client whose gap is more than
+  4 times the fetch gets no read-ahead. A client that slows down stops its surplus pieces at once
+  and gives their room back. The first two pieces of a GET, and a piece that the cache holds,
+  start no read-ahead. Read-ahead never waits: a piece ahead takes room in the read budget only
+  while all the room in use, with it, stays within half of the budget, and a remote read only
+  while fewer than 32 run for read-ahead. Otherwise the GET goes on one piece at a time. A client
+  that goes away stops its read-ahead tasks. The pieces leave in order, and a failed fetch cuts the
+  response when its piece is due. One GET holds at most 1 + `engine.read_ahead` pieces.
+- Read-ahead measured in release on macOS, a remote with 200 ms per read, cache off, a 1 GiB
+  object, `engine.read_ahead` 0 then 3. One GET: 61.1 s then 15.9 s, RSS growth 22 MiB then
+  90 MiB. Four GETs of 256 MiB one after the other: 61.6 s then 17.4 s. Four clients that each
+  read 8 MiB ranges in order: 86.3 s then 85.3 s, because a range of two pieces starts no
+  read-ahead. On a 256 MiB read budget, 250 readers at 200 KiB/s get 173 to 181 refusals (503) at
+  depth 0 and 172 to 186 at depth 3: readers this slow start no read-ahead. 8 fast readers and 242
+  readers at 200 KiB/s get 173 and 178 refusals at depth 0, 172 and 174 at depth 3.
 - Measured on macOS, one daemon, a 1 GiB object, readers at 200 KiB/s: an idle daemon holds
   17 MiB; 64 readers peak at 664 MiB, 250 readers at 1.6 GiB, and 288 connected readers at
   2.2 GiB, so 5 to 10 MiB per reader. After the readers stop, the allocator keeps about 1.3 GiB,
@@ -335,10 +355,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   most 1 MiB. It takes the buffer room of the whole object first (`503 SlowDown` with no room).
   The reader fixes the source version at the start: a delete or an overwrite of the source during
   the copy does not change what it copies. A source that is still only in the buffer works. A
-  copy onto itself (metadata `REPLACE`) works. A client that goes away drops the spool file.
-  Measured on macOS, release build, a flushed source of 1 GiB: one copy took 2.2 s, and 8 copies
-  at once 3.9 s. The live memory of a copy is one read piece and one 1 MiB piece; the RSS rose by
-  about 250 MiB, which vmmap shows as freed large blocks that the allocator keeps.
+  copy onto itself (metadata `REPLACE`) works. A client that goes away drops the spool file. The
+  read pieces are up to 4 MiB, as for a GET, and count in the read budget; the 1 MiB bound is for
+  the write pieces. Measured on macOS, release build, a flushed source of 1 GiB: one copy took
+  2.2 s, and 8 copies at once 3.9 s. With the cache off, one copy raised the RSS by 18 MiB.
 
 ## Scale
 

@@ -3,6 +3,7 @@
 use super::*;
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use tokio::io::AsyncReadExt;
 
@@ -10,6 +11,21 @@ use crate::plan::Fetch;
 
 /// The largest piece that [`Engine::next_piece`] gives, so a read holds this much data at a time.
 pub const READ_STEP: usize = 4 * 1024 * 1024;
+
+/// The largest read-ahead depth that the configuration accepts.
+pub const MAX_READ_AHEAD: usize = 8;
+
+/// Remote reads that read-ahead runs at one time on all GETs, under the limit of the remote
+/// client, so the flush keeps connections.
+pub const READ_AHEAD_IN_FLIGHT: usize = 32;
+
+/// A client that takes more than this many fetch times to ask for its next piece gets no
+/// read-ahead: one piece ahead would save it less than a fifth of its time.
+pub const READ_AHEAD_SLOW_FACTOR: u32 = 4;
+
+/// Read-ahead takes room only while the room in use stays within 1/N of the read budget, so a
+/// first piece finds room.
+pub const READ_AHEAD_BUDGET_PART: u64 = 2;
 
 /// An open read of an object. [`Engine::next_piece`] gives its data.
 pub struct ObjectReader {
@@ -29,7 +45,117 @@ enum Source {
         skip: u64,
         remaining: u64,
         mode: CacheMode,
+        /// The pieces after the head that tasks read now, in plan order.
+        ahead: VecDeque<Ahead>,
+        pace: Pace,
     },
+}
+
+/// A piece that a task reads ahead, and its room in the read budget until the reader takes it.
+struct Ahead {
+    fetch: Fetch,
+    task: AheadTask,
+    room: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// A read-ahead task: the raw piece and the time of its fetch. It stops when it drops, so a
+/// reader that goes away stops its fetches.
+struct AheadTask(tokio::task::JoinHandle<Result<(Vec<u8>, Duration)>>);
+
+impl AheadTask {
+    async fn join(mut self) -> Result<(Vec<u8>, Duration)> {
+        match (&mut self.0).await {
+            Ok(piece) => piece,
+            Err(e) => Err(std::io::Error::other(format!("a read-ahead task failed: {e}")).into()),
+        }
+    }
+}
+
+impl Drop for AheadTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What the depth rule knows of one reader: its last two gaps and its last two fetch times.
+#[derive(Default)]
+struct Pace {
+    /// When the last piece left [`Engine::next_piece`].
+    returned: Option<Instant>,
+    gaps_seen: u32,
+    gaps: [Duration; 2],
+    fetches: [Duration; 2],
+}
+
+impl Pace {
+    fn asked(&mut self, now: Instant) {
+        let Some(returned) = self.returned.take() else {
+            return;
+        };
+        self.gaps_seen += 1;
+        // The socket buffer can take a whole first piece: its gap says nothing of the client.
+        if self.gaps_seen > 1 {
+            self.gaps = [self.gaps[1], now - returned];
+        }
+    }
+
+    fn fetched(&mut self, took: Duration) {
+        self.fetches = [self.fetches[1], took];
+    }
+
+    fn depth(&self, cap: usize) -> usize {
+        if self.gaps_seen < 2 {
+            return 0;
+        }
+        let gap = self.gaps[0].max(self.gaps[1]);
+        let fetch = self.fetches[0].max(self.fetches[1]);
+        read_ahead_depth(fetch, gap, cap)
+    }
+}
+
+/// The pieces to read ahead so the remote stays busy while the client takes a piece.
+fn read_ahead_depth(fetch: Duration, gap: Duration, cap: usize) -> usize {
+    if cap == 0 || gap > fetch * READ_AHEAD_SLOW_FACTOR {
+        return 0;
+    }
+    if gap.is_zero() {
+        return cap;
+    }
+    let depth = fetch.as_nanos().div_ceil(gap.as_nanos());
+    usize::try_from(depth).unwrap_or(cap).clamp(1, cap)
+}
+
+/// Read-ahead tasks: those that run now, and all that started since the open.
+#[derive(Default)]
+pub(crate) struct TaskCounts {
+    running: AtomicU64,
+    started: AtomicU64,
+}
+
+/// Counts one task from its spawn to the drop of its future, which an abort also drops.
+struct TaskCount(Arc<TaskCounts>);
+
+impl TaskCount {
+    fn start(counts: &Arc<TaskCounts>) -> Self {
+        counts.running.fetch_add(1, Ordering::SeqCst);
+        counts.started.fetch_add(1, Ordering::SeqCst);
+        Self(counts.clone())
+    }
+}
+
+impl Drop for TaskCount {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The free room of the reads and the read-ahead tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadState {
+    pub budget_free: u64,
+    pub fetch_slots_free: usize,
+    pub tasks_running: u64,
+    pub tasks_started: u64,
 }
 
 impl<R: Remote + 'static> Engine<R> {
@@ -75,26 +201,39 @@ impl<R: Remote + 'static> Engine<R> {
                 skip,
                 remaining,
                 mode,
+                ahead,
+                pace,
             } => loop {
                 if *remaining == 0 {
                     return Ok(None);
                 }
-                let Some(fetch) = fetches.pop_front() else {
-                    return Err(EngineError::Corrupt(
-                        "the chunks of a manifest end before its size".to_string(),
-                    ));
+                pace.asked(Instant::now());
+                let depth = pace.depth(self.config.read_ahead);
+                let (raw, took) = match ahead.pop_front() {
+                    Some(head) => {
+                        shrink(fetches, ahead, depth);
+                        self.read_ahead(fetches, ahead, *mode, depth);
+                        head.task.join().await?
+                    }
+                    None => {
+                        let Some(fetch) = fetches.pop_front() else {
+                            return Err(EngineError::Corrupt(
+                                "the chunks of a manifest end before its size".to_string(),
+                            ));
+                        };
+                        self.read_ahead(fetches, ahead, *mode, depth);
+                        let started = Instant::now();
+                        let raw = self.chunks.read_piece(&fetch, *mode).await?;
+                        (raw, started.elapsed())
+                    }
                 };
-                // One size for every piece: buffers of many sizes stay with the allocator after
-                // their free.
-                let mut raw = Vec::with_capacity(READ_STEP);
-                for chunk in self.read_fetch(&fetch, *mode).await? {
-                    raw.extend(chunk);
-                }
+                pace.fetched(took);
                 let start = (*skip).min(raw.len() as u64);
                 *skip -= start;
                 let end = (start + *remaining).min(raw.len() as u64);
                 *remaining -= end - start;
                 if end > start {
+                    pace.returned = Some(Instant::now());
                     return Ok(Some(Bytes::from(raw).slice(start as usize..end as usize)));
                 }
             },
@@ -186,6 +325,8 @@ impl<R: Remote + 'static> Engine<R> {
                             skip,
                             remaining,
                             mode,
+                            ahead: VecDeque::new(),
+                            pace: Pace::default(),
                         },
                     });
                 }
@@ -284,6 +425,37 @@ impl<R: Remote + 'static> Engine<R> {
         let manifest = Manifest::decode(id, bytes)?;
         self.index().put_manifest(id, bytes)?;
         Ok(manifest)
+    }
+}
+
+/// What a fetch reads: the remote, the keys and the cache. A read-ahead task holds a handle.
+pub(crate) struct Chunks<R> {
+    pub(crate) remote: Arc<R>,
+    pub(crate) keys: Keys,
+    pub(crate) cache: Option<Arc<ChunkCache>>,
+}
+
+impl<R: Remote + 'static> Chunks<R> {
+    /// The raw bytes of one fetch.
+    async fn read_piece(&self, fetch: &Fetch, mode: CacheMode) -> Result<Vec<u8>> {
+        // One size for every piece: buffers of many sizes stay with the allocator after their
+        // free.
+        let mut raw = Vec::with_capacity(READ_STEP);
+        for chunk in self.read_fetch(fetch, mode).await? {
+            raw.extend(chunk);
+        }
+        Ok(raw)
+    }
+
+    /// True when the cache holds every chunk of `fetch` for a read in `mode`.
+    fn all_cached(&self, fetch: &Fetch, mode: CacheMode) -> bool {
+        let Some(cache) = self.cache.as_ref().filter(|_| mode != CacheMode::Off) else {
+            return false;
+        };
+        fetch
+            .entries
+            .iter()
+            .all(|entry| cache.contains(entry.chunk_id))
     }
 
     /// The raw chunks of one fetch, in order: from the cache when it holds
@@ -518,5 +690,165 @@ impl<R: Remote + 'static> Engine<R> {
             info!("GETs get room in the read budget again");
         }
         Ok(ReadRoom { _permit: permit })
+    }
+
+    /// Room for the next piece of `reader`. A piece that read-ahead holds gives its own room.
+    pub async fn piece_room(&self, reader: &mut ObjectReader) -> Result<ReadRoom> {
+        if let Source::Stored { ahead, .. } = &mut reader.source
+            && let Some(room) = ahead.front_mut().and_then(|head| head.room.take())
+        {
+            return Ok(ReadRoom { _permit: room });
+        }
+        // The queue of this reader is empty here: a reader that waits for room holds none, so
+        // readers never wait for each other in a cycle.
+        self.read_room(None).await
+    }
+
+    /// Starts tasks for the pieces after the head, up to `depth`. It never waits: with no room or
+    /// no fetch slot it starts nothing, and the read goes on one piece at a time.
+    fn read_ahead(
+        &self,
+        fetches: &mut VecDeque<Fetch>,
+        ahead: &mut VecDeque<Ahead>,
+        mode: CacheMode,
+        depth: usize,
+    ) {
+        while ahead.len() < depth {
+            let Some(fetch) = fetches.front() else {
+                return;
+            };
+            // A cached piece is fast to read in turn.
+            if self.chunks.all_cached(fetch, mode) {
+                return;
+            }
+            let Some(room) = self.try_ahead_room() else {
+                return;
+            };
+            let Ok(slot) = self.read_ahead_fetches.clone().try_acquire_owned() else {
+                return;
+            };
+            let fetch = fetches.pop_front().expect("the front fetch exists");
+            let (chunks, task_fetch) = (self.chunks.clone(), fetch.clone());
+            let count = TaskCount::start(&self.read_ahead_tasks);
+            let task = tokio::spawn(async move {
+                let _count = count;
+                let started = Instant::now();
+                let piece = chunks.read_piece(&task_fetch, mode).await;
+                // The slot is for the remote read only; the piece keeps its room until it leaves.
+                drop(slot);
+                piece.map(|raw| (raw, started.elapsed()))
+            });
+            ahead.push_back(Ahead {
+                fetch,
+                task: AheadTask(task),
+                room: Some(room),
+            });
+        }
+    }
+
+    /// Room for one read-ahead piece, while the room in use stays within its part of the budget.
+    fn try_ahead_room(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let piece = READ_STEP as u64;
+        let budget = self.config.read_budget;
+        let _one = self
+            .read_ahead_lock
+            .lock()
+            .expect("no panic while the lock is held");
+        let in_use = budget - self.read_budget.available_permits() as u64;
+        if in_use + piece > budget / READ_AHEAD_BUDGET_PART {
+            return None;
+        }
+        self.read_budget
+            .clone()
+            .try_acquire_many_owned(piece as u32)
+            .ok()
+    }
+
+    pub fn read_state(&self) -> ReadState {
+        ReadState {
+            budget_free: self.read_budget.available_permits() as u64,
+            fetch_slots_free: self.read_ahead_fetches.available_permits(),
+            tasks_running: self.read_ahead_tasks.running.load(Ordering::SeqCst),
+            tasks_started: self.read_ahead_tasks.started.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Stops the pieces past `depth` and puts their fetches back: a client that slows down gives
+/// their room back at once.
+fn shrink(fetches: &mut VecDeque<Fetch>, ahead: &mut VecDeque<Ahead>, depth: usize) {
+    while ahead.len() > depth {
+        let surplus = ahead
+            .pop_back()
+            .expect("the queue is longer than the depth");
+        fetches.push_front(surplus.fetch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn test_read_ahead_depth_follows_the_gap_and_the_fetch() {
+        let cases = [
+            // (fetch, gap, cap, depth)
+            (200 * MS, Duration::ZERO, 3, 3),
+            (200 * MS, Duration::ZERO, 8, 8),
+            (200 * MS, MS, 3, 3),
+            (200 * MS, 70 * MS, 8, 3),
+            (200 * MS, 100 * MS, 8, 2),
+            (200 * MS, 200 * MS, 3, 1),
+            (200 * MS, 800 * MS, 3, 1),
+            (200 * MS, 801 * MS, 3, 0),
+            (200 * MS, 20_000 * MS, 3, 0),
+            (Duration::ZERO, MS, 3, 0),
+            (200 * MS, 100 * MS, 0, 0),
+        ];
+        for (fetch, gap, cap, depth) in cases {
+            assert_eq!(
+                read_ahead_depth(fetch, gap, cap),
+                depth,
+                "fetch {fetch:?}, gap {gap:?}, cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_ahead_depth_never_passes_the_cap() {
+        for cap in 0..=MAX_READ_AHEAD {
+            for gap in [0, 1, 10, 100, 1000, 10_000] {
+                let depth = read_ahead_depth(1000 * MS, gap * MS, cap);
+                assert!(depth <= cap, "cap {cap}, gap {gap} ms: depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pace_ignores_the_first_gap_and_takes_the_larger_of_two() {
+        let mut pace = Pace::default();
+        let start = Instant::now();
+        pace.fetched(200 * MS);
+        assert_eq!(pace.depth(3), 0, "the first piece starts no read-ahead");
+
+        pace.returned = Some(start);
+        pace.asked(start + 10_000 * MS);
+        assert_eq!(pace.depth(3), 0, "the first gap is not a sample");
+
+        pace.returned = Some(start);
+        pace.asked(start);
+        assert_eq!(pace.depth(3), 3, "a client that asks at once gets the cap");
+
+        pace.returned = Some(start);
+        pace.asked(start + 900 * MS);
+        pace.returned = Some(start);
+        pace.asked(start);
+        assert_eq!(
+            pace.depth(3),
+            0,
+            "one slow gap of the last two stops read-ahead"
+        );
     }
 }

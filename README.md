@@ -265,6 +265,12 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   most 1 MiB: it holds about 1 MiB of memory, and the peak for such PUTs is `max_connections`
   times 1 MiB. Its spool file counts against the buffer limit as it grows. A smaller PUT goes
   through the buffer in one record, with the group fsync.
+- Measured on macOS, one daemon, PUTs of a 100 MiB file at 200 KiB/s for 60 s: 64 writers raised
+  the daemon from 224 MiB to 241 MiB, and 250 writers from 43 MiB to 106 MiB, about 260 KiB per
+  writer, with 2.9 GiB in spool files. When the clients stopped, no spool file stayed.
+- The flush and the replay at start read each buffered object whole into memory: after one PUT of
+  100 MiB, its flush raised the daemon to 224 MiB. So a spooled PUT of 5 GiB takes more than
+  5 GiB of memory at its flush.
 - A PUT with an aws-chunked body, a CopyObject and a CompleteMultipartUpload hold the whole
   object in memory, up to 5 GiB per request, about 3 times the object: a PUT of 1 GiB raised the
   daemon to 3.1 GiB, so one at the 5 GiB cap takes about 15 GiB. No limit covers them all

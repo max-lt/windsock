@@ -328,3 +328,36 @@ async fn test_failure_around_the_rename_breaks_the_buffer() {
         assert_eq!(spool_files(dir.path()), 0);
     }
 }
+
+#[tokio::test]
+async fn test_reserved_room_counts_at_once_and_comes_back_when_the_spool_goes() {
+    let remote = Arc::new(MemoryRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        buffer_limit: 8 * PIECE as u64,
+        ..Config::default()
+    };
+    let a = open(dir.path(), &remote, config).await;
+    a.create_bucket(BUCKET, None).await.unwrap();
+    a.flush().await.unwrap();
+    let reserve = 6 * PIECE as u64;
+    let sized = |key: &'static str| {
+        a.begin_put_sized(BUCKET, key, BTreeMap::new(), WriteMode::Overwrite, reserve)
+    };
+
+    let mut first = sized("a").await.unwrap();
+    let second = sized("b").await;
+    let inside = a.spool_write(&mut first, &data(6 * PIECE)).await;
+    drop(first);
+    let mut third = sized("c").await.unwrap();
+    a.spool_write(&mut third, &data(7 * PIECE)).await.unwrap();
+    let committed = a.finish_put(third).await;
+
+    assert!(
+        matches!(second, Err(EngineError::BufferFull { .. })),
+        "{:?}",
+        second.as_ref().err()
+    );
+    inside.unwrap();
+    assert_eq!(committed.unwrap().size, 7 * PIECE as u64);
+}

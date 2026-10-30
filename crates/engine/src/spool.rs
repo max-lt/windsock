@@ -27,12 +27,24 @@ pub struct PutSpool {
     metadata: BTreeMap<String, String>,
     mode: WriteMode,
     spooled: Arc<AtomicU64>,
+    /// Room of the buffer limit taken at the start, for a body of a known size.
+    reserved: u64,
 }
 
 impl PutSpool {
     /// Bytes of the body so far.
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// The blake3 hash of the body so far: the content hash of the put once the body is whole.
+    pub fn content_hash(&self) -> [u8; 32] {
+        *self.hasher.clone().finalize().as_bytes()
+    }
+
+    /// The bytes that count against the buffer limit.
+    fn counted(&self) -> u64 {
+        self.len.max(self.reserved)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -44,7 +56,7 @@ impl Drop for PutSpool {
     fn drop(&mut self) {
         // After the commit the file is a segment: the path no longer exists, and len is 0.
         let _ = std::fs::remove_file(&self.path);
-        let len = self.len;
+        let len = self.counted();
         let _ = self
             .spooled
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |spooled| {
@@ -62,6 +74,20 @@ impl<R: Remote + 'static> Engine<R> {
         key: &str,
         metadata: BTreeMap<String, String>,
         mode: WriteMode,
+    ) -> Result<PutSpool> {
+        self.begin_put_sized(bucket, key, metadata, mode, 0).await
+    }
+
+    /// [`Engine::begin_put`] for a body of `size` bytes: its room of the buffer limit is taken at
+    /// once, so puts that start together cannot pass the limit together. The room comes back when
+    /// the spool goes.
+    pub async fn begin_put_sized(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: BTreeMap<String, String>,
+        mode: WriteMode,
+        size: u64,
     ) -> Result<PutSpool> {
         crate::write::check_key(key)?;
         self.check_writes()?;
@@ -100,9 +126,12 @@ impl<R: Remote + 'static> Engine<R> {
                 });
             }
             let limit = self.config.buffer_limit;
-            if buffer.bytes() + self.spooled.load(Ordering::SeqCst) >= limit {
+            let used = buffer.bytes() + self.spooled.load(Ordering::SeqCst);
+            if used >= limit || used + size > limit {
                 return Err(EngineError::BufferFull { limit });
             }
+            // Under the buffer lock: two puts that start together see each other.
+            self.spooled.fetch_add(size, Ordering::SeqCst);
         }
 
         let n = SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -110,11 +139,18 @@ impl<R: Remote + 'static> Engine<R> {
             .buffer_dir
             .join(SPOOL_DIR)
             .join(format!("{}.{n}", std::process::id()));
-        let file = tokio::fs::OpenOptions::new()
+        let file = match tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&path)
-            .await?;
+            .await
+        {
+            Ok(file) => file,
+            Err(e) => {
+                self.spooled.fetch_sub(size, Ordering::SeqCst);
+                return Err(e.into());
+            }
+        };
         let mut spool = PutSpool {
             file,
             path,
@@ -125,6 +161,7 @@ impl<R: Remote + 'static> Engine<R> {
             metadata,
             mode,
             spooled: self.spooled.clone(),
+            reserved: size,
         };
         // The record starts with the data length: it is known only at the end, so it goes at
         // offset 0 then.
@@ -142,15 +179,22 @@ impl<R: Remote + 'static> Engine<R> {
                 limit: largest,
             });
         }
+        // Only the bytes past the room taken at the start count again.
+        let extra = size.saturating_sub(spool.counted());
         let limit = self.config.buffer_limit;
-        let buffered = self.buffer.lock().await.bytes();
-        if buffered + self.spooled.load(Ordering::SeqCst) + piece.len() as u64 > limit {
-            return Err(EngineError::BufferFull { limit });
+        {
+            let buffer = self.buffer.lock().await;
+            if buffer.bytes() + self.spooled.load(Ordering::SeqCst) + extra > limit {
+                return Err(EngineError::BufferFull { limit });
+            }
+            self.spooled.fetch_add(extra, Ordering::SeqCst);
         }
-        spool.file.write_all(piece).await?;
+        if let Err(e) = spool.file.write_all(piece).await {
+            self.spooled.fetch_sub(extra, Ordering::SeqCst);
+            return Err(e.into());
+        }
         spool.hasher.update(piece);
         spool.len = size;
-        self.spooled.fetch_add(piece.len() as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -189,9 +233,11 @@ impl<R: Remote + 'static> Engine<R> {
 
         let len = spool.len;
         buffer.adopt(&spool.path, &head, len).await?;
-        // The bytes now count in the segments of the buffer.
+        // The bytes count in the segments of the buffer.
+        let counted = spool.counted();
         spool.len = 0;
-        self.spooled.fetch_sub(len, Ordering::SeqCst);
+        spool.reserved = 0;
+        self.spooled.fetch_sub(counted, Ordering::SeqCst);
         self.wake_flusher_when_full(&buffer);
         drop(buffer);
         crate::sim::crash_point(crate::sim::Point::SpoolAck)?;

@@ -155,6 +155,7 @@ async fn test_node_handle_reads_state_and_sets_the_cache_limit() {
     assert!(status.buffered_bytes > 0);
     assert!(!status.quarantined && !status.index_poisoned && !status.draining);
     assert!(!status.gc_enabled);
+    assert!(status.admin_socket);
     assert_eq!(status.other_gc_node, None);
     assert_eq!(buckets.len(), 1);
     assert_eq!(buckets[0].name, "demo");

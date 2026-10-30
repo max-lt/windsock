@@ -24,6 +24,9 @@ pub struct NodeStatus {
     pub index_poisoned: bool,
     pub draining: bool,
     pub gc_enabled: bool,
+    /// The admin socket of `windsockd cache-trim` listens. False when the socket path of
+    /// `data_dir` is over the Unix limit.
+    pub admin_socket: bool,
     /// Another node that ran the GC in the last horizon.
     pub other_gc_node: Option<NodeId>,
 }
@@ -62,11 +65,13 @@ impl Node {
         engine: Arc<Engine<R>>,
         uploads: Arc<s3api::Uploads>,
         limits: Limits,
+        admin_socket: bool,
     ) -> Self {
         Self(Arc::new(EngineNode {
             engine,
             uploads,
             limits,
+            admin_socket,
         }))
     }
 
@@ -108,6 +113,7 @@ struct EngineNode<R> {
     engine: Arc<Engine<R>>,
     uploads: Arc<s3api::Uploads>,
     limits: Limits,
+    admin_socket: bool,
 }
 
 #[async_trait::async_trait]
@@ -124,6 +130,7 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
             index_poisoned: self.engine.index_is_poisoned(),
             draining: self.engine.is_draining(),
             gc_enabled: self.limits.gc_enabled,
+            admin_socket: self.admin_socket,
             other_gc_node: self.engine.other_gc_node(),
         }
     }

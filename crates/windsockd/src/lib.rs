@@ -407,12 +407,14 @@ async fn serve<R: Sweep + 'static>(
         parts: config.engine.parts_limit_bytes,
         gc_enabled: config.gc.enabled,
     };
-    let node = Node::new(engine.clone(), s3.uploads.clone(), limits);
     let socket = admin::prepare(&config.data_dir)?;
-    background.push(tokio::spawn(admin::serve(
-        admin::bind(&socket)?,
-        node.clone(),
-    )));
+    let node = Node::new(engine.clone(), s3.uploads.clone(), limits, socket.is_some());
+    if let Some(socket) = &socket {
+        background.push(tokio::spawn(admin::serve(
+            admin::bind(socket)?,
+            node.clone(),
+        )));
+    }
     on_open(node);
     let expirer = s3.uploads.clone();
     let max_age = Duration::from_secs(config.uploads_expire_secs);
@@ -483,7 +485,9 @@ async fn serve<R: Sweep + 'static>(
     for task in background {
         task.abort();
     }
-    if let Err(e) = std::fs::remove_file(&socket) {
+    if let Some(socket) = socket
+        && let Err(e) = std::fs::remove_file(&socket)
+    {
         warn!(%e, socket = %socket.display(), "cannot remove the admin socket");
     }
 

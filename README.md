@@ -183,8 +183,10 @@ first. A read that has a chunk file open keeps its data. The next read of an evi
 the remote. The directory `data/admin` has mode 0700 and the socket 0600: only the user of the
 daemon can use them. At start, the daemon refuses a `data/admin` that is a link, belongs to another
 user or that other users can open, and replaces a socket that a stopped daemon left. A Unix socket
-path takes at most 103 bytes: with a longer `data_dir/admin/admin.sock`, the start stops with an
-error that asks for a shorter `data_dir`.
+path takes at most 103 bytes: with a longer `data_dir/admin/admin.sock`, the daemon starts with
+no admin socket and logs one WARN with the path, its length and the fix (a shorter `data_dir`).
+`windsockd cache-trim` then fails with `no admin socket: data_dir is too long`, and the console
+sees `admin_socket = false` in the node status.
 
 ## Configuration
 

@@ -1039,3 +1039,30 @@ async fn test_daemon_replaces_the_socket_that_a_crash_left() {
     );
     assert!(daemon.stop());
 }
+
+#[tokio::test]
+async fn test_long_data_dir_starts_with_no_admin_socket_and_one_warn() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("d".repeat(80));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = common::cluster_config(&dir, &dir.join("remote"), 100, "enabled = false");
+    let mut daemon = start(&config, "info");
+    let keys = common::test_keys();
+
+    let put = call(&daemon, &keys, "PUT", "/demo", b"").await;
+    let trimmed = cache_trim(&config, None);
+    let warns = daemon.count_after(
+        "the admin socket path is over the Unix limit",
+        Duration::from_millis(500),
+    );
+
+    assert_eq!(put.status, StatusCode::OK);
+    assert_eq!(warns, 1);
+    assert!(!trimmed.status.success());
+    let error = String::from_utf8_lossy(&trimmed.stderr);
+    assert!(
+        error.contains("no admin socket: data_dir is too long"),
+        "{error}"
+    );
+    assert!(daemon.stop());
+}

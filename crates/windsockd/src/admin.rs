@@ -51,16 +51,21 @@ fn parse(line: &str) -> Result<Request, String> {
 
 /// Makes the admin directory with mode 0700, and removes the socket that a stopped daemon left.
 /// Call it once the engine is open: the engine lock keeps a second daemon out of this data
-/// directory, so the socket found here is never the one of a live daemon.
-pub(crate) fn prepare(data_dir: &Path) -> Result<PathBuf> {
+/// directory, so the socket found here is never the one of a live daemon. `None` when the socket
+/// path is over the Unix limit: an optional feature must not stop a store that holds data, so
+/// the daemon runs with no admin socket, and one WARN says why.
+pub(crate) fn prepare(data_dir: &Path) -> Result<Option<PathBuf>> {
     let path = socket_path(data_dir);
     let length = path.as_os_str().len();
     if length > MAX_SOCKET_PATH {
-        bail!(
-            "the admin socket {} is {length} bytes, over the Unix limit of {MAX_SOCKET_PATH}: use a \
-             shorter data_dir",
-            path.display()
+        warn!(
+            socket = %path.display(),
+            length,
+            limit = MAX_SOCKET_PATH,
+            "the admin socket path is over the Unix limit: no admin socket, so cache-trim does not \
+             work. Use a shorter data_dir"
         );
+        return Ok(None);
     }
     let dir = data_dir.join(ADMIN_DIR);
     let uid = rustix::process::getuid().as_raw();
@@ -96,7 +101,7 @@ pub(crate) fn prepare(data_dir: &Path) -> Result<PathBuf> {
         }
         Ok(_) => bail!("{} is not a socket of this user: remove it", path.display()),
     }
-    Ok(path)
+    Ok(Some(path))
 }
 
 /// Listens on `path` with mode 0600.
@@ -150,6 +155,14 @@ async fn answer(stream: UnixStream, node: &Node) -> std::io::Result<()> {
 /// Sets the cache limit of the daemon that runs on `data_dir`.
 pub(crate) async fn cache_trim(data_dir: &Path, bytes: u64) -> Result<()> {
     let path = socket_path(data_dir);
+    let length = path.as_os_str().len();
+    if length > MAX_SOCKET_PATH {
+        bail!(
+            "no admin socket: data_dir is too long (the socket path {} is {length} bytes, the Unix \
+             limit is {MAX_SOCKET_PATH})",
+            path.display()
+        );
+    }
     let stream = UnixStream::connect(&path).await.with_context(|| {
         format!(
             "cannot reach the daemon at {}: is it running on this data_dir?",
@@ -199,10 +212,10 @@ mod tests {
     #[test]
     fn test_prepare_makes_a_private_directory_and_removes_an_old_socket() {
         let data = tempfile::tempdir().unwrap();
-        let path = prepare(data.path()).unwrap();
+        let path = prepare(data.path()).unwrap().unwrap();
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
-        let again = prepare(data.path()).unwrap();
+        let again = prepare(data.path()).unwrap().unwrap();
 
         let mode = std::fs::metadata(data.path().join(ADMIN_DIR))
             .unwrap()
@@ -224,7 +237,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(target.path(), linked.path().join(ADMIN_DIR)).unwrap();
         let file = tempfile::tempdir().unwrap();
-        let path = prepare(file.path()).unwrap();
+        let path = prepare(file.path()).unwrap().unwrap();
         std::fs::write(&path, b"not a socket").unwrap();
 
         let errors = [open.path(), linked.path(), file.path()].map(|dir| {
@@ -239,14 +252,25 @@ mod tests {
         assert!(path.exists());
     }
     #[test]
-    fn test_prepare_refuses_a_socket_path_over_the_limit_and_names_the_fix() {
+    fn test_socket_path_over_the_limit_gives_no_socket_and_the_client_names_the_cause() {
         let base = tempfile::tempdir().unwrap();
         let data = base.path().join("d".repeat(MAX_SOCKET_PATH));
         std::fs::create_dir_all(&data).unwrap();
 
-        let error = prepare(&data).unwrap_err().to_string();
+        let socket = prepare(&data).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let client = runtime
+            .block_on(cache_trim(&data, 0))
+            .unwrap_err()
+            .to_string();
 
-        assert!(error.contains("shorter data_dir"), "{error}");
+        assert_eq!(socket, None);
         assert!(!data.join(ADMIN_DIR).exists());
+        assert!(
+            client.contains("no admin socket: data_dir is too long"),
+            "{client}"
+        );
     }
 }

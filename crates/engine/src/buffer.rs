@@ -152,13 +152,23 @@ pub(crate) struct Record {
     pub data: Vec<u8>,
     /// Position of `data` in the segment file.
     pub data_offset: u64,
+    /// Where the record starts and ends in the segment file.
+    pub span: Range<u64>,
+    /// The blake3 hash of the head bytes: the identity of the record.
+    pub head_hash: [u8; 32],
 }
 
-enum Read {
+pub(crate) enum Read {
     Record(Record),
     End,
-    /// A torn or corrupt record starts at this offset.
-    Invalid(u64),
+    /// The head is missing, short or fails its hash. `next` is where the next record would start,
+    /// when the lengths stay inside the file.
+    BadHead {
+        start: u64,
+        next: Option<u64>,
+    },
+    /// The head is valid and the data does not match it: the put may have been acknowledged.
+    BadData(Record),
 }
 
 /// Reads the records of one segment in order.
@@ -170,12 +180,18 @@ pub(crate) struct SegmentReader {
 
 impl SegmentReader {
     pub async fn open(path: &Path) -> Result<Self, EngineError> {
-        let file = File::open(path).await?;
+        Self::open_at(path, 0).await
+    }
+
+    /// A reader whose first record starts at `offset`.
+    pub async fn open_at(path: &Path, offset: u64) -> Result<Self, EngineError> {
+        let mut file = File::open(path).await?;
         let len = file.metadata().await?.len();
+        file.seek(SeekFrom::Start(offset.min(len))).await?;
 
         Ok(Self {
             file: BufReader::new(file),
-            offset: 0,
+            offset: offset.min(len),
             len,
         })
     }
@@ -185,79 +201,140 @@ impl SegmentReader {
         match self.read().await? {
             Read::Record(record) => Ok(Some(record)),
             Read::End => Ok(None),
-            Read::Invalid(at) => Err(EngineError::Corrupt(format!(
-                "{}: invalid record at offset {at}",
+            Read::BadHead { start, .. } => Err(EngineError::Corrupt(format!(
+                "{}: invalid record at offset {start}",
+                path.display()
+            ))),
+            Read::BadData(record) => Err(EngineError::Corrupt(format!(
+                "{}: the data of {} at offset {} does not match its head",
+                path.display(),
+                record.head.op.target(),
+                record.span.start
+            ))),
+        }
+    }
+
+    /// Next record of a quarantine file, with `true` when its data does not match its head.
+    pub async fn next_held(&mut self, path: &Path) -> Result<Option<(Record, bool)>, EngineError> {
+        match self.read().await? {
+            Read::Record(record) => Ok(Some((record, false))),
+            Read::BadData(record) => Ok(Some((record, true))),
+            Read::End => Ok(None),
+            Read::BadHead { start, .. } => Err(EngineError::Corrupt(format!(
+                "{}: invalid record at offset {start}",
                 path.display()
             ))),
         }
     }
 
-    async fn read(&mut self) -> Result<Read, EngineError> {
+    /// The next record. Each length is checked against the file and a limit before any
+    /// allocation: a length from a file that a crash cut is not trusted.
+    pub async fn read(&mut self) -> Result<Read, EngineError> {
         let start = self.offset;
-
         if start == self.len {
             return Ok(Read::End);
         }
+        let bad = |next| Ok(Read::BadHead { start, next });
 
         let mut len = [0u8; DATA_LEN_LEN];
         if !read_full(&mut self.file, &mut len).await? {
-            return Ok(Read::Invalid(start));
+            return bad(None);
         }
         let data_len = u64::from_le_bytes(len);
         let remaining = self.len - start - DATA_LEN_LEN as u64;
-        // A length from a file that a crash cut is not trusted: check it before any allocation.
         let fits = data_len
             .checked_add(HEAD_PREFIX_LEN as u64)
             .is_some_and(|len| len <= remaining);
         if data_len > MAX_DATA_LEN || !fits {
-            return Ok(Read::Invalid(start));
+            return bad(None);
         }
         let mut data = vec![0u8; data_len as usize];
         let mut prefix = [0u8; HEAD_PREFIX_LEN];
         if !read_full(&mut self.file, &mut data).await?
             || !read_full(&mut self.file, &mut prefix).await?
         {
-            return Ok(Read::Invalid(start));
+            return bad(None);
         }
         let head_len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
-        let head_hash = &prefix[4..];
+        let head_hash: [u8; 32] = prefix[4..].try_into().expect("32 bytes");
         let fits = u64::from(head_len) <= remaining - data_len - HEAD_PREFIX_LEN as u64;
         if head_len > MAX_HEAD_LEN || !fits {
-            return Ok(Read::Invalid(start));
+            return bad(None);
         }
         let mut head_bytes = vec![0u8; head_len as usize];
         if !read_full(&mut self.file, &mut head_bytes).await? {
-            return Ok(Read::Invalid(start));
+            return bad(None);
         }
 
-        let Some(head) = decode_head(head_hash, &head_bytes, &data) else {
-            return Ok(Read::Invalid(start));
-        };
-
         let data_offset = start + DATA_LEN_LEN as u64;
-        self.offset = data_offset + data_len + HEAD_PREFIX_LEN as u64 + u64::from(head_len);
-
-        Ok(Read::Record(Record {
+        let end = data_offset + data_len + HEAD_PREFIX_LEN as u64 + u64::from(head_len);
+        self.offset = end;
+        let Some(head) = decode_head(&head_hash, &head_bytes) else {
+            return bad(Some(end));
+        };
+        let record = Record {
             head,
             data,
             data_offset,
-        }))
+            span: start..end,
+            head_hash,
+        };
+        match data_matches(&record.head, &record.data) {
+            true => Ok(Read::Record(record)),
+            false => Ok(Read::BadData(record)),
+        }
     }
 }
 
-/// Checks the head hash and, for a put, the data hash.
-fn decode_head(head_hash: &[u8], head_bytes: &[u8], data: &[u8]) -> Option<Head> {
-    if blake3::hash(head_bytes).as_bytes()[..] != head_hash[..] {
+/// A record with a valid head and data that does not match it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BadRecord {
+    pub segment: u64,
+    pub span: Range<u64>,
+    pub head_hash: [u8; 32],
+    /// `bucket/key`, or a bucket name.
+    pub target: String,
+}
+
+/// True when a record with a valid head starts at `offset`: then a bad head before it is damage
+/// in the middle of the segment, not a torn tail.
+async fn head_at(path: &Path, offset: Option<u64>) -> Result<bool, EngineError> {
+    let Some(offset) = offset else {
+        return Ok(false);
+    };
+    let mut reader = SegmentReader::open_at(path, offset).await?;
+    Ok(matches!(
+        reader.read().await?,
+        Read::Record(_) | Read::BadData(_)
+    ))
+}
+
+/// A record whose head does not read: its key is unknown, and the records after it cannot be
+/// found. The start stops with the steps of the operator.
+fn corrupt_head(path: &Path, start: u64) -> EngineError {
+    EngineError::Corrupt(format!(
+        "{}: corrupt record at offset {start}, key unknown. The proxy does not start. \
+         docs/storage.md (A record whose head does not read) gives the steps: copy the segment \
+         aside, cut it at offset {start}; the records from that offset to the end of the segment \
+         are lost from the buffer",
+        path.display()
+    ))
+}
+
+/// The head, when its hash matches and it decodes.
+fn decode_head(head_hash: &[u8; 32], head_bytes: &[u8]) -> Option<Head> {
+    if blake3::hash(head_bytes).as_bytes() != head_hash {
         return None;
     }
+    postcard::from_bytes(head_bytes).ok()
+}
 
-    let head: Head = postcard::from_bytes(head_bytes).ok()?;
-    let data_is_valid = match &head.op {
+/// A put matches the hash in its head; any other op has no data.
+fn data_matches(head: &Head, data: &[u8]) -> bool {
+    match &head.op {
         Op::Put { content_hash, .. } => blake3::hash(data).as_bytes() == content_hash,
         _ => data.is_empty(),
-    };
-
-    data_is_valid.then_some(head)
+    }
 }
 
 /// Fills `buf`. Returns `false` when the file ends first.
@@ -393,6 +470,8 @@ pub(crate) struct Buffer {
     lost: Vec<Range<u64>>,
     /// A failed fsync that the buffer could not repair. Only a restart reads the disk again.
     broken: bool,
+    /// Records of the replay with a valid head and bad data.
+    bad_data: Vec<BadRecord>,
     #[cfg(test)]
     pub syncs: u64,
     #[cfg(test)]
@@ -427,6 +506,7 @@ impl Buffer {
             durable: 0,
             lost: Vec::new(),
             broken: false,
+            bad_data: Vec::new(),
             #[cfg(test)]
             syncs: 0,
             #[cfg(test)]
@@ -501,30 +581,35 @@ impl Buffer {
                     );
                     records += 1;
                 }
+                // Not tracked: the open moves it to the quarantine and fails.
+                Read::BadData(record) => {
+                    self.bad_data.push(BadRecord {
+                        segment: seq,
+                        span: record.span,
+                        head_hash: record.head_hash,
+                        target: record.head.op.target(),
+                    });
+                    records += 1;
+                }
                 Read::End => break reader.len,
-                Read::Invalid(at) if on_invalid == OnInvalid::CutTail => {
+                Read::BadHead { start, next }
+                    if on_invalid == OnInvalid::CutTail && !head_at(&path, next).await? =>
+                {
                     warn!(
                         segment = seq,
-                        offset = at,
-                        dropped = reader.len - at,
+                        offset = start,
+                        dropped = reader.len - start,
                         "cut a torn record"
                     );
                     let file = tokio::fs::OpenOptions::new()
                         .write(true)
                         .open(&path)
                         .await?;
-                    file.set_len(at).await?;
+                    file.set_len(start).await?;
                     file.sync_all().await?;
-                    break at;
+                    break start;
                 }
-                Read::Invalid(at) => {
-                    return Err(EngineError::Corrupt(format!(
-                        "{}: invalid record at offset {at}. The segment holds acknowledged writes \
-                         that are not in the remote. Moving it out of the buffer directory lets \
-                         the proxy start, and loses those writes",
-                        path.display()
-                    )));
-                }
+                Read::BadHead { start, .. } => return Err(corrupt_head(&path, start)),
             }
         };
 
@@ -536,6 +621,12 @@ impl Buffer {
         debug!(segment = seq, records, "replayed segment");
         self.sealed.insert(seq, end);
         Ok(())
+    }
+
+    /// The records with a valid head and data that does not match it. The open moves them to
+    /// the quarantine.
+    pub fn bad_data(&self) -> &[BadRecord] {
+        &self.bad_data
     }
 
     pub fn segment_path(&self, seq: u64) -> PathBuf {
@@ -1023,6 +1114,171 @@ async fn quarantine_late_until(
     Ok(moved)
 }
 
+/// Moves the records of `bad` to the quarantine, one segment at a time: first a durable copy in
+/// `quarantine/<seq>.<head hash>.log`, then the segment written again without them. A crash
+/// between the two leaves the record in both places; [`finish_quarantine_moves`] at the next
+/// start ends the move, so no record goes to the quarantine twice. Returns their targets.
+pub(crate) async fn quarantine_bad_data(
+    dir: &Path,
+    quarantine: &Path,
+    bad: &[BadRecord],
+) -> Result<Vec<String>, EngineError> {
+    let mut by_segment: BTreeMap<u64, Vec<&BadRecord>> = BTreeMap::new();
+    for record in bad {
+        by_segment.entry(record.segment).or_default().push(record);
+    }
+    for (seq, records) in by_segment {
+        let segment = segment_path(dir, seq);
+        let spans: Vec<Range<u64>> = records.iter().map(|record| record.span.clone()).collect();
+        let name = format!(
+            "{seq:020}.{}{SEGMENT_SUFFIX}",
+            hex::encode(&records[0].head_hash[..8])
+        );
+        let target = quarantine.join(name);
+        create_quarantine(quarantine).await?;
+        copy_spans_durable(&segment, &spans, quarantine, &target).await?;
+        crate::sim::crash_point(crate::sim::Point::QuarantineCopy)?;
+        remove_spans(dir, seq, &spans).await?;
+        crate::sim::crash_point(crate::sim::Point::QuarantineRewrite)?;
+    }
+    Ok(bad.iter().map(|record| record.target.clone()).collect())
+}
+
+/// Ends the moves to the quarantine that a crash stopped. A record of a quarantine file
+/// `<seq>.*.log` that buffer segment `<seq>` still holds, found by its head hash, leaves the
+/// segment. Temporary files of a stopped move go too: the record is still in its segment.
+pub(crate) async fn finish_quarantine_moves(
+    dir: &Path,
+    quarantine: &Path,
+) -> Result<(), EngineError> {
+    if !tokio::fs::try_exists(dir).await? {
+        return Ok(());
+    }
+    remove_with_suffix(dir, ".rewrite").await?;
+    if !tokio::fs::try_exists(quarantine).await? {
+        return Ok(());
+    }
+    remove_with_suffix(quarantine, ".tmp").await?;
+    let mut entries = tokio::fs::read_dir(quarantine).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(seq) = name
+            .get(..20)
+            .filter(|_| name.ends_with(SEGMENT_SUFFIX))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let segment = segment_path(dir, seq);
+        if !tokio::fs::try_exists(&segment).await? {
+            continue;
+        }
+        let held: BTreeSet<[u8; 32]> = heads_of(&path)
+            .await?
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect();
+        let spans: Vec<Range<u64>> = heads_of(&segment)
+            .await?
+            .into_iter()
+            .filter(|(_, hash)| held.contains(hash))
+            .map(|(span, _)| span)
+            .collect();
+        if !spans.is_empty() {
+            warn!(
+                segment = seq,
+                records = spans.len(),
+                "ended a move to the quarantine that a crash stopped"
+            );
+            remove_spans(dir, seq, &spans).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The span and head hash of each record with a valid head, up to the first bad head.
+async fn heads_of(path: &Path) -> Result<Vec<(Range<u64>, [u8; 32])>, EngineError> {
+    let mut reader = SegmentReader::open(path).await?;
+    let mut out = Vec::new();
+    loop {
+        match reader.read().await? {
+            Read::Record(record) | Read::BadData(record) => {
+                out.push((record.span, record.head_hash))
+            }
+            Read::End | Read::BadHead { .. } => return Ok(out),
+        }
+    }
+}
+
+async fn remove_with_suffix(dir: &Path, suffix: &str) -> Result<(), EngineError> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name().to_string_lossy().ends_with(suffix) {
+            remove_if_present(&entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies the byte ranges `spans` of `source`, in order, to `out`.
+async fn copy_spans(
+    source: &Path,
+    spans: &[Range<u64>],
+    out: &mut File,
+) -> Result<(), EngineError> {
+    let mut file = File::open(source).await?;
+    for span in spans {
+        file.seek(SeekFrom::Start(span.start)).await?;
+        let wanted = span.end - span.start;
+        let copied = tokio::io::copy(&mut (&mut file).take(wanted), out).await?;
+        if copied != wanted {
+            return Err(EngineError::Corrupt(format!(
+                "{}: ends before offset {}",
+                source.display(),
+                span.end
+            )));
+        }
+    }
+    out.sync_all().await?;
+    Ok(())
+}
+
+/// Writes the `spans` of `source` to `target` through a fsynced temporary file and a rename, then
+/// fsyncs `dir`. An existing `target` holds them already: a crash stopped the move after it.
+async fn copy_spans_durable(
+    source: &Path,
+    spans: &[Range<u64>],
+    dir: &Path,
+    target: &Path,
+) -> Result<(), EngineError> {
+    if tokio::fs::try_exists(target).await? {
+        return Ok(());
+    }
+    let tmp = target.with_extension("tmp");
+    copy_spans(source, spans, &mut File::create(&tmp).await?).await?;
+    tokio::fs::rename(&tmp, target).await?;
+    sync_dir(dir).await
+}
+
+/// Writes segment `seq` again without the byte ranges `spans`.
+async fn remove_spans(dir: &Path, seq: u64, spans: &[Range<u64>]) -> Result<(), EngineError> {
+    let path = segment_path(dir, seq);
+    let len = tokio::fs::metadata(&path).await?.len();
+    let mut keep = Vec::new();
+    let mut at = 0;
+    for span in spans {
+        keep.push(at..span.start);
+        at = span.end;
+    }
+    keep.push(at..len);
+    keep.retain(|span| !span.is_empty());
+    let tmp = dir.join(format!("{seq:020}.rewrite"));
+    copy_spans(&path, &keep, &mut File::create(&tmp).await?).await?;
+    tokio::fs::rename(&tmp, &path).await?;
+    sync_dir(dir).await
+}
+
 /// A write that the quarantine holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuarantinedWrite {
@@ -1044,6 +1300,8 @@ pub struct QuarantinedRecord {
     pub write: QuarantinedWrite,
     /// The object body of a put; empty for the other ops.
     pub data: Vec<u8>,
+    /// The data does not match the hash in its head: the record left the buffer for that.
+    pub corrupt: bool,
 }
 
 /// Reads the records of the quarantine directory `dir` one at a time, in order.
@@ -1082,7 +1340,7 @@ impl QuarantineReader {
                 self.current = Some((path, reader, 0));
             }
             let (path, reader, number) = self.current.as_mut().expect("set above");
-            let Some(record) = reader.next(path).await? else {
+            let Some((record, corrupt)) = reader.next_held(path).await? else {
                 self.current = None;
                 continue;
             };
@@ -1106,6 +1364,7 @@ impl QuarantineReader {
                     hlc: record.head.time,
                 },
                 data: record.data,
+                corrupt,
             }));
         }
     }
@@ -1127,7 +1386,7 @@ pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>,
     paths.sort();
     for path in paths {
         let mut reader = SegmentReader::open(&path).await?;
-        while let Some(record) = reader.next(&path).await? {
+        while let Some((record, _)) = reader.next_held(&path).await? {
             out.push(QuarantinedWrite {
                 target: record.head.op.target(),
                 hlc: record.head.time,
@@ -1500,7 +1759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flipped_byte_in_the_last_segment_keeps_the_records_before_it() {
+    async fn test_flipped_data_byte_in_the_last_segment_lists_the_record_and_keeps_the_others() {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
@@ -1511,15 +1770,21 @@ mod tests {
         let path = segment_path(dir.path(), 0);
         let mut bytes = std::fs::read(&path).unwrap();
         let record = bytes.len() / 3;
-        // A byte in the data of the second record.
-        bytes[2 * record - 1] ^= 1;
+        // A byte in the data of the second record, after its data length.
+        bytes[record + 9] ^= 1;
         std::fs::write(&path, bytes).unwrap();
 
         let buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
 
         assert!(buffer.object("b", "a").is_some());
         assert!(buffer.object("b", "b").is_none());
-        assert!(buffer.object("b", "c").is_none());
+        assert!(buffer.object("b", "c").is_some());
+        let bad: Vec<&str> = buffer
+            .bad_data()
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect();
+        assert_eq!(bad, ["b/b"]);
     }
 
     #[tokio::test]
@@ -1572,7 +1837,8 @@ mod tests {
 
         assert!(message.contains("00000000000000000000.log"), "{message}");
         assert!(message.contains("at offset"), "{message}");
-        assert!(message.contains("loses those writes"), "{message}");
+        assert!(message.contains("key unknown"), "{message}");
+        assert!(message.contains("docs/storage.md"), "{message}");
     }
 
     #[tokio::test]

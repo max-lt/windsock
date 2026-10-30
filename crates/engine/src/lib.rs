@@ -508,6 +508,8 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
         let dir = dir.as_ref();
+        // A move that a crash stopped ends first, so its record never goes to the quarantine twice.
+        buffer::finish_quarantine_moves(&dir.join(BUFFER_DIR), &dir.join(QUARANTINE_DIR)).await?;
         // Before any remote call: a move later in the open could put a write next to one that
         // the operator has not decided on yet, and the operator must see it with the remote down.
         refuse_held_quarantine(&dir.join(QUARANTINE_DIR)).await?;
@@ -520,6 +522,17 @@ impl<R: Remote + 'static> Engine<R> {
         );
         let buffer_dir = dir.join(BUFFER_DIR);
         let buffer = Buffer::open(&buffer_dir, config.pack_target as u64).await?;
+        if !buffer.bad_data().is_empty() {
+            let quarantine = dir.join(QUARANTINE_DIR);
+            let moved =
+                buffer::quarantine_bad_data(&buffer_dir, &quarantine, buffer.bad_data()).await?;
+            error!(
+                keys = moved.join(", "),
+                path = %quarantine.display(),
+                "buffered records whose data does not match their head: moved to quarantine"
+            );
+            return Err(refusal(&quarantine, &held_writes(&quarantine).await?));
+        }
         // The wall clock can step back across a restart: an ack never goes under an earlier
         // one, so own values move the clock with no cap. Values of other nodes stop at R ahead.
         let mut journal = journal;

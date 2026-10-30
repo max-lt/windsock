@@ -14,17 +14,22 @@ fn quarantine(config: &Config) -> PathBuf {
     engine::quarantine_dir(config.data_dir.join("engine"))
 }
 
-/// One record as a tab-separated line: file, number, op, target, ack HLC, ack time, size.
+/// One record as a tab-separated line: file, number, op, target, ack HLC, ack time, size, and
+/// `ok` or `corrupt` for data that does not match its head.
 fn line(record: &QuarantinedRecord) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         escape(&record.file),
         record.number,
         record.op,
         escape(&record.write.target),
         record.write.hlc,
         s3proto::time::iso8601(record.write.hlc),
-        record.data.len()
+        record.data.len(),
+        match record.corrupt {
+            true => "corrupt",
+            false => "ok",
+        }
     )
 }
 

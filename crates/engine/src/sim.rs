@@ -38,6 +38,10 @@ pub enum Point {
     CompleteMarked,
     /// The object is committed; the parts are still on disk.
     CompleteCommitted,
+    /// An upload part wrote some of its body to its temporary file.
+    PartWrite,
+    /// An upload part is whole and fsynced in its temporary file; its rename comes next.
+    PartRename,
 }
 
 #[cfg(feature = "sim")]

@@ -15,6 +15,15 @@ pub(crate) async fn object_put<R: Remote + 'static>(
 ) -> Reply {
     reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
     if let Some(Extension(streamed)) = streamed {
+        if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber"))
+        {
+            let part = (upload_id.as_str(), number.as_str());
+            let etag = streamed_part(&state, (&bucket, &key), part, body, streamed).await?;
+            return Ok(reply(StatusCode::OK)
+                .header("etag", xml::quoted(&etag))
+                .body(Body::empty())
+                .expect("a hex ETag is a valid header value"));
+        }
         let mode = write_mode(&headers)?;
         let metadata = metadata(&headers)?;
         let info = streamed_put(&state, &bucket, &key, metadata, mode, body, streamed).await?;
@@ -32,18 +41,9 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         )
     })?;
 
-    if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber")) {
-        if headers.contains_key("x-amz-copy-source") {
-            return Err(S3Error::not_implemented("UploadPartCopy is not supported"));
-        }
-        let part_etag = state
-            .uploads
-            .put_part(upload_id, &bucket, &key, number, &body)
-            .await?;
-        return Ok(reply(StatusCode::OK)
-            .header("etag", xml::quoted(&part_etag))
-            .body(Body::empty())
-            .expect("a hex ETag is a valid header value"));
+    // Every other upload part streams: here only a part copy comes.
+    if params.contains_key("uploadId") && params.contains_key("partNumber") {
+        return Err(S3Error::not_implemented("UploadPartCopy is not supported"));
     }
 
     if let Some(source) = header(&headers, "x-amz-copy-source") {
@@ -349,24 +349,39 @@ fn object_body<R: Remote + 'static>(
 /// The largest piece that a streamed PUT writes at once: the memory of one PUT.
 const PUT_PIECE: usize = 1024 * 1024;
 
-/// A PUT whose body goes to a spool file as it arrives. A cut body or a wrong SHA-256 drops the
-/// spool file, and nothing is written.
-async fn streamed_put<R: Remote + 'static>(
-    state: &AppState<R>,
-    bucket: &str,
-    key: &str,
-    metadata: BTreeMap<String, String>,
-    mode: WriteMode,
+/// Where a streamed body goes, one piece at a time.
+trait Sink {
+    async fn write(&mut self, piece: &[u8]) -> Result<(), S3Error>;
+}
+
+impl<R: Remote + 'static> Sink for (&Engine<R>, &mut PutSpool) {
+    async fn write(&mut self, piece: &[u8]) -> Result<(), S3Error> {
+        Ok(self.0.spool_write(self.1, piece).await?)
+    }
+}
+
+impl Sink for PartWriter<'_> {
+    async fn write(&mut self, piece: &[u8]) -> Result<(), S3Error> {
+        PartWriter::write(self, piece).await?;
+        Ok(engine::sim::crash_point(Point::PartWrite)?)
+    }
+}
+
+/// Reads a body as it arrives, decoded when it is aws-chunked, into `sink` in pieces of at most
+/// 1 MiB, and checks it: max_body, Content-Length, x-amz-content-sha256, each chunk and trailer
+/// signature, and x-amz-decoded-content-length. The caller commits only after an Ok.
+async fn stream_body(
+    max_body: usize,
     mut body: Body,
     streamed: StreamedBody,
-) -> Result<ObjectInfo, S3Error> {
+    sink: &mut impl Sink,
+) -> Result<(), S3Error> {
     use http_body_util::BodyExt;
     use sha2::Digest;
 
-    let mut spool = state.engine.begin_put(bucket, key, metadata, mode).await?;
     let mut sha256 = streamed.sha256.as_ref().map(|_| sha2::Sha256::new());
     let mut decoder = streamed.chunked;
-    let mut received = 0u64;
+    let (mut received, mut written) = (0u64, 0u64);
     let incomplete = |message: &str| {
         S3Error::new(
             "IncompleteBody",
@@ -392,13 +407,14 @@ async fn streamed_put<R: Remote + 'static>(
         };
         for piece in data.iter().flat_map(|data| data.chunks(PUT_PIECE)) {
             // A body with no Content-Length meets the limit only here.
-            if spool.len() + piece.len() as u64 > state.max_body as u64 {
-                return Err(S3Error::entity_too_large(state.max_body));
+            if written + piece.len() as u64 > max_body as u64 {
+                return Err(S3Error::entity_too_large(max_body));
             }
             if let Some(sha256) = &mut sha256 {
                 sha256.update(piece);
             }
-            state.engine.spool_write(&mut spool, piece).await?;
+            sink.write(piece).await?;
+            written += piece.len() as u64;
         }
     }
     if streamed.length.is_some_and(|length| length != received) {
@@ -408,7 +424,7 @@ async fn streamed_put<R: Remote + 'static>(
         decoder.finish().map_err(crate::auth::chunk_error)?;
         if streamed
             .decoded_length
-            .is_some_and(|length| length != spool.len())
+            .is_some_and(|length| length != written)
         {
             return Err(incomplete(
                 "the body is shorter or longer than x-amz-decoded-content-length",
@@ -424,5 +440,54 @@ async fn streamed_put<R: Remote + 'static>(
             "the body does not match x-amz-content-sha256",
         ));
     }
+    Ok(())
+}
+
+/// The size that a streamed body declares, for the room it takes at the start.
+fn declared(streamed: &StreamedBody) -> u64 {
+    match streamed.chunked {
+        Some(_) => streamed.decoded_length.unwrap_or(0),
+        None => streamed.length.unwrap_or(0),
+    }
+}
+
+/// A PUT whose body goes to a spool file as it arrives. A cut body or a failed check drops the
+/// spool file, and nothing is written.
+async fn streamed_put<R: Remote + 'static>(
+    state: &AppState<R>,
+    bucket: &str,
+    key: &str,
+    metadata: BTreeMap<String, String>,
+    mode: WriteMode,
+    body: Body,
+    streamed: StreamedBody,
+) -> Result<ObjectInfo, S3Error> {
+    let mut spool = state.engine.begin_put(bucket, key, metadata, mode).await?;
+    stream_body(
+        state.max_body,
+        body,
+        streamed,
+        &mut (state.engine.as_ref(), &mut spool),
+    )
+    .await?;
     Ok(state.engine.finish_put(spool).await?)
+}
+
+/// An upload part whose body goes to a temporary file as it arrives; it takes its name once the
+/// body passed every check. A cut body or a failed check leaves no part and gives the room back.
+async fn streamed_part<R: Remote + 'static>(
+    state: &AppState<R>,
+    object: (&str, &str),
+    (upload_id, number): (&str, &str),
+    body: Body,
+    streamed: StreamedBody,
+) -> Result<String, S3Error> {
+    // A part waits for no buffer room, but a far-ahead clock or a drain stops every write.
+    state.engine.check_writes()?;
+    let mut part = state
+        .uploads
+        .begin_part(upload_id, object, number, declared(&streamed))
+        .await?;
+    stream_body(state.max_body, body, streamed, &mut part).await?;
+    part.finish().await
 }

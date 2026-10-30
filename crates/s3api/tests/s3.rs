@@ -2323,7 +2323,9 @@ impl ChunkedPut {
     /// `payload` is `STREAMING_SIGNED` or `STREAMING_UNSIGNED_TRAILER`.
     fn with_payload(key: &str, data: &[u8], decoded_length: usize, payload: &str) -> Self {
         let timestamp = sigv4::timestamp(now());
+        // `key` can carry a query, as an upload part does.
         let uri = format!("/bkt/{key}");
+        let (path, query) = uri.split_once('?').unwrap_or((&uri, ""));
         let headers: Vec<(String, String)> = vec![
             ("host".into(), "localhost".into()),
             ("x-amz-date".into(), timestamp.clone()),
@@ -2337,8 +2339,8 @@ impl ChunkedPut {
         let (authorization, seed) = sigv4::sign(
             &sigv4::Request {
                 method: "PUT",
-                path: &uri,
-                query: "",
+                path,
+                query,
                 headers: &headers,
                 payload_hash: payload,
             },
@@ -2617,4 +2619,168 @@ async fn test_crash_after_the_commit_keeps_the_object_and_the_start_removes_the_
     assert_eq!(again.status, StatusCode::NOT_FOUND);
     assert_eq!(again.xml("Code").unwrap(), "NoSuchUpload");
     assert_eq!(server.uploads.held(), 0);
+}
+
+/// Files of an upload directory that never got their name.
+fn part_temps(server: &Server, id: &str) -> usize {
+    std::fs::read_dir(server._dir.path().join("uploads").join(id))
+        .map(|entries| {
+            entries
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".tmp.")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A signed upload part whose body comes through a channel, with a Content-Length of `length`.
+fn part_through_channel(
+    server: &Server,
+    id: &str,
+    number: u32,
+    length: usize,
+) -> (
+    tokio::sync::mpsc::Sender<Bytes>,
+    tokio::task::JoinHandle<StatusCode>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|piece| (Ok::<_, std::io::Error>(piece), rx))
+    });
+    let uri = format!("/bkt/big?partNumber={number}&uploadId={id}");
+    let mut call = call("PUT", &uri).header("content-length", length.to_string());
+    call.payload_hash = Some(sigv4::UNSIGNED_PAYLOAD.to_string());
+    let mut request = call.request();
+    *request.body_mut() = Body::from_stream(stream);
+    let app = server.app.clone();
+    (
+        tx,
+        tokio::spawn(async move { app.oneshot(request).await.unwrap().status() }),
+    )
+}
+
+#[tokio::test]
+async fn test_cut_part_body_or_bad_chunk_signature_leaves_no_part() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let data = vec![7u8; 3 << 20];
+
+    let (tx, cut) = part_through_channel(&server, &id, 1, data.len());
+    tx.send(Bytes::copy_from_slice(&data[..1 << 20]))
+        .await
+        .unwrap();
+    drop(tx);
+    let cut = cut.await.unwrap();
+    let forged = {
+        let target = format!("big?partNumber=2&uploadId={id}");
+        let put = ChunkedPut::new(&target, &data, data.len());
+        let mut body = put.encoded.clone();
+        let at = body.len() / 2;
+        body[at] ^= 1;
+        send(&server, put.request(Body::from(body))).await
+    };
+
+    assert_eq!(cut, StatusCode::BAD_REQUEST);
+    assert_eq!(forged.status, StatusCode::FORBIDDEN, "{}", forged.text());
+    assert_eq!(
+        list_parts(&server, &id)
+            .await
+            .text()
+            .matches("<Part>")
+            .count(),
+        0
+    );
+    assert_eq!(part_temps(&server, &id), 0);
+    assert_eq!(server.uploads.held(), 0);
+}
+
+#[tokio::test]
+async fn test_two_writers_of_one_part_number_leave_the_last_one_and_count_it_once() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let first = vec![1u8; 2 << 20];
+    let second = "2".repeat(3 << 20);
+
+    let (tx, slow) = part_through_channel(&server, &id, 1, first.len());
+    tx.send(Bytes::copy_from_slice(&first[..1 << 20]))
+        .await
+        .unwrap();
+    let fast = upload_part(&server, &id, 1, &second).await;
+    tx.send(Bytes::copy_from_slice(&first[1 << 20..]))
+        .await
+        .unwrap();
+    drop(tx);
+    let slow = slow.await.unwrap();
+    let parts = list_parts(&server, &id).await.text();
+
+    assert_eq!(fast.status, StatusCode::OK);
+    assert_eq!(slow, StatusCode::OK);
+    assert_eq!(parts.matches("<Part>").count(), 1);
+    assert!(
+        parts.contains(&blake3::hash(&first).to_hex().to_string()),
+        "{parts}"
+    );
+    assert_eq!(server.uploads.held(), first.len() as u64);
+    assert_eq!(part_temps(&server, &id), 0);
+}
+
+#[tokio::test]
+async fn test_part_room_taken_by_another_upload_gets_503() {
+    let server =
+        bucket_on(server_in(tempfile::tempdir().unwrap(), Config::default(), 3 << 20).await).await;
+    let one = start_upload(&server).await;
+    let two = start_upload(&server).await;
+    let data = vec![3u8; 2 << 20];
+
+    let (tx, first) = part_through_channel(&server, &one, 1, data.len());
+    tx.send(Bytes::copy_from_slice(&data[..1 << 20]))
+        .await
+        .unwrap();
+    let full = upload_part(&server, &two, 1, &"x".repeat(2 << 20)).await;
+    tx.send(Bytes::copy_from_slice(&data[1 << 20..]))
+        .await
+        .unwrap();
+    drop(tx);
+    let first = first.await.unwrap();
+
+    assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(full.xml("Code").unwrap(), "SlowDown");
+    assert_eq!(first, StatusCode::OK);
+    assert_eq!(server.uploads.held(), data.len() as u64);
+}
+
+#[tokio::test]
+async fn test_crash_while_a_part_is_written_or_named_keeps_the_old_part() {
+    for point in [Point::PartWrite, Point::PartRename] {
+        let server = with_bucket().await;
+        let id = start_upload(&server).await;
+        let old = upload_part(&server, &id, 1, "old part").await;
+        let old_etag = old.header("etag").unwrap().to_string();
+
+        engine::sim::arm_crash(Some(point));
+        let crashed = upload_part(&server, &id, 1, &"n".repeat(2 << 20)).await;
+        engine::sim::arm_crash(None);
+        let server = restarted(server).await;
+        let parts = list_parts(&server, &id).await.text();
+
+        assert_eq!(
+            crashed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{point:?}"
+        );
+        assert_eq!(parts.matches("<Part>").count(), 1, "{point:?}");
+        assert!(
+            parts.contains(old_etag.trim_matches('"')),
+            "{point:?}: {parts}"
+        );
+        assert_eq!(part_temps(&server, &id), 0, "{point:?}");
+        assert_eq!(server.uploads.held(), "old part".len() as u64, "{point:?}");
+    }
 }

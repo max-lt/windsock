@@ -314,10 +314,21 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   longer, about 50 s for 5 GiB at 100 MB/s.
 - A crash during a complete: before its commit, the next start gives the upload back with its
   parts, and the complete can run again. After its commit, the next start removes the parts; the
-  object is there, and a second complete of the upload gets `404 NoSuchUpload`.
-- An UploadPart holds its part in memory, up to 5 GiB, and a CopyObject the whole object, about
-  3 times its size: a PUT of 1 GiB held in memory raised the daemon to 3.1 GiB. No limit covers
-  them all together. Size the memory for them, or put a limit in front of the proxy.
+  object is there, and a second complete of the upload gets `404 NoSuchUpload`. The start knows
+  the commit by the hash of the object, which the complete writes in its upload before the
+  commit. If the key was overwritten or deleted between that commit and the crash, the start gives
+  the upload back, and a client that sends the complete again writes the object again. This needs
+  a crash in that short window, and only that client is affected.
+- An UploadPart writes its body to a temporary file in its upload directory as it arrives, in
+  pieces of at most 1 MiB, with the body checks of a PUT. The room of the declared body in
+  `parts_limit_bytes` is taken first; with no room it gets `503 SlowDown`. The part gets its name
+  after a fsync, then the directory is fsynced: a part sent again replaces the old one, and the
+  last of two parts of one number wins. A cut body or a failed check leaves no part, and a start
+  removes the temporary files of a crash. Measured as for the PUT, with parts of 100 MiB at
+  200 KiB/s: 250 writers raised the daemon from 40 MiB to 102 MiB, about 250 KiB per writer.
+- A CopyObject holds the whole object in memory, about 3 times its size: a PUT of 1 GiB held in
+  memory raised the daemon to 3.1 GiB. No limit covers them all together. Size the memory for
+  them, or put a limit in front of the proxy.
 
 ## Scale
 

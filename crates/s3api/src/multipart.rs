@@ -23,6 +23,8 @@ use crate::xml::PartInfo;
 
 /// Makes upload ids and temporary names unique inside one process.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+/// A file that a crash can leave in an upload directory: it never got its name.
+const TEMP_PREFIX: &str = ".tmp.";
 
 const META: &str = "meta";
 /// In a claimed upload: the hex blake3 hash of the object that its complete commits next.
@@ -88,6 +90,9 @@ pub struct Uploads {
     /// When this process first saw each upload, on its monotonic clock.
     first_seen: Mutex<HashMap<String, Instant>>,
     completes: tokio::sync::Semaphore,
+    /// One part takes its name at a time: the last rename of a part number wins, and the room
+    /// of the part it replaces comes back once.
+    naming: tokio::sync::Mutex<()>,
 }
 
 impl Uploads {
@@ -99,6 +104,7 @@ impl Uploads {
             held: AtomicU64::new(0),
             first_seen: Mutex::new(HashMap::new()),
             completes: tokio::sync::Semaphore::new(MAX_COMPLETES),
+            naming: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -113,6 +119,10 @@ impl Uploads {
         };
         while let Some(entry) = entries.next_entry().await.map_err(io)? {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // A part that a crash stopped never got its name: the part before it stays.
+            if entry.file_type().await.map_err(io)?.is_dir() {
+                remove_part_temps(&entry.path()).await?;
+            }
             // A marked complete may have committed: [`Uploads::settle`] decides with the engine.
             if let Some(id) = name.strip_suffix(Claim::Complete.suffix())
                 && !entry.path().join(MARKER).exists()
@@ -297,7 +307,52 @@ impl Uploads {
         Ok(upload_id)
     }
 
+    /// Starts a part whose body comes in pieces. The upload, the part number and the room of
+    /// `declared` bytes are checked first, so a part that cannot be stored writes nothing.
+    pub(crate) async fn begin_part(
+        &self,
+        upload_id: &str,
+        (bucket, key): (&str, &str),
+        number: &str,
+        declared: u64,
+    ) -> Result<PartWriter<'_>, S3Error> {
+        let number: u16 = number
+            .parse()
+            .ok()
+            .filter(|n| (1..=MAX_PART).contains(n))
+            .ok_or_else(|| S3Error::invalid_argument("partNumber must be between 1 and 10000"))?;
+        self.meta(upload_id, bucket, key).await?;
+        let dir = self.upload_dir(upload_id)?;
+        self.reserve(declared)?;
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("{TEMP_PREFIX}{}.{seq}", std::process::id()));
+        let file = match tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) => {
+                self.release(declared);
+                return Err(io(e));
+            }
+        };
+        Ok(PartWriter {
+            uploads: self,
+            dir,
+            number,
+            tmp,
+            file,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+            reserved: declared,
+            named: false,
+        })
+    }
+
     /// Stores a part and returns its ETag. A part sent again replaces the old one.
+    #[cfg(test)]
     pub(crate) async fn put_part(
         &self,
         upload_id: &str,
@@ -306,37 +361,11 @@ impl Uploads {
         number: &str,
         data: &[u8],
     ) -> Result<String, S3Error> {
-        let number: u16 = number
-            .parse()
-            .ok()
-            .filter(|n| (1..=MAX_PART).contains(n))
-            .ok_or_else(|| S3Error::invalid_argument("partNumber must be between 1 and 10000"))?;
-        self.meta(upload_id, bucket, key).await?;
-
-        let dir = self.upload_dir(upload_id)?;
-        let etag = blake3::hash(data).to_hex().to_string();
-        let name = part_name(number, &etag);
-        let old: Vec<(String, u64)> = part_files(&dir)
-            .await?
-            .into_iter()
-            .filter(|((n, _), _)| *n == number)
-            .map(|((n, old_etag), (size, _))| (part_name(n, &old_etag), size))
-            .collect();
-        let old_size: u64 = old.iter().map(|(_, size)| size).sum();
-        let size = data.len() as u64;
-        // A part sent again replaces the old one: only its growth needs room.
-        let grow = size.saturating_sub(old_size);
-        self.reserve(grow)?;
-        if let Err(e) = write_file(&dir, &name, data).await {
-            self.release(grow);
-            return Err(e);
-        }
-        for (old_name, _) in old.iter().filter(|(old_name, _)| *old_name != name) {
-            remove_if_present(&dir.join(old_name)).await?;
-        }
-        self.release(old_size.saturating_sub(size));
-
-        Ok(etag)
+        let mut part = self
+            .begin_part(upload_id, (bucket, key), number, data.len() as u64)
+            .await?;
+        part.write(data).await?;
+        part.finish().await
     }
 
     /// Takes an upload away from every other call: a rename of its directory. A second
@@ -630,7 +659,7 @@ async fn part_files(dir: &Path) -> Result<BTreeMap<(u16, String), (u64, u64)>, S
 /// Writes a temporary file, then renames it: a reader never sees a partial file.
 async fn write_file(dir: &Path, name: &str, data: &[u8]) -> Result<(), S3Error> {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".tmp.{}.{seq}", std::process::id()));
+    let tmp = dir.join(format!("{TEMP_PREFIX}{}.{seq}", std::process::id()));
     let mut file = tokio::fs::File::create(&tmp).await.map_err(io)?;
     file.write_all(data).await.map_err(io)?;
     file.flush().await.map_err(io)?;
@@ -642,6 +671,104 @@ async fn remove_if_present(path: &Path) -> Result<(), S3Error> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io(e)),
+    }
+}
+
+/// Removes the files of `dir` that never got their name.
+async fn remove_part_temps(dir: &Path) -> Result<(), S3Error> {
+    let mut entries = tokio::fs::read_dir(dir).await.map_err(io)?;
+    while let Some(entry) = entries.next_entry().await.map_err(io)? {
+        if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+            remove_if_present(&entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn sync_dir(dir: &Path) -> Result<(), S3Error> {
+    tokio::fs::File::open(dir)
+        .await
+        .map_err(io)?
+        .sync_all()
+        .await
+        .map_err(io)
+}
+
+/// A part whose body goes to a temporary file in its upload directory. Dropped before it takes
+/// its name, it removes the file and gives its room back.
+pub(crate) struct PartWriter<'a> {
+    uploads: &'a Uploads,
+    dir: PathBuf,
+    number: u16,
+    tmp: PathBuf,
+    file: tokio::fs::File,
+    hasher: blake3::Hasher,
+    len: u64,
+    /// Room of the parts limit taken at the start, for the declared body.
+    reserved: u64,
+    named: bool,
+}
+
+impl PartWriter<'_> {
+    /// The bytes that count against the parts limit.
+    fn counted(&self) -> u64 {
+        self.len.max(self.reserved)
+    }
+
+    /// Writes one piece. Only the bytes past the room taken at the start need more room.
+    pub(crate) async fn write(&mut self, piece: &[u8]) -> Result<(), S3Error> {
+        let size = self.len + piece.len() as u64;
+        let extra = size.saturating_sub(self.counted());
+        self.uploads.reserve(extra)?;
+        if let Err(e) = self.file.write_all(piece).await {
+            self.uploads.release(extra);
+            return Err(io(e));
+        }
+        self.hasher.update(piece);
+        self.len = size;
+        Ok(())
+    }
+
+    /// Fsyncs the part, then gives it its name, which replaces a part of the same number, and
+    /// fsyncs the directory. Returns its ETag: the blake3 hash made as the part was written.
+    pub(crate) async fn finish(mut self) -> Result<String, S3Error> {
+        self.file.sync_all().await.map_err(io)?;
+        let etag = self.hasher.finalize().to_hex().to_string();
+        let name = part_name(self.number, &etag);
+        engine::sim::crash_point(engine::sim::Point::PartRename)?;
+        let _naming = self.uploads.naming.lock().await;
+        let old: Vec<(String, u64)> = part_files(&self.dir)
+            .await?
+            .into_iter()
+            .filter(|((number, _), _)| *number == self.number)
+            .map(|((number, etag), (size, _))| (part_name(number, &etag), size))
+            .collect();
+        tokio::fs::rename(&self.tmp, self.dir.join(&name))
+            .await
+            .map_err(io)?;
+        // The part holds its length now; the room past it comes back.
+        self.named = true;
+        self.uploads.release(self.counted() - self.len);
+        self.len = 0;
+        self.reserved = 0;
+        for (old_name, size) in &old {
+            if *old_name != name {
+                remove_if_present(&self.dir.join(old_name)).await?;
+            }
+            // The rename replaced a part of the same name.
+            self.uploads.release(*size);
+        }
+        sync_dir(&self.dir).await?;
+        Ok(etag)
+    }
+}
+
+impl Drop for PartWriter<'_> {
+    fn drop(&mut self) {
+        if !self.named {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+        self.uploads.release(self.counted());
     }
 }
 

@@ -272,7 +272,7 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     /// Fails when the buffer takes no write now: a stop, a quarantine, or a clock far ahead.
-    pub(crate) fn check_writes(&self) -> Result<()> {
+    pub fn check_writes(&self) -> Result<()> {
         if self.draining.load(Ordering::SeqCst) {
             return Err(EngineError::Draining);
         }

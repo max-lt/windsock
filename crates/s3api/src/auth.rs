@@ -171,7 +171,8 @@ fn unix_now() -> u64 {
 /// A PUT body up to this size goes through the buffer in one record, with the group fsync.
 const SMALL_PUT: u64 = 1024 * 1024;
 
-/// The body check of a PUT of an object that the handler streams: a larger or unknown length.
+/// The body check of a PUT that the handler streams: an upload part, or an object with a larger
+/// or unknown length.
 /// `None` for any other request. A signed aws-chunked body with no chunk signer is refused.
 fn streamed(parts: &Parts, signer: Option<&ChunkSigner>) -> Result<Option<StreamedBody>, S3Error> {
     if parts.method != Method::PUT || parts.headers.contains_key("x-amz-copy-source") {
@@ -193,7 +194,8 @@ fn streamed(parts: &Parts, signer: Option<&ChunkSigner>) -> Result<Option<Stream
         Some(length) => length > SMALL_PUT,
         None => chunked,
     };
-    if part || !large {
+    // Every upload part streams to its part file; a small PUT goes through the buffer.
+    if !part && !large {
         return Ok(None);
     }
     let hash = header(&parts.headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);

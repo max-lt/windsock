@@ -18,11 +18,11 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
 use engine::sim::Point;
-use engine::{Engine, ObjectInfo, ObjectReader, ReadRoom, WriteMode};
+use engine::{Engine, ObjectInfo, ObjectReader, PutSpool, ReadRoom, WriteMode};
 use remote::Remote;
 use tracing::{info, warn};
 
-use crate::multipart::Claim;
+use crate::multipart::{Claim, PartWriter};
 use crate::xml::{self, ListPage, ListedObject};
 use crate::{AppState, Caller, S3Error, StreamedBody};
 use s3proto::time::http_date;

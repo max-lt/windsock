@@ -2137,8 +2137,8 @@ async fn test_large_put_with_a_bad_body_writes_nothing() {
     assert_eq!(spool_files(&server), 0);
 }
 
-#[tokio::test]
-async fn test_chunked_put_with_no_length_stops_at_the_body_limit() {
+/// A bucket on a server with a body limit of 2 MiB.
+async fn with_max_body() -> Server {
     let mut server = with_bucket().await;
     let mut config = S3Config::new(
         HashMap::from([(ACCESS.to_string(), SECRET.to_string())]),
@@ -2147,15 +2147,25 @@ async fn test_chunked_put_with_no_length_stops_at_the_body_limit() {
     config.uploads = server.uploads.clone();
     config.max_body = 2 * 1024 * 1024;
     server.app = s3api::router(server.engine.clone(), config);
+    server
+}
+
+/// A body with no Content-Length: the limit applies to the bytes that arrive.
+fn chunked<'a>(call: Call<'a>, body: &[u8]) -> Call<'a> {
+    call.header("transfer-encoding", "chunked").body(body)
+}
+
+#[tokio::test]
+async fn test_chunked_put_with_no_length_stops_at_the_body_limit() {
+    let server = with_max_body().await;
     let body = vec![7; 3 * 1024 * 1024];
 
-    let chunked = |uri: &'static str, body: Vec<u8>| {
-        call("PUT", uri)
-            .header("transfer-encoding", "chunked")
-            .body(body)
-    };
-    let over = run(&server, chunked("/bkt/a", body.clone())).await;
-    let under = run(&server, chunked("/bkt/b", body[..1024 * 1024 + 1].to_vec())).await;
+    let over = run(&server, chunked(call("PUT", "/bkt/a"), &body)).await;
+    let under = run(
+        &server,
+        chunked(call("PUT", "/bkt/b"), &body[..1024 * 1024 + 1]),
+    )
+    .await;
     let read = run(&server, call("GET", "/bkt/a")).await;
 
     assert_eq!(over.status, StatusCode::BAD_REQUEST, "{}", over.text());
@@ -2163,4 +2173,27 @@ async fn test_chunked_put_with_no_length_stops_at_the_body_limit() {
     assert_eq!(under.status, StatusCode::OK, "{}", under.text());
     assert_eq!(read.status, StatusCode::NOT_FOUND);
     assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_buffered_bodies_with_no_length_stop_at_the_body_limit() {
+    let server = with_max_body().await;
+    let id = start_upload(&server).await;
+    let part = format!("/bkt/big?partNumber=1&uploadId={id}");
+    let body = vec![7; 3 * 1024 * 1024];
+
+    let replies = [
+        run(&server, chunked(call("PUT", &part), &body)).await,
+        run(
+            &server,
+            chunked(call("PUT", "/bkt/copy"), &body).header("x-amz-copy-source", "/bkt/source"),
+        )
+        .await,
+        run(&server, chunked(call("PUT", "/other"), &body)).await,
+    ];
+
+    for reply in replies {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        assert_eq!(reply.xml("Code").unwrap(), "EntityTooLarge");
+    }
 }

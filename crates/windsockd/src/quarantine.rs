@@ -26,7 +26,7 @@ fn line(record: &QuarantinedRecord) -> String {
         record.write.hlc,
         s3proto::time::iso8601(record.write.hlc),
         record.data.len(),
-        match record.corrupt {
+        match record.write.corrupt {
             true => "corrupt",
             false => "ok",
         }

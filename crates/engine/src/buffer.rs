@@ -1286,6 +1286,8 @@ pub struct QuarantinedWrite {
     pub target: String,
     /// The HLC of its ack.
     pub hlc: u64,
+    /// The data does not match the hash in its head: the record left the buffer for that.
+    pub corrupt: bool,
 }
 
 /// One record of the quarantine, with its body.
@@ -1300,8 +1302,6 @@ pub struct QuarantinedRecord {
     pub write: QuarantinedWrite,
     /// The object body of a put; empty for the other ops.
     pub data: Vec<u8>,
-    /// The data does not match the hash in its head: the record left the buffer for that.
-    pub corrupt: bool,
 }
 
 /// Reads the records of the quarantine directory `dir` one at a time, in order.
@@ -1362,9 +1362,9 @@ impl QuarantineReader {
                 write: QuarantinedWrite {
                     target: record.head.op.target(),
                     hlc: record.head.time,
+                    corrupt,
                 },
                 data: record.data,
-                corrupt,
             }));
         }
     }
@@ -1386,10 +1386,11 @@ pub(crate) async fn read_quarantine(dir: &Path) -> Result<Vec<QuarantinedWrite>,
     paths.sort();
     for path in paths {
         let mut reader = SegmentReader::open(&path).await?;
-        while let Some((record, _)) = reader.next_held(&path).await? {
+        while let Some((record, corrupt)) = reader.next_held(&path).await? {
             out.push(QuarantinedWrite {
                 target: record.head.op.target(),
                 hlc: record.head.time,
+                corrupt,
             });
         }
     }

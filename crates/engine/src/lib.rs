@@ -122,7 +122,7 @@ pub enum EngineError {
     #[cfg(feature = "sim")]
     #[error("simulated crash after {0:?}")]
     SimCrash(sim::Point),
-    #[error("buffered writes older than the late limit are in quarantine: {0}")]
+    #[error("buffered writes are in quarantine: {0}")]
     Quarantined(String),
     #[error("the object has {size} bytes, over the limit of {limit} bytes")]
     ObjectTooLarge { size: u64, limit: u64 },
@@ -376,7 +376,13 @@ async fn held_writes(quarantine: &Path) -> Result<String> {
     let writes = buffer::read_quarantine(quarantine).await?;
     let named: Vec<String> = writes
         .iter()
-        .map(|write| format!("{} (ack HLC {})", write.target, write.hlc))
+        .map(|write| match write.corrupt {
+            true => format!(
+                "{} (ack HLC {}, data does not match its head)",
+                write.target, write.hlc
+            ),
+            false => format!("{} (ack HLC {})", write.target, write.hlc),
+        })
         .collect();
     if named.is_empty() {
         return Ok("an interrupted flush (intent file only)".to_string());

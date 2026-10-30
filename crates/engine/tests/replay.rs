@@ -137,6 +137,11 @@ async fn test_bad_data_under_a_valid_head_goes_to_quarantine_in_the_middle_and_a
             refused.contains(&format!("{BUCKET}/{key}")),
             "{key}: {refused}"
         );
+        assert!(
+            refused.contains("data does not match its head"),
+            "{key}: {refused}"
+        );
+        assert!(!refused.contains("late limit"), "{key}: {refused}");
         assert_eq!(held, [format!("{BUCKET}/{key}")], "{key}");
         assert!(again.contains(&format!("{BUCKET}/{key}")), "{key}: {again}");
         assert_eq!(

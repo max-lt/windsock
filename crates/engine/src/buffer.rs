@@ -26,7 +26,9 @@ use tracing::{debug, warn};
 
 use crate::EngineError;
 
-const PREFIX_LEN: usize = 4 + 8 + 32;
+/// The data length before the data, then the head length and the head hash after it.
+const DATA_LEN_LEN: usize = 8;
+const HEAD_PREFIX_LEN: usize = 4 + 32;
 
 /// Larger heads are garbage: keys, bucket names and metadata are small.
 const MAX_HEAD_LEN: u32 = 64 * 1024;
@@ -37,7 +39,7 @@ pub(crate) const MAX_DATA_LEN: u64 = 5 << 30;
 const SEGMENT_SUFFIX: &str = ".log";
 
 /// The record format of this build. Segments of another format must not decode.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 const FORMAT_FILE: &str = "format";
 const INTENT_FILE: &str = "intent";
 const INTENT_TEMP: &str = ".intent.tmp";
@@ -60,7 +62,8 @@ async fn check_format(dir: &Path, has_segments: bool) -> Result<(), EngineError>
         Ok(FORMAT) => Ok(()),
         Ok(found) => Err(EngineError::Corrupt(format!(
             "{}: the buffer has record format {found}, this build reads format {FORMAT}. Start \
-             the build that wrote it, and let it flush the buffer",
+             the build that wrote it, stop it with SIGTERM (it flushes the buffer before it \
+             exits, and exits 0 when the buffer is empty), then start this build",
             dir.display()
         ))),
         Err(_) => Err(EngineError::Corrupt(format!(
@@ -105,17 +108,25 @@ pub(crate) enum Op {
     },
 }
 
-/// Encodes a record. Pure, so the format has a golden test.
+/// Encodes a record: the data length, the data, then the head length, the head hash and the head.
+/// A streamed put knows its head only at the end. Pure, so the format has a golden test.
 pub(crate) fn encode_record(head: &Head, data: &[u8]) -> Vec<u8> {
+    let tail = encode_head(head);
+    let mut out = Vec::with_capacity(DATA_LEN_LEN + data.len() + tail.len());
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(&tail);
+    out
+}
+
+/// The part of a record after its data: the head length, the head hash and the head.
+pub(crate) fn encode_head(head: &Head) -> Vec<u8> {
     let head_bytes = postcard::to_allocvec(head).expect("a record head always serializes");
     let head_len = u32::try_from(head_bytes.len()).expect("a record head is smaller than 4 GiB");
-
-    let mut out = Vec::with_capacity(PREFIX_LEN + head_bytes.len() + data.len());
+    let mut out = Vec::with_capacity(HEAD_PREFIX_LEN + head_bytes.len());
     out.extend_from_slice(&head_len.to_le_bytes());
-    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
     out.extend_from_slice(blake3::hash(&head_bytes).as_bytes());
     out.extend_from_slice(&head_bytes);
-    out.extend_from_slice(data);
     out
 }
 
@@ -172,29 +183,34 @@ impl SegmentReader {
             return Ok(Read::End);
         }
 
-        let mut prefix = [0u8; PREFIX_LEN];
-        if !read_full(&mut self.file, &mut prefix).await? {
+        let mut len = [0u8; DATA_LEN_LEN];
+        if !read_full(&mut self.file, &mut len).await? {
             return Ok(Read::Invalid(start));
         }
-
-        let head_len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
-        let data_len = u64::from_le_bytes(prefix[4..12].try_into().expect("8 bytes"));
-        let head_hash = &prefix[12..];
-        let remaining = self.len - start - PREFIX_LEN as u64;
-        let fits = u64::from(head_len)
-            .checked_add(data_len)
-            .is_some_and(|len| len <= remaining);
-
+        let data_len = u64::from_le_bytes(len);
+        let remaining = self.len - start - DATA_LEN_LEN as u64;
         // A length from a file that a crash cut is not trusted: check it before any allocation.
-        if head_len > MAX_HEAD_LEN || data_len > MAX_DATA_LEN || !fits {
+        let fits = data_len
+            .checked_add(HEAD_PREFIX_LEN as u64)
+            .is_some_and(|len| len <= remaining);
+        if data_len > MAX_DATA_LEN || !fits {
             return Ok(Read::Invalid(start));
         }
-
-        let mut head_bytes = vec![0u8; head_len as usize];
         let mut data = vec![0u8; data_len as usize];
-        if !read_full(&mut self.file, &mut head_bytes).await?
-            || !read_full(&mut self.file, &mut data).await?
+        let mut prefix = [0u8; HEAD_PREFIX_LEN];
+        if !read_full(&mut self.file, &mut data).await?
+            || !read_full(&mut self.file, &mut prefix).await?
         {
+            return Ok(Read::Invalid(start));
+        }
+        let head_len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
+        let head_hash = &prefix[4..];
+        let fits = u64::from(head_len) <= remaining - data_len - HEAD_PREFIX_LEN as u64;
+        if head_len > MAX_HEAD_LEN || !fits {
+            return Ok(Read::Invalid(start));
+        }
+        let mut head_bytes = vec![0u8; head_len as usize];
+        if !read_full(&mut self.file, &mut head_bytes).await? {
             return Ok(Read::Invalid(start));
         }
 
@@ -202,8 +218,8 @@ impl SegmentReader {
             return Ok(Read::Invalid(start));
         };
 
-        let data_offset = start + (PREFIX_LEN as u64) + u64::from(head_len);
-        self.offset = data_offset + data_len;
+        let data_offset = start + DATA_LEN_LEN as u64;
+        self.offset = data_offset + data_len + HEAD_PREFIX_LEN as u64 + u64::from(head_len);
 
         Ok(Read::Record(Record {
             head,
@@ -530,7 +546,7 @@ impl Buffer {
         }
 
         let record = encode_record(&head, data);
-        let data_offset = self.active.len + (record.len() - data.len()) as u64;
+        let data_offset = self.active.len + DATA_LEN_LEN as u64;
 
         if let Err(e) = self.write_active(&record).await {
             // A partial record inside a segment would stop the replay of every record after it.
@@ -1274,11 +1290,19 @@ mod tests {
 
     #[test]
     fn test_record_format_is_stable() {
-        let bytes = encode_record(&put("k", b"data"), b"data");
+        let head = put("k", b"data");
+        let bytes = encode_record(&head, b"data");
+        let head_bytes = postcard::to_allocvec(&head).unwrap();
 
+        // The data first, then the head: a streamed put knows its head only at the end.
+        assert_eq!(bytes[..8], 4u64.to_le_bytes());
+        assert_eq!(&bytes[8..12], b"data");
+        assert_eq!(bytes[12..16], (head_bytes.len() as u32).to_le_bytes());
+        assert_eq!(bytes[16..48], *blake3::hash(&head_bytes).as_bytes());
+        assert_eq!(&bytes[48..], &head_bytes[..]);
         assert_eq!(
             blake3::hash(&bytes).to_string(),
-            "16160308b47a1cbf772609dd37102a41263dad1f0d306352d659a7f905102949"
+            "1aa15ae7cba1a8fb1065ffd5b4ce3f8147e992ffc19bc855986c22cc16c2805f"
         );
     }
 
@@ -1312,7 +1336,7 @@ mod tests {
 
         let text = error.to_string();
         assert!(text.contains("does not read"), "{text}");
-        assert!(text.contains("write 2 into it"), "{text}");
+        assert!(text.contains("write 3 into it"), "{text}");
     }
 
     #[tokio::test]
@@ -1330,7 +1354,22 @@ mod tests {
 
         let text = error.to_string();
         assert!(text.contains("record format 1"), "{text}");
-        assert!(text.contains("format 2"), "{text}");
+        assert!(text.contains("format 3"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_buffer_of_format_2_names_the_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FORMAT_FILE), b"2\n").unwrap();
+        std::fs::write(segment_path(dir.path(), 0), b"old records").unwrap();
+
+        let Err(error) = Buffer::open(dir.path(), 1 << 20).await else {
+            panic!("a buffer of format 2 opens");
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("record format 2"), "{text}");
+        assert!(text.contains("SIGTERM"), "{text}");
     }
 
     #[tokio::test]
@@ -1443,10 +1482,7 @@ mod tests {
     async fn segment_with_a_huge_length(dir: &Path, seq: u64) {
         let path = segment_path(dir, seq);
         let mut bytes = encode_record(&put("a", b"one"), b"one");
-        let mut prefix = vec![0u8; PREFIX_LEN];
-        prefix[..4].copy_from_slice(&8u32.to_le_bytes());
-        prefix[4..12].copy_from_slice(&(u64::MAX - 4).to_le_bytes());
-        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(&(u64::MAX - 4).to_le_bytes());
         bytes.extend_from_slice(&[0u8; 64]);
         tokio::fs::write(&path, bytes).await.unwrap();
     }

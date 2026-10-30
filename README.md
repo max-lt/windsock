@@ -229,6 +229,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   stays possible across proxies. The check costs one manifest read when the manifest is not in
   the index, done outside the buffer lock.
 - Object tags, bucket lifecycle rules and ACLs are not supported.
+- This build writes buffer records of format 3. It refuses at start a buffer of format 2, from an
+  earlier build. Start the earlier build, stop it with SIGTERM (it flushes the buffer, and exits 0
+  when the buffer is empty), then start this build. There is no conversion.
 - Presigned URLs (SigV4 in the query) cover GET, HEAD and a single PUT of an object. Multipart,
   copy, delete and bucket requests need a signed header. `X-Amz-Expires` is 1 to 604800 seconds
   (7 days). A URL is valid from `X-Amz-Date` less 15 minutes of clock skew, until `X-Amz-Date`

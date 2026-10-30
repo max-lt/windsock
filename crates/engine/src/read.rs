@@ -84,7 +84,9 @@ impl<R: Remote + 'static> Engine<R> {
                         "the chunks of a manifest end before its size".to_string(),
                     ));
                 };
-                let mut raw = Vec::new();
+                // One size for every piece: buffers of many sizes stay with the allocator after
+                // their free.
+                let mut raw = Vec::with_capacity(READ_STEP);
                 for chunk in self.read_fetch(&fetch, *mode).await? {
                     raw.extend(chunk);
                 }

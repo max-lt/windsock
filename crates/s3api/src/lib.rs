@@ -57,12 +57,16 @@ impl S3Config {
 }
 
 /// A PUT of an object whose body the handler streams to a spool file, with the SHA-256 that the
-/// client signed, if any.
+/// client signed, or the decoder of an aws-chunked body.
 #[derive(Clone, Debug)]
 pub(crate) struct StreamedBody {
     pub sha256: Option<String>,
-    /// The Content-Length of the request, when it has one.
+    /// The Content-Length of the request, when it has one: the encoded length for aws-chunked.
     pub length: Option<u64>,
+    /// The decoder of an aws-chunked body, with the chunk signer of the request.
+    pub chunked: Option<sigv4::ChunkDecoder>,
+    /// `x-amz-decoded-content-length` of an aws-chunked body.
+    pub decoded_length: Option<u64>,
 }
 
 /// The access key of an authenticated request.

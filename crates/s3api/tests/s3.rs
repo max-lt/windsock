@@ -2304,3 +2304,173 @@ async fn test_key_store_that_never_answers_gets_503_at_the_deadline() {
     assert_eq!(reply.xml("Code").unwrap(), "ServiceUnavailable");
     assert!(start.elapsed() >= s3api::KEY_STORE_DEADLINE);
 }
+
+/// A signed aws-chunked PUT of `key`: the encoded body for `data`, and the request with `body`.
+struct ChunkedPut {
+    encoded: Vec<u8>,
+    headers: Vec<(String, String)>,
+    authorization: String,
+    uri: String,
+}
+
+impl ChunkedPut {
+    fn new(key: &str, data: &[u8], decoded_length: usize) -> Self {
+        Self::with_payload(key, data, decoded_length, sigv4::STREAMING_SIGNED)
+    }
+
+    /// `payload` is `STREAMING_SIGNED` or `STREAMING_UNSIGNED_TRAILER`.
+    fn with_payload(key: &str, data: &[u8], decoded_length: usize, payload: &str) -> Self {
+        let timestamp = sigv4::timestamp(now());
+        let uri = format!("/bkt/{key}");
+        let headers: Vec<(String, String)> = vec![
+            ("host".into(), "localhost".into()),
+            ("x-amz-date".into(), timestamp.clone()),
+            ("x-amz-content-sha256".into(), payload.into()),
+            (
+                "x-amz-decoded-content-length".into(),
+                decoded_length.to_string(),
+            ),
+            ("content-encoding".into(), "aws-chunked".into()),
+        ];
+        let (authorization, seed) = sigv4::sign(
+            &sigv4::Request {
+                method: "PUT",
+                path: &uri,
+                query: "",
+                headers: &headers,
+                payload_hash: payload,
+            },
+            ACCESS,
+            SECRET,
+            &timestamp,
+            REGION,
+        );
+        let signer = sigv4::ChunkSigner {
+            key: sigv4::signing_key(SECRET, &timestamp[..8], REGION),
+            timestamp: timestamp.clone(),
+            scope: format!("{}/{REGION}/s3/aws4_request", &timestamp[..8]),
+            previous: seed,
+        };
+        Self {
+            encoded: sigv4::encode_chunked(
+                data,
+                64 * 1024,
+                (payload == sigv4::STREAMING_SIGNED).then_some(signer),
+            ),
+            headers,
+            authorization,
+            uri,
+        }
+    }
+
+    /// The request, with a Content-Length of the whole encoded body.
+    fn request(&self, body: Body) -> Request<Body> {
+        let mut request = Request::builder().method("PUT").uri(&self.uri);
+        for (name, value) in &self.headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        request
+            .header("content-length", self.encoded.len().to_string())
+            .header("authorization", self.authorization.as_str())
+            .body(body)
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn test_large_aws_chunked_put_streams_through_a_spool_file() {
+    let server = with_bucket().await;
+    let data = large_object();
+    let put = ChunkedPut::new("big", &data, data.len());
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|piece| (Ok::<_, std::io::Error>(piece), rx))
+    });
+    let reply = tokio::spawn({
+        let app = server.app.clone();
+        let request = put.request(Body::from_stream(stream));
+        async move { app.oneshot(request).await.unwrap().status() }
+    });
+    let half = put.encoded.len() / 2;
+
+    tx.send(Bytes::copy_from_slice(&put.encoded[..half]))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while spool_files(&server) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let spooled_while_sending = spool_files(&server);
+    tx.send(Bytes::copy_from_slice(&put.encoded[half..]))
+        .await
+        .unwrap();
+    drop(tx);
+    let status = reply.await.unwrap();
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    assert_eq!(spooled_while_sending, 1);
+    assert_eq!(status, StatusCode::OK);
+    assert!(read.body == data);
+    assert_eq!(read.header("content-encoding"), None);
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_large_aws_chunked_put_with_a_bad_body_writes_nothing() {
+    let server = with_bucket().await;
+    let data = large_object();
+    let forged = {
+        let put = ChunkedPut::new("forged", &data, data.len());
+        let mut body = put.encoded.clone();
+        let at = body.len() / 2;
+        body[at] ^= 1;
+        send(&server, put.request(Body::from(body))).await
+    };
+    let cut = {
+        let put = ChunkedPut::new("cut", &data, data.len());
+        let mut body = put.encoded.clone();
+        body.truncate(body.len() - 100);
+        let mut request = put.request(Body::from(body.clone()));
+        request
+            .headers_mut()
+            .insert("content-length", body.len().to_string().parse().unwrap());
+        send(&server, request).await
+    };
+    let wrong_length = {
+        let put = ChunkedPut::new("wrong", &data, data.len() + 1);
+        send(&server, put.request(Body::from(put.encoded.clone()))).await
+    };
+
+    assert_eq!(forged.status, StatusCode::FORBIDDEN, "{}", forged.text());
+    assert_eq!(forged.xml("Code").unwrap(), "SignatureDoesNotMatch");
+    for reply in [&cut, &wrong_length] {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        assert_eq!(reply.xml("Code").unwrap(), "IncompleteBody");
+    }
+    for key in ["forged", "cut", "wrong"] {
+        let read = run(&server, call("GET", &format!("/bkt/{key}"))).await;
+        assert_eq!(read.status, StatusCode::NOT_FOUND, "{key}");
+    }
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_large_unsigned_trailer_put_streams_and_reads_back() {
+    let server = with_bucket().await;
+    let data = large_object();
+    let put = ChunkedPut::with_payload(
+        "unsigned",
+        &data,
+        data.len(),
+        sigv4::STREAMING_UNSIGNED_TRAILER,
+    );
+
+    let reply = send(&server, put.request(Body::from(put.encoded.clone()))).await;
+    let read = run(&server, call("GET", "/bkt/unsigned")).await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(read.body == data);
+    assert_eq!(spool_files(&server), 0);
+}

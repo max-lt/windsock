@@ -329,19 +329,32 @@ async fn streamed_put<R: Remote + 'static>(
 
     let mut spool = state.engine.begin_put(bucket, key, metadata, mode).await?;
     let mut sha256 = streamed.sha256.as_ref().map(|_| sha2::Sha256::new());
-    let incomplete = || {
+    let mut decoder = streamed.chunked;
+    let mut received = 0u64;
+    let incomplete = |message: &str| {
         S3Error::new(
             "IncompleteBody",
             StatusCode::BAD_REQUEST,
-            "the body did not arrive whole",
+            message.to_string(),
         )
     };
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| incomplete())?;
-        let Ok(data) = frame.into_data() else {
+        let frame = frame.map_err(|_| incomplete("the body did not arrive whole"))?;
+        let Ok(frame) = frame.into_data() else {
             continue;
         };
-        for piece in data.chunks(PUT_PIECE) {
+        received += frame.len() as u64;
+        let mut decoded = Vec::new();
+        let data = match &mut decoder {
+            Some(decoder) => {
+                decoder
+                    .push(&frame, &mut decoded)
+                    .map_err(crate::auth::chunk_error)?;
+                decoded
+            }
+            None => vec![&frame[..]],
+        };
+        for piece in data.iter().flat_map(|data| data.chunks(PUT_PIECE)) {
             // A body with no Content-Length meets the limit only here.
             if spool.len() + piece.len() as u64 > state.max_body as u64 {
                 return Err(S3Error::entity_too_large(state.max_body));
@@ -352,8 +365,19 @@ async fn streamed_put<R: Remote + 'static>(
             state.engine.spool_write(&mut spool, piece).await?;
         }
     }
-    if streamed.length.is_some_and(|length| length != spool.len()) {
-        return Err(incomplete());
+    if streamed.length.is_some_and(|length| length != received) {
+        return Err(incomplete("the body did not arrive whole"));
+    }
+    if let Some(decoder) = &decoder {
+        decoder.finish().map_err(crate::auth::chunk_error)?;
+        if streamed
+            .decoded_length
+            .is_some_and(|length| length != spool.len())
+        {
+            return Err(incomplete(
+                "the body is shorter or longer than x-amz-decoded-content-length",
+            ));
+        }
     }
     if let (Some(expected), Some(sha256)) = (&streamed.sha256, sha256)
         && hex::encode(sha256.finalize()) != *expected

@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::keys::{self, KeyStore};
 use crate::{AppState, Caller, S3Error, StreamedBody, presign};
-use s3proto::sigv4::{self, Authorization, ChunkSigner};
+use s3proto::sigv4::{self, Authorization, ChunkDecoder, ChunkSigner};
 use s3proto::time::parse_amz_date;
 
 /// AWS rejects a request whose `x-amz-date` is further than this from its clock.
@@ -111,20 +111,14 @@ fn payload(
     body: Bytes,
 ) -> Result<Bytes, S3Error> {
     let hash = header(headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
-    let incomplete = |e: sigv4::ChunkError| match e {
-        sigv4::ChunkError::BadSignature => signature_mismatch(),
-        sigv4::ChunkError::Malformed | sigv4::ChunkError::Incomplete => {
-            S3Error::new("IncompleteBody", StatusCode::BAD_REQUEST, e.to_string())
-        }
-    };
     let decoded = match hash {
         sigv4::UNSIGNED_PAYLOAD => return Ok(body),
         sigv4::STREAMING_SIGNED | sigv4::STREAMING_SIGNED_TRAILER => {
             let signer = signer.ok_or_else(signature_mismatch)?;
-            sigv4::decode_chunked(&body, Some(signer)).map_err(incomplete)?
+            sigv4::decode_chunked(&body, Some(signer)).map_err(chunk_error)?
         }
         sigv4::STREAMING_UNSIGNED_TRAILER => {
-            sigv4::decode_chunked(&body, None).map_err(incomplete)?
+            sigv4::decode_chunked(&body, None).map_err(chunk_error)?
         }
         hex if sigv4::sha256_hex(&body) == hex.to_ascii_lowercase() => return Ok(body),
         _ => {
@@ -177,15 +171,15 @@ fn unix_now() -> u64 {
 /// A PUT body up to this size goes through the buffer in one record, with the group fsync.
 const SMALL_PUT: u64 = 1024 * 1024;
 
-/// The body check of a PUT of an object that the handler streams: a larger or unknown length,
-/// and no aws-chunked body. `None` for any other request.
-fn streamed(parts: &Parts) -> Option<StreamedBody> {
+/// The body check of a PUT of an object that the handler streams: a larger or unknown length.
+/// `None` for any other request. A signed aws-chunked body with no chunk signer is refused.
+fn streamed(parts: &Parts, signer: Option<&ChunkSigner>) -> Result<Option<StreamedBody>, S3Error> {
     if parts.method != Method::PUT || parts.headers.contains_key("x-amz-copy-source") {
-        return None;
+        return Ok(None);
     }
     let object = parts.uri.path().trim_start_matches('/').split_once('/');
     if object.is_none_or(|(_, key)| key.is_empty()) {
-        return None;
+        return Ok(None);
     }
     let query = parts.uri.query().unwrap_or("");
     let part = query.split('&').any(|pair| {
@@ -200,19 +194,39 @@ fn streamed(parts: &Parts) -> Option<StreamedBody> {
         None => chunked,
     };
     if part || !large {
-        return None;
+        return Ok(None);
     }
     let hash = header(&parts.headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
-    match hash {
-        sigv4::UNSIGNED_PAYLOAD => Some(StreamedBody {
-            sha256: None,
+    let decoded_length =
+        header(&parts.headers, "x-amz-decoded-content-length").and_then(|v| v.parse().ok());
+    let streamed = |sha256, chunked| {
+        Some(StreamedBody {
+            sha256,
             length,
-        }),
+            chunked,
+            decoded_length,
+        })
+    };
+    Ok(match hash {
+        sigv4::UNSIGNED_PAYLOAD => streamed(None, None),
+        sigv4::STREAMING_SIGNED | sigv4::STREAMING_SIGNED_TRAILER => {
+            let signer = signer.cloned().ok_or_else(signature_mismatch)?;
+            streamed(None, Some(ChunkDecoder::new(Some(signer))))
+        }
+        sigv4::STREAMING_UNSIGNED_TRAILER => streamed(None, Some(ChunkDecoder::new(None))),
+        // An unknown STREAMING- value fails in the buffered check of the hash.
         hash if hash.starts_with("STREAMING-") => None,
-        hash => Some(StreamedBody {
-            sha256: Some(hash.to_ascii_lowercase()),
-            length,
-        }),
+        hash => streamed(Some(hash.to_ascii_lowercase()), None),
+    })
+}
+
+/// The S3 error of an aws-chunked body that fails to decode.
+pub(crate) fn chunk_error(e: sigv4::ChunkError) -> S3Error {
+    match e {
+        sigv4::ChunkError::BadSignature => signature_mismatch(),
+        sigv4::ChunkError::Malformed | sigv4::ChunkError::Incomplete => {
+            S3Error::new("IncompleteBody", StatusCode::BAD_REQUEST, e.to_string())
+        }
     }
 }
 
@@ -252,11 +266,14 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
         }
     };
     parts.extensions.insert(Caller(access_key));
-    if let Some(stream) = streamed(&parts) {
-        let length = header(&parts.headers, "content-length").and_then(|v| v.parse::<u64>().ok());
-        if length.is_some_and(|length| length > state.max_body as u64) {
+    if let Some(stream) = streamed(&parts, signer.as_ref())? {
+        if stream
+            .length
+            .is_some_and(|length| length > state.max_body as u64)
+        {
             return Err(S3Error::entity_too_large(state.max_body));
         }
+        strip_aws_chunked(&mut parts.headers);
         parts.extensions.insert(stream);
         return Ok(next.run(Request::from_parts(parts, body)).await);
     }

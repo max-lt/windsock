@@ -283,21 +283,24 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - A client that stops reading a GET body holds its stream until `idle_timeout_secs` (60 s by
   default) after the last write that made progress. Stalled readers can hold the whole read budget for that time: the 503 then protects the memory, not the service. Then the daemon closes the connection. A client
   that reads slowly keeps it open: there is no minimum rate.
-- A PUT with a Content-Length over 1 MiB, or a chunked body with no Content-Length, and no
-  aws-chunked body, writes its body to a spool file in the buffer as it arrives, in pieces of at
-  most 1 MiB: it holds about 1 MiB of memory, and the peak for such PUTs is `max_connections`
-  times 1 MiB. Its spool file counts against the buffer limit as it grows. A smaller PUT goes
-  through the buffer in one record, with the group fsync.
+- A PUT with a Content-Length over 1 MiB, or a chunked body with no Content-Length, writes its
+  body to a spool file in the buffer as it arrives, in pieces of at most 1 MiB: it holds about
+  1 MiB of memory, and the peak for such PUTs is `max_connections` times 1 MiB. Its spool file
+  counts against the buffer limit as it grows. A smaller PUT goes through the buffer in one
+  record, with the group fsync. An aws-chunked body is decoded as it arrives: a header or trailer
+  line takes at most 4 KiB, all trailers 16 KiB, and a declared chunk size reserves no memory.
+  Each chunk signature is checked at the end of its chunk, and nothing is written before the last
+  chunk, the trailer signature and `x-amz-decoded-content-length` match.
 - Measured on macOS, one daemon, PUTs of a 100 MiB file at 200 KiB/s for 60 s: 64 writers raised
   the daemon from 224 MiB to 241 MiB, and 250 writers from 43 MiB to 106 MiB, about 260 KiB per
   writer, with 2.9 GiB in spool files. When the clients stopped, no spool file stayed.
 - The flush and the replay at start read each buffered object whole into memory: after one PUT of
   100 MiB, its flush raised the daemon to 224 MiB. So a spooled PUT of 5 GiB takes more than
   5 GiB of memory at its flush.
-- A PUT with an aws-chunked body, a CopyObject and a CompleteMultipartUpload hold the whole
-  object in memory, up to 5 GiB per request, about 3 times the object: a PUT of 1 GiB raised the
-  daemon to 3.1 GiB, so one at the 5 GiB cap takes about 15 GiB. No limit covers them all
-  together. Size the memory for them, or put a limit in front of the proxy.
+- A CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB per
+  request, about 3 times the object: a PUT of 1 GiB held in memory raised the daemon to 3.1 GiB,
+  so one at the 5 GiB cap takes about 15 GiB. No limit covers them all together. Size the memory
+  for them, or put a limit in front of the proxy.
 
 ## Scale
 

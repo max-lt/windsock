@@ -83,6 +83,7 @@ async fn test_crash_at_each_spool_step_acks_nothing_and_keeps_only_durable_puts(
     for (point, durable) in [
         (Point::SpoolData, false),
         (Point::SpoolHead, false),
+        (Point::SpoolDirSync, true),
         (Point::SpoolRename, true),
         (Point::SpoolAck, true),
     ] {
@@ -259,4 +260,60 @@ async fn test_spooled_put_over_the_pack_target_wakes_the_flusher() {
     }
 
     flusher.abort();
+}
+
+/// The last segment of the buffer: the active one, empty after a flush.
+fn last_segment(dir: &Path) -> u64 {
+    std::fs::read_dir(dir.join("buffer"))
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".log")?.parse().ok()
+        })
+        .max()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_failure_after_the_rename_breaks_the_buffer_and_keeps_the_put() {
+    for dir_sync_fails in [true, false] {
+        let remote = Arc::new(MemoryRemote::default());
+        let dir = tempfile::tempdir().unwrap();
+        let a = open(dir.path(), &remote, Config::default()).await;
+        a.create_bucket(BUCKET, None).await.unwrap();
+        a.flush().await.unwrap();
+        let body = data(2 * PIECE);
+        // A directory with the name of the next segment makes its creation fail.
+        let next = dir
+            .path()
+            .join(format!("buffer/{:020}.log", last_segment(dir.path()) + 1));
+        match dir_sync_fails {
+            true => engine::sim::arm_crash(Some(Point::SpoolDirSync)),
+            false => std::fs::create_dir(&next).unwrap(),
+        }
+
+        let result = spooled_put(&a, "k", &body, WriteMode::Overwrite).await;
+        engine::sim::arm_crash(None);
+        let later = a
+            .put(
+                BUCKET,
+                "j",
+                Bytes::from("x"),
+                BTreeMap::new(),
+                WriteMode::Overwrite,
+            )
+            .await;
+        drop(a);
+        if next.is_dir() {
+            std::fs::remove_dir(&next).unwrap();
+        }
+        let a = open(dir.path(), &remote, Config::default()).await;
+
+        assert!(result.is_err(), "{dir_sync_fails}: {result:?}");
+        assert!(
+            matches!(later, Err(EngineError::BufferBroken)),
+            "{dir_sync_fails}: {later:?}"
+        );
+        assert!(a.get(BUCKET, "k", None).await.unwrap().data == body);
+    }
 }

@@ -755,6 +755,7 @@ impl Sim {
         let points = [
             Point::SpoolData,
             Point::SpoolHead,
+            Point::SpoolDirSync,
             Point::SpoolRename,
             Point::SpoolAck,
         ];

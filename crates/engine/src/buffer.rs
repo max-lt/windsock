@@ -798,6 +798,7 @@ impl Buffer {
     }
 
     async fn open_after_spool(&mut self, seq: u64) -> Result<(), EngineError> {
+        crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;
         sync_dir(&self.dir).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolRename)?;
         let size = tokio::fs::metadata(self.segment_path(seq)).await?.len();

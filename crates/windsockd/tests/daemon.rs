@@ -929,7 +929,9 @@ async fn test_presigned_signature_is_never_logged() {
 
     let good = presigned_query(&daemon, &keys, "/demo/k", "300");
     let signature = good.rsplit_once('=').unwrap().1.to_string();
-    let flipped = format!("{}0", &good[..good.len() - 1]);
+    // The last digit always changes: a signature that ends in 0 must not stay valid.
+    let other = if good.ends_with('0') { '1' } else { '0' };
+    let flipped = format!("{}{other}", &good[..good.len() - 1]);
     let flipped_signature = flipped.rsplit_once('=').unwrap().1.to_string();
     let malformed = presigned_query(&daemon, &keys, "/demo/k", "0");
     let malformed_signature = malformed.rsplit_once('=').unwrap().1.to_string();

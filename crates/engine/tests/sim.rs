@@ -226,6 +226,12 @@ struct Stats {
     step_back: bool,
     /// A spooled put crashed at one of its steps.
     spool_crash: bool,
+    /// A power loss changed the data of an unacked put under a valid head, or cut its record.
+    power_loss_data: u64,
+    power_loss_cut: u64,
+    /// Starts refused on the quarantine, and records there with data that does not match.
+    refused_starts: u64,
+    corrupt_quarantined: u64,
     keyless: bool,
     slow_stale_plan: bool,
     /// Chunks that a flush found stored and did not upload again.
@@ -286,6 +292,8 @@ fn config() -> Config {
 
 struct Sim {
     rng: Rng,
+    /// Power losses draw from their own stream, so the other steps of a seed stay as they were.
+    loss: Rng,
     remote: Arc<SimRemote>,
     proxies: Vec<Proxy>,
     now: u64,
@@ -409,7 +417,10 @@ impl Sim {
                     self.proxies[i].engine = Some(engine);
                     return Ok(());
                 }
-                Err(EngineError::Quarantined(e)) => self.operator(i, &e).await?,
+                Err(EngineError::Quarantined(e)) => {
+                    self.stats.refused_starts += 1;
+                    self.operator(i, &e).await?
+                }
                 // A remote error at open: the supervisor starts the proxy again.
                 Err(e) if e.to_string().contains("injected") => {
                     self.log.push(format!("p{i} open failed: {e}"));
@@ -451,7 +462,15 @@ impl Sim {
             .map_err(|e| format!("p{i} quarantine: {e}"))?;
         self.log
             .push(format!("p{i} quarantine at open: {writes:?}"));
-        self.stats.quarantine = true;
+        // A record with bad data comes from a power loss before its fsync: never acked.
+        let (corrupt, writes): (Vec<_>, Vec<_>) = writes.into_iter().partition(|w| w.corrupt);
+        if let Some(acked) = corrupt.iter().find(|w| self.was_acked(i, &w.target, w.hlc)) {
+            return Err(format!(
+                "p{i}: an acked write is in the quarantine with bad data: {acked:?}"
+            ));
+        }
+        self.stats.corrupt_quarantined += corrupt.len() as u64;
+        self.stats.quarantine |= !writes.is_empty();
         // A write is late when its HLC is under the clock less (R - M), and the clock of the
         // open is at most R ahead of its wall clock.
         let wall = self.now + self.proxies[i].offset;
@@ -484,6 +503,17 @@ impl Sim {
             .chain(self.buckets.values())
             .flatten()
             .any(|a| a.proxy == i && a.hlc > hlc && !a.dropped)
+    }
+
+    /// True when proxy `i` acked a write to `target` at `hlc`.
+    fn was_acked(&self, i: usize, target: &str, hlc: u64) -> bool {
+        let (writes, name) = match target.split_once('/') {
+            Some((_, key)) => (&self.keys, key),
+            None => (&self.buckets, target),
+        };
+        writes
+            .get(name)
+            .is_some_and(|acked| acked.iter().any(|a| a.proxy == i && a.hlc == hlc))
     }
 
     /// Marks the acked write of proxy `i` to `target` at `hlc` as dropped by the operator.
@@ -714,6 +744,10 @@ impl Sim {
             }
             false => self.rng.next().to_le_bytes().to_vec(),
         };
+        // The open after a power loss needs the remote: in an outage it would fail for ever.
+        let outage = self.proxies[i].outage.load(Ordering::SeqCst);
+        let power_loss = !outage && self.loss.chance(3);
+        engine::sim::arm_crash(power_loss.then_some(Point::Appended));
         let result = self
             .engine(i)
             .put(
@@ -724,6 +758,10 @@ impl Sim {
                 WriteMode::Overwrite,
             )
             .await;
+        engine::sim::arm_crash(None);
+        if let Err(EngineError::SimCrash(Point::Appended)) = result {
+            return self.power_loss(i, &key, &value).await;
+        }
         match result {
             Ok(info) => {
                 self.log
@@ -741,6 +779,41 @@ impl Sim {
             Err(e) => self.quarantine(i, &e),
         }
         Ok(())
+    }
+
+    /// A power loss after a put reached the active segment with no fsync and no ack: part of its
+    /// record is lost. Half the time its data changes under a valid head, else the file ends
+    /// inside the record. Then the proxy starts again.
+    async fn power_loss(&mut self, i: usize, key: &str, value: &[u8]) -> Result<(), String> {
+        self.proxies[i].engine = None;
+        let buffer = self.proxies[i].dir.path().join("buffer");
+        let last = std::fs::read_dir(&buffer)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "log"))
+            .max()
+            .expect("the put is in a segment");
+        let mut content = std::fs::read(&last).unwrap();
+        let at = content
+            .windows(value.len())
+            .rposition(|window| window == value)
+            .expect("the put is in the last segment");
+        let changed = self.loss.chance(50);
+        match changed {
+            true => {
+                content[at + value.len() / 2] ^= 1;
+                self.stats.power_loss_data += 1;
+            }
+            false => {
+                content.truncate(at + self.loss.below(value.len() as u64) as usize);
+                self.stats.power_loss_cut += 1;
+            }
+        }
+        std::fs::write(&last, &content).unwrap();
+        self.log.push(format!(
+            "p{i} power loss on the put of {key}: data changed {changed}"
+        ));
+        self.open(i).await
     }
 
     /// A put that streams its body through a spool file, now and then with a crash at one of its
@@ -1234,6 +1307,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
     let remote = Arc::new(SimRemote::default());
     let mut sim = Sim {
         rng: Rng(seed),
+        loss: Rng(seed ^ 0x9e37_79b9_7f4a_7c15),
         remote,
         proxies: Vec::new(),
         now,
@@ -1305,6 +1379,10 @@ struct Totals {
     far_ahead: u64,
     step_back: u64,
     spool_crash: u64,
+    power_loss_data: u64,
+    power_loss_cut: u64,
+    refused_starts: u64,
+    corrupt_quarantined: u64,
     keyless: u64,
     slow_stale_plan: u64,
     dedup_hits: u64,
@@ -1328,6 +1406,10 @@ impl Totals {
         self.far_ahead += u64::from(stats.far_ahead);
         self.step_back += u64::from(stats.step_back);
         self.spool_crash += u64::from(stats.spool_crash);
+        self.power_loss_data += stats.power_loss_data;
+        self.power_loss_cut += stats.power_loss_cut;
+        self.refused_starts += stats.refused_starts;
+        self.corrupt_quarantined += stats.corrupt_quarantined;
         self.slow_stale_plan += u64::from(stats.slow_stale_plan);
         self.keyless += u64::from(stats.keyless);
         self.dedup_hits += stats.dedup_hits;
@@ -1359,6 +1441,15 @@ impl Totals {
             ("a clock more than R ahead", self.far_ahead),
             ("a wall step back over R with a buffer", self.step_back),
             ("a spooled put that crashed", self.spool_crash),
+            (
+                "a power loss with bad data under a valid head",
+                self.power_loss_data,
+            ),
+            ("a power loss that cut a record", self.power_loss_cut),
+            (
+                "a record with bad data in the quarantine",
+                self.corrupt_quarantined,
+            ),
             ("a StalePlan after a slow upload", self.slow_stale_plan),
             ("a chain from a writer with no repo key", self.keyless),
             ("a dedup hit", self.dedup_hits),

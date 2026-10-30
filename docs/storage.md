@@ -200,12 +200,20 @@ and fails. `windsockd quarantine list` marks such a record `corrupt` in its last
 operator does the steps of "What the operator does": the body in the quarantine is damaged, so
 keep a write only from the copy that the client holds.
 
+A power loss can give this refusal. An append writes the data and the head of a put in one write,
+and the fsync comes after it: after a power loss, the head can be on disk and part of the data
+not. Such a put had no ack. The refusal and `windsockd quarantine list` show its key with
+`data does not match its head` (`corrupt` in the last column of the list). If the client got
+no ack for that key at that time, empty the quarantine. If it got one, keep the export and write
+the object again from the copy that the client holds.
+
 ### A torn tail
 
 Only the last segment can end in a torn record: a crash cut its last write. A record is a torn
 tail when its head is missing, short or fails its hash, and no record with a valid head starts
-where it ends. The replay cuts the segment there and logs `WARN cut a torn record`. A spooled
-put is never in the last segment: its segment gets its name after the next segment exists.
+where it ends. The replay cuts the segment there and logs one `WARN cut a torn record` with the
+segment, the offset and the bytes dropped. A spooled put is never in the last segment: its
+segment gets its name after the next segment exists.
 
 ### A record whose head does not read
 

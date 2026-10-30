@@ -55,6 +55,7 @@ impl<R: Remote + 'static> Engine<R> {
             })
             .await?;
 
+        crate::sim::crash_point(crate::sim::Point::Appended)?;
         self.acknowledge(record).await?;
         Ok(info)
     }

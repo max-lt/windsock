@@ -24,6 +24,8 @@ pub enum Point {
     SpoolRename,
     /// The put is durable, and its ack is not given yet.
     SpoolAck,
+    /// A put is in the active segment with no fsync and no ack.
+    Appended,
     /// A record with bad data is in a durable quarantine file, and still in its segment.
     QuarantineCopy,
     /// The segment of that record is written again without it.

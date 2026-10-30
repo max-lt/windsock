@@ -2767,6 +2767,9 @@ async fn test_crash_while_a_part_is_written_or_named_keeps_the_old_part() {
         engine::sim::arm_crash(Some(point));
         let crashed = upload_part(&server, &id, 1, &"n".repeat(2 << 20)).await;
         engine::sim::arm_crash(None);
+        // A kill leaves the temporary file that the drop of the writer removed here.
+        let dir = server._dir.path().join("uploads").join(&id);
+        std::fs::write(dir.join(".tmp.1.1"), b"half a part").unwrap();
         let server = restarted(server).await;
         let parts = list_parts(&server, &id).await.text();
 
@@ -2783,4 +2786,61 @@ async fn test_crash_while_a_part_is_written_or_named_keeps_the_old_part() {
         assert_eq!(part_temps(&server, &id), 0, "{point:?}");
         assert_eq!(server.uploads.held(), "old part".len() as u64, "{point:?}");
     }
+}
+
+#[tokio::test]
+async fn test_crash_after_a_part_renamed_and_before_the_old_one_went_keeps_the_newest() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    upload_part(&server, &id, 1, "old part").await;
+    let new = "n".repeat(2 << 20);
+
+    engine::sim::arm_crash(Some(Point::PartReplace));
+    let crashed = upload_part(&server, &id, 1, &new).await;
+    engine::sim::arm_crash(None);
+    let server = restarted(server).await;
+    let parts = list_parts(&server, &id).await.text();
+    let new_etag = blake3::hash(new.as_bytes()).to_hex().to_string();
+    let done = complete(&server, &id, &[(1, new_etag.as_str())]).await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    assert_eq!(crashed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(parts.matches("<Part>").count(), 1, "{parts}");
+    assert!(parts.contains(&new_etag), "{parts}");
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert!(read.body == new.as_bytes());
+}
+
+#[tokio::test]
+async fn test_part_body_reaches_its_temporary_file_before_the_body_ends() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let data = vec![5u8; 2 << 20];
+
+    let (tx, part) = part_through_channel(&server, &id, 1, data.len());
+    tx.send(Bytes::copy_from_slice(&data[..1 << 20]))
+        .await
+        .unwrap();
+    let dir = server._dir.path().join("uploads").join(&id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let written = loop {
+        let size: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp."))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        if size >= 1 << 20 || std::time::Instant::now() > deadline {
+            break size;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    tx.send(Bytes::copy_from_slice(&data[1 << 20..]))
+        .await
+        .unwrap();
+    drop(tx);
+    let part = part.await.unwrap();
+
+    assert_eq!(written, 1 << 20);
+    assert_eq!(part, StatusCode::OK);
 }

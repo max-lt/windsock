@@ -42,6 +42,8 @@ pub enum Point {
     PartWrite,
     /// An upload part is whole and fsynced in its temporary file; its rename comes next.
     PartRename,
+    /// An upload part has its name; the part of the same number that it replaces is still there.
+    PartReplace,
 }
 
 #[cfg(feature = "sim")]

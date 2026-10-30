@@ -119,9 +119,11 @@ impl Uploads {
         };
         while let Some(entry) = entries.next_entry().await.map_err(io)? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // A part that a crash stopped never got its name: the part before it stays.
+            // A part that a crash stopped never got its name: the part before it stays. A part
+            // that got its name before the removal of the part it replaced wins over it.
             if entry.file_type().await.map_err(io)?.is_dir() {
                 remove_part_temps(&entry.path()).await?;
+                keep_newest_parts(&entry.path()).await?;
             }
             // A marked complete may have committed: [`Uploads::settle`] decides with the engine.
             if let Some(id) = name.strip_suffix(Claim::Complete.suffix())
@@ -383,6 +385,9 @@ impl Uploads {
     }
 
     async fn take(&self, upload_id: &str, claim: Claim) -> Result<PathBuf, S3Error> {
+        // No part is between its rename and the removal of the part it replaces: a complete
+        // never sees two parts of one number.
+        let _naming = self.naming.lock().await;
         let from = self.upload_dir(upload_id)?;
         let to = self.dir.join(format!("{upload_id}{}", claim.suffix()));
         match tokio::fs::rename(&from, &to).await {
@@ -674,6 +679,29 @@ async fn remove_if_present(path: &Path) -> Result<(), S3Error> {
     }
 }
 
+/// Keeps one part per part number in `dir`: the newest by modification time. A crash after the
+/// rename of a part and before the removal of the part it replaced leaves two.
+async fn keep_newest_parts(dir: &Path) -> Result<(), S3Error> {
+    let mut newest: BTreeMap<u16, (u64, String)> = BTreeMap::new();
+    let mut older = Vec::new();
+    for ((number, etag), (_, time)) in part_files(dir).await? {
+        let name = part_name(number, &etag);
+        match newest.get(&number) {
+            Some((kept, _)) if *kept >= time => older.push(name),
+            _ => {
+                if let Some((_, replaced)) = newest.insert(number, (time, name)) {
+                    older.push(replaced);
+                }
+            }
+        }
+    }
+    for name in older {
+        warn!(part = name, dir = %dir.display(), "removed a part that a newer one replaced");
+        remove_if_present(&dir.join(name)).await?;
+    }
+    Ok(())
+}
+
 /// Removes the files of `dir` that never got their name.
 async fn remove_part_temps(dir: &Path) -> Result<(), S3Error> {
     let mut entries = tokio::fs::read_dir(dir).await.map_err(io)?;
@@ -751,6 +779,7 @@ impl PartWriter<'_> {
         self.uploads.release(self.counted() - self.len);
         self.len = 0;
         self.reserved = 0;
+        engine::sim::crash_point(engine::sim::Point::PartReplace)?;
         for (old_name, size) in &old {
             if *old_name != name {
                 remove_if_present(&self.dir.join(old_name)).await?;

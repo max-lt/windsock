@@ -28,7 +28,7 @@ use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 pub use config::{Config, KeySource};
-pub use engine::{BucketInfo, CacheState, ObjectInfo};
+pub use engine::{BucketInfo, CacheState, EngineError, ObjectInfo};
 pub use model::NodeId;
 pub use node::{MAX_PAGE, Node, NodeStatus, Page};
 pub use s3api::KeyStore;

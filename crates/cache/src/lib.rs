@@ -121,7 +121,8 @@ impl Drop for Flight<'_> {
 pub struct ChunkCache {
     dir: PathBuf,
     keys: Keys,
-    max_bytes: u64,
+    /// The bound in bytes. [`ChunkCache::set_limit`] changes it while the cache runs.
+    max_bytes: AtomicU64,
     lru: Mutex<Lru>,
     flights: Flights,
     /// The last write failed. One warning marks the start of the failures, not each one.
@@ -147,7 +148,7 @@ impl ChunkCache {
         let cache = Self {
             dir,
             keys,
-            max_bytes,
+            max_bytes: AtomicU64::new(max_bytes),
             lru: Mutex::new(lru),
             flights: Mutex::new(HashMap::new()),
             write_failing: std::sync::atomic::AtomicBool::new(false),
@@ -163,6 +164,19 @@ impl ChunkCache {
     /// Bytes the cache holds.
     pub fn bytes(&self) -> u64 {
         self.lru().bytes
+    }
+
+    /// The bound in bytes.
+    pub fn limit(&self) -> u64 {
+        self.max_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Changes the bound, and evicts the least recently used chunks above it. 0 empties the
+    /// cache. A read that has a file open keeps its data: the unlink frees the space at its close.
+    pub async fn set_limit(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes, Ordering::SeqCst);
+        let evicted = self.lru().evict_over(max_bytes);
+        self.remove_files(&evicted).await;
     }
 
     fn path(&self, id: ChunkId) -> PathBuf {
@@ -218,7 +232,7 @@ impl ChunkCache {
     pub async fn insert(&self, id: ChunkId, data: &[u8]) -> Result<()> {
         let size = data.len() as u64;
 
-        if size > self.max_bytes || self.lru().touch(id) {
+        if size > self.limit() || self.lru().touch(id) {
             return Ok(());
         }
 
@@ -237,7 +251,7 @@ impl ChunkCache {
         let evicted = {
             let mut lru = self.lru();
             lru.insert(id, size);
-            lru.evict_over(self.max_bytes)
+            lru.evict_over(self.limit())
         };
         self.remove_files(&evicted).await;
         Ok(())
@@ -481,5 +495,64 @@ mod tests {
 
         assert_eq!(waiter.await.unwrap().unwrap(), data);
         assert!(cache.flights.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn test_lower_limit_evicts_the_oldest_files_and_zero_empties() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let chunks: Vec<_> = (0..3).map(|n| chunk(n, 100)).collect();
+        for (id, data) in &chunks {
+            cache.insert(*id, data).await.unwrap();
+        }
+
+        cache.set_limit(150).await;
+        let after_trim = cache.bytes();
+        let oldest_gone = !path_of(dir.path(), chunks[0].0).exists();
+        let newest_kept = cache.get(chunks[2].0).await.unwrap().is_some();
+        cache.set_limit(0).await;
+
+        assert_eq!(after_trim, 100);
+        assert!(oldest_gone && newest_kept);
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.limit(), 0);
+        for (id, _) in &chunks {
+            assert!(!path_of(dir.path(), *id).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_keeps_to_the_new_limit_and_a_raise_lets_it_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let (a, data_a) = chunk(1, 100);
+        let (b, data_b) = chunk(2, 100);
+
+        cache.set_limit(50).await;
+        cache.insert(a, &data_a).await.unwrap();
+        let at_50 = cache.bytes();
+        cache.set_limit(1 << 20).await;
+        cache.insert(a, &data_a).await.unwrap();
+        cache.insert(b, &data_b).await.unwrap();
+
+        assert_eq!(at_50, 0);
+        assert_eq!(cache.bytes(), 200);
+    }
+    #[tokio::test]
+    async fn test_reader_with_an_open_file_keeps_its_data_after_a_trim() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let (id, data) = chunk(1, 100);
+        cache.insert(id, &data).await.unwrap();
+        let mut open = std::fs::File::open(path_of(dir.path(), id)).unwrap();
+
+        cache.set_limit(0).await;
+        let mut read = Vec::new();
+        open.read_to_end(&mut read).unwrap();
+
+        assert_eq!(read, data);
+        assert!(!path_of(dir.path(), id).exists());
+        assert_eq!(cache.bytes(), 0);
     }
 }

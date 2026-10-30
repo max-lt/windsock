@@ -326,9 +326,19 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   last of two parts of one number wins. A cut body or a failed check leaves no part, and a start
   removes the temporary files of a crash. Measured as for the PUT, with parts of 100 MiB at
   200 KiB/s: 250 writers raised the daemon from 40 MiB to 102 MiB, about 250 KiB per writer.
-- A CopyObject holds the whole object in memory, about 3 times its size: a PUT of 1 GiB held in
-  memory raised the daemon to 3.1 GiB. No limit covers them all together. Size the memory for
-  them, or put a limit in front of the proxy.
+- A crash after a part got its name and before the removal of the part of the same number that it
+  replaced leaves two parts of one number. The next start keeps the newest by modification time.
+  If the clock stepped back between the two writes, it keeps the older one; the new part had no
+  ack, so its client sends it again.
+- A CopyObject reads its source as a GET does, one piece at a time with room in the read budget
+  (the first piece waits 5 s, then `503 SlowDown`), and writes it to a spool file in pieces of at
+  most 1 MiB. It takes the buffer room of the whole object first (`503 SlowDown` with no room).
+  The reader fixes the source version at the start: a delete or an overwrite of the source during
+  the copy does not change what it copies. A source that is still only in the buffer works. A
+  copy onto itself (metadata `REPLACE`) works. A client that goes away drops the spool file.
+  Measured on macOS, release build, a flushed source of 1 GiB: one copy took 2.2 s, and 8 copies
+  at once 3.9 s. The live memory of a copy is one read piece and one 1 MiB piece; the RSS rose by
+  about 250 MiB, which vmmap shows as freed large blocks that the allocator keeps.
 
 ## Scale
 

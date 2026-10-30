@@ -110,16 +110,48 @@ async fn copy_object<R: Remote + 'static>(
         ));
     }
 
-    let object = state.engine.get(source_bucket, source_key, None).await?;
-    let metadata = if replace {
-        metadata(headers)?
-    } else {
-        object.info.metadata
-    };
-    let info = state
+    // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
+    let mut room = Some(state.engine.read_room(Some(FIRST_PIECE_WAIT)).await?);
+    // The reader fixes the source version now: a later delete or overwrite of the source does
+    // not change what the copy reads.
+    let mut reader = state
         .engine
-        .put(bucket, key, object.data, metadata, WriteMode::Overwrite)
+        .get_reader(source_bucket, source_key, None)
         .await?;
+    let metadata = match replace {
+        true => metadata(headers)?,
+        false => reader.info.metadata.clone(),
+    };
+    let mut spool = state
+        .engine
+        .begin_put_sized(
+            bucket,
+            key,
+            metadata,
+            WriteMode::Overwrite,
+            reader.info.size,
+        )
+        .await?;
+    loop {
+        let held = match room.take() {
+            Some(room) => room,
+            None => state.engine.read_room(None).await?,
+        };
+        let Some(piece) = state.engine.next_piece(&mut reader).await? else {
+            break;
+        };
+        for part in piece.chunks(PUT_PIECE) {
+            state.engine.spool_write(&mut spool, part).await?;
+        }
+        engine::sim::crash_point(Point::CopyPiece)?;
+        drop(held);
+    }
+    if spool.content_hash() != reader.info.content_hash {
+        return Err(S3Error::internal(
+            "the copied data does not match the hash of its source",
+        ));
+    }
+    let info = state.engine.finish_put(spool).await?;
 
     xml_reply(xml::copy_result(&etag(&info), info.last_modified))
 }

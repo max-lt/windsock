@@ -2844,3 +2844,119 @@ async fn test_part_body_reaches_its_temporary_file_before_the_body_ends() {
     assert_eq!(written, 1 << 20);
     assert_eq!(part, StatusCode::OK);
 }
+
+fn copy_call(destination: &'static str, source: &'static str) -> Call<'static> {
+    call("PUT", destination).header("x-amz-copy-source", source)
+}
+
+#[tokio::test]
+async fn test_large_copy_streams_from_a_buffered_and_a_flushed_source() {
+    let server = with_bucket().await;
+    let data = large_object();
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+
+    let buffered = run(&server, copy_call("/bkt/from-buffer", "/bkt/src")).await;
+    server.engine.flush().await.unwrap();
+    let flushed = run(&server, copy_call("/bkt/from-remote", "/bkt/src")).await;
+    let reads = [
+        run(&server, call("GET", "/bkt/from-buffer")).await,
+        run(&server, call("GET", "/bkt/from-remote")).await,
+    ];
+
+    for copy in [&buffered, &flushed] {
+        assert_eq!(copy.status, StatusCode::OK, "{}", copy.text());
+        assert!(
+            copy.text()
+                .contains(&blake3::hash(&data).to_hex().to_string())
+        );
+    }
+    for read in reads {
+        assert!(read.body == data);
+    }
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_large_copy_onto_itself_replaces_the_metadata() {
+    let server = with_bucket().await;
+    let data = large_object();
+    sized_put(&server, "self", data.clone(), data.len(), None).await;
+
+    let copy = run(
+        &server,
+        copy_call("/bkt/self", "/bkt/self")
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header("x-amz-meta-color", "blue"),
+    )
+    .await;
+    let read = run(&server, call("GET", "/bkt/self")).await;
+
+    assert_eq!(copy.status, StatusCode::OK, "{}", copy.text());
+    assert!(read.body == data);
+    assert_eq!(read.header("x-amz-meta-color"), Some("blue"));
+}
+
+#[tokio::test]
+async fn test_copy_with_no_buffer_room_gets_503_and_writes_nothing() {
+    let config = Config {
+        buffer_limit: 6 << 20,
+        ..Config::default()
+    };
+    let server = bucket_on(server_with(config).await).await;
+    let data = vec![4u8; 4 << 20];
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+
+    let full = run(&server, copy_call("/bkt/dst", "/bkt/src")).await;
+    let read = run(&server, call("GET", "/bkt/dst")).await;
+
+    assert_eq!(
+        full.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        full.text()
+    );
+    assert_eq!(full.xml("Code").unwrap(), "SlowDown");
+    assert_eq!(read.status, StatusCode::NOT_FOUND);
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_copy_with_no_read_room_gets_503_after_the_first_piece_wait() {
+    let server = small_budget().await;
+    let data = vec![3u8; 2 * engine::READ_STEP];
+    run(&server, call("PUT", "/bkt/src").body(data)).await;
+    let mut held = Vec::new();
+    for _ in 0..engine::MIN_READ_BUDGET as usize / engine::READ_STEP {
+        held.push(get_response(&server, "/bkt/src").await);
+    }
+
+    let started = std::time::Instant::now();
+    let full = run(&server, copy_call("/bkt/dst", "/bkt/src")).await;
+    drop(held);
+    let after = run(&server, copy_call("/bkt/dst", "/bkt/src")).await;
+
+    assert_eq!(
+        full.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        full.text()
+    );
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert_eq!(after.status, StatusCode::OK, "{}", after.text());
+}
+
+#[tokio::test]
+async fn test_crash_during_a_copy_leaves_no_spool_and_no_object() {
+    let server = with_bucket().await;
+    let data = large_object();
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+
+    engine::sim::arm_crash(Some(Point::CopyPiece));
+    let crashed = run(&server, copy_call("/bkt/dst", "/bkt/src")).await;
+    engine::sim::arm_crash(None);
+    let read = run(&server, call("GET", "/bkt/dst")).await;
+
+    assert_eq!(crashed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(read.status, StatusCode::NOT_FOUND);
+    assert_eq!(spool_files(&server), 0);
+}

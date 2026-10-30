@@ -44,6 +44,8 @@ pub enum Point {
     PartRename,
     /// An upload part has its name; the part of the same number that it replaces is still there.
     PartReplace,
+    /// A copy wrote one piece of its source to its spool.
+    CopyPiece,
 }
 
 #[cfg(feature = "sim")]

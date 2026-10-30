@@ -1,6 +1,5 @@
 //! Request authentication: SigV4 on the head, then the payload against its signed hash.
 
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -13,6 +12,7 @@ use bytes::Bytes;
 use remote::Remote;
 use tracing::debug;
 
+use crate::keys::{self, KeyStore};
 use crate::{AppState, Caller, S3Error, StreamedBody, presign};
 use s3proto::sigv4::{self, Authorization, ChunkSigner};
 use s3proto::time::parse_amz_date;
@@ -41,22 +41,12 @@ fn signature_mismatch() -> S3Error {
     )
 }
 
-fn verify_head(
-    parts: &Parts,
-    keys: &HashMap<String, String>,
-    now: u64,
-) -> Result<Verified, S3Error> {
+async fn verify_head(parts: &Parts, keys: &dyn KeyStore, now: u64) -> Result<Verified, S3Error> {
     let authorization = header(&parts.headers, "authorization")
         .and_then(Authorization::parse)
         .ok_or_else(|| S3Error::access_denied("a SigV4 Authorization header is required"))?;
 
-    let secret = keys.get(&authorization.access_key).ok_or_else(|| {
-        S3Error::new(
-            "InvalidAccessKeyId",
-            StatusCode::FORBIDDEN,
-            "the access key does not exist",
-        )
-    })?;
+    let secret = keys::secret_of(keys, &authorization.access_key).await?;
 
     let timestamp = header(&parts.headers, "x-amz-date")
         .ok_or_else(|| S3Error::access_denied("x-amz-date is required"))?;
@@ -94,7 +84,8 @@ fn verify_head(
         payload_hash,
     );
 
-    let signing_key = sigv4::signing_key(secret, &authorization.date, &authorization.region);
+    let signing_key =
+        sigv4::signing_key(secret.expose(), &authorization.date, &authorization.region);
     let scope = authorization.scope();
     let expected = sigv4::signature(&signing_key, timestamp, &scope, &canonical);
 
@@ -245,11 +236,12 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
                     format!("the clock is ahead, presigned requests resume in {wait_secs} s"),
                 ));
             }
-            let presigned = presign::verify(&parts, &state.keys, unix_now(), MAX_SKEW_SECS)?;
+            let presigned =
+                presign::verify(&parts, state.keys.as_ref(), unix_now(), MAX_SKEW_SECS).await?;
             (presigned.access_key, None)
         }
         false => {
-            let verified = verify_head(&parts, &state.keys, unix_now())?;
+            let verified = verify_head(&parts, state.keys.as_ref(), unix_now()).await?;
             let signer = ChunkSigner {
                 key: verified.signing_key,
                 timestamp: verified.timestamp,

@@ -11,7 +11,7 @@ use ed25519_dalek::SigningKey;
 use engine::{Config, Engine};
 use http_body_util::BodyExt;
 use remote::DirRemote;
-use s3api::{S3Config, sigv4};
+use s3api::{KeyStore, KeyStoreError, S3Config, Secret, sigv4};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -2196,4 +2196,87 @@ async fn test_buffered_bodies_with_no_length_stop_at_the_body_limit() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
         assert_eq!(reply.xml("Code").unwrap(), "EntityTooLarge");
     }
+}
+
+/// Keys that change while the server runs, as in a console. `down` makes every lookup fail.
+#[derive(Default)]
+struct LiveKeys {
+    keys: std::sync::Mutex<HashMap<String, String>>,
+    down: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl KeyStore for LiveKeys {
+    async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(KeyStoreError::new("the key database is locked"));
+        }
+        let keys = self.keys.lock().unwrap();
+        Ok(keys
+            .get(access_key)
+            .map(|secret| Secret::new(secret.clone())))
+    }
+}
+
+/// A bucket on a server whose keys come from `store`.
+async fn with_key_store(store: Arc<LiveKeys>) -> Server {
+    let mut server = with_bucket().await;
+    store
+        .keys
+        .lock()
+        .unwrap()
+        .insert(ACCESS.to_string(), SECRET.to_string());
+    let mut config = S3Config::new(HashMap::new(), server._dir.path().join("uploads"));
+    config.uploads = server.uploads.clone();
+    config.keys = store;
+    server.app = s3api::router(server.engine.clone(), config);
+    server
+}
+
+#[tokio::test]
+async fn test_revoked_key_fails_at_the_next_request() {
+    let store = Arc::new(LiveKeys::default());
+    let server = with_key_store(store.clone()).await;
+    put(&server, "k", "data").await;
+    let sign = Presign::new("GET", "/bkt/k");
+
+    let before = run(&server, call("GET", "/bkt/k")).await;
+    let presigned_before = presigned(&server, &sign, "GET", "/bkt/k").await;
+    store.keys.lock().unwrap().remove(ACCESS);
+    let after = run(&server, call("GET", "/bkt/k")).await;
+    let presigned_after = presigned(&server, &sign, "GET", "/bkt/k").await;
+
+    assert_eq!(before.status, StatusCode::OK);
+    assert_eq!(presigned_before.status, StatusCode::OK);
+    for reply in [after, presigned_after] {
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(reply.xml("Code").unwrap(), "InvalidAccessKeyId");
+    }
+}
+
+#[tokio::test]
+async fn test_key_store_failure_denies_the_request_with_503() {
+    let store = Arc::new(LiveKeys::default());
+    let server = with_key_store(store.clone()).await;
+    put(&server, "k", "data").await;
+    let sign = Presign::new("GET", "/bkt/k");
+
+    store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let get = run(&server, call("GET", "/bkt/k")).await;
+    let write = put(&server, "new", "data").await;
+    let presigned_get = presigned(&server, &sign, "GET", "/bkt/k").await;
+    store.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    let read = run(&server, call("GET", "/bkt/new")).await;
+
+    for reply in [get, write, presigned_get] {
+        assert_eq!(
+            reply.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            reply.text()
+        );
+        assert_eq!(reply.xml("Code").unwrap(), "ServiceUnavailable");
+        assert!(!reply.text().contains("locked"), "{}", reply.text());
+    }
+    assert_eq!(read.status, StatusCode::NOT_FOUND);
 }

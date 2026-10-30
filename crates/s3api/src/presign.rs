@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use tracing::debug;
 
 use crate::S3Error;
+use crate::keys::KeyStore;
 use s3proto::sigv4;
 use s3proto::time::parse_amz_date;
 
@@ -177,9 +178,9 @@ fn expires(value: &str) -> Result<u64, S3Error> {
 
 /// Checks a presigned request at `now` (Unix seconds). The messages name a parameter, never
 /// its value: the query holds the signature.
-pub(crate) fn verify(
+pub(crate) async fn verify(
     parts: &Parts,
-    keys: &HashMap<String, String>,
+    keys: &dyn KeyStore,
     now: u64,
     max_skew: u64,
 ) -> Result<Presigned, S3Error> {
@@ -229,13 +230,7 @@ pub(crate) fn verify(
         return Err(S3Error::access_denied("Request has expired"));
     }
 
-    let secret = keys.get(access_key).ok_or_else(|| {
-        S3Error::new(
-            "InvalidAccessKeyId",
-            StatusCode::FORBIDDEN,
-            "the access key does not exist",
-        )
-    })?;
+    let secret = crate::keys::secret_of(keys, access_key).await?;
     let payload_hash = payload_hash(&parts.headers)?;
     let headers: Vec<(String, String)> = parts
         .headers
@@ -253,7 +248,7 @@ pub(crate) fn verify(
         &signed_headers,
         payload_hash,
     );
-    let key = sigv4::signing_key(secret, date, region);
+    let key = sigv4::signing_key(secret.expose(), date, region);
     let scope = format!("{date}/{region}/s3/aws4_request");
     let expected = sigv4::signature(&key, timestamp, &scope, &canonical);
     if !sigv4::same_signature(&expected, signature) {
@@ -296,10 +291,11 @@ mod tests {
         assert!(decode("a%+f").is_none());
     }
 
-    #[test]
-    fn test_errors_never_hold_the_signature() {
+    #[tokio::test]
+    async fn test_errors_never_hold_the_signature() {
         let signature = "5ec2e7".repeat(10) + "abcd";
-        let keys = HashMap::from([("KEY".to_string(), "secret".to_string())]);
+        let keys =
+            crate::StaticKeys::new(HashMap::from([("KEY".to_string(), "secret".to_string())]));
         let query = |expires: &str| {
             format!(
                 "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=KEY%2F20261030%2Fus-east-1%2Fs3%2F\
@@ -319,7 +315,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let (parts, ()) = request.into_parts();
-            let Err(error) = verify(&parts, &keys, now, 900) else {
+            let Err(error) = verify(&parts, &keys, now, 900).await else {
                 panic!("{query} passed");
             };
 

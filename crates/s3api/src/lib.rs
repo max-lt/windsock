@@ -1,11 +1,12 @@
 //! S3 API over the engine, with axum.
 //!
-//! Authentication is SigV4 in the `Authorization` header. The keys come from the
-//! configuration, and every key can reach every bucket.
+//! Authentication is SigV4 in the `Authorization` header or in the query. The keys come from a
+//! [`KeyStore`], and every key can reach every bucket.
 
 mod auth;
 mod error;
 mod handlers;
+mod keys;
 mod list;
 mod multipart;
 mod presign;
@@ -23,6 +24,7 @@ use engine::Engine;
 use remote::Remote;
 
 pub use error::S3Error;
+pub use keys::{KeyStore, KeyStoreError, Secret, StaticKeys};
 pub use s3proto::sigv4;
 
 pub use multipart::Uploads;
@@ -35,8 +37,8 @@ const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 pub const DEFAULT_PARTS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
 pub struct S3Config {
-    /// Access key to secret key.
-    pub keys: HashMap<String, String>,
+    /// The secret keys, asked on every request.
+    pub keys: Arc<dyn KeyStore>,
     /// The multipart uploads. Call [`Uploads::start`] before the first request.
     pub uploads: Arc<Uploads>,
     /// Requests with a larger body fail.
@@ -44,9 +46,10 @@ pub struct S3Config {
 }
 
 impl S3Config {
+    /// A configuration with `keys` fixed at start: access key to secret key.
     pub fn new(keys: HashMap<String, String>, uploads_dir: impl Into<PathBuf>) -> Self {
         Self {
-            keys,
+            keys: Arc::new(StaticKeys::new(keys)),
             uploads: Arc::new(Uploads::new(uploads_dir, DEFAULT_PARTS_LIMIT)),
             max_body: DEFAULT_MAX_BODY,
         }
@@ -68,7 +71,7 @@ pub(crate) struct Caller(pub String);
 
 pub(crate) struct AppState<R> {
     engine: Arc<Engine<R>>,
-    keys: Arc<HashMap<String, String>>,
+    keys: Arc<dyn KeyStore>,
     uploads: Arc<Uploads>,
     max_body: usize,
 }
@@ -88,7 +91,7 @@ impl<R> Clone for AppState<R> {
 pub fn router<R: Remote + 'static>(engine: Arc<Engine<R>>, config: S3Config) -> Router {
     let state = AppState {
         engine,
-        keys: Arc::new(config.keys),
+        keys: config.keys,
         uploads: config.uploads,
         max_body: config.max_body,
     };

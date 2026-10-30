@@ -289,13 +289,17 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   while fewer than 32 run for read-ahead. Otherwise the GET goes on one piece at a time. A client
   that goes away stops its read-ahead tasks. The pieces leave in order, and a failed fetch cuts the
   response when its piece is due. One GET holds at most 1 + `engine.read_ahead` pieces.
+- A client that needs speed from the remote sends GETs of whole objects, or ranges of 32 MiB or
+  more: a range of 8 MiB gets no read-ahead.
 - Read-ahead measured in release on macOS, a remote with 200 ms per read, cache off, a 1 GiB
   object, `engine.read_ahead` 0 then 3. One GET: 61.1 s then 15.9 s, RSS growth 22 MiB then
   90 MiB. Four GETs of 256 MiB one after the other: 61.6 s then 17.4 s. Four clients that each
-  read 8 MiB ranges in order: 86.3 s then 85.3 s, because a range of two pieces starts no
-  read-ahead. On a 256 MiB read budget, 250 readers at 200 KiB/s get 173 to 181 refusals (503) at
-  depth 0 and 172 to 186 at depth 3: readers this slow start no read-ahead. 8 fast readers and 242
-  readers at 200 KiB/s get 173 and 178 refusals at depth 0, 172 and 174 at depth 3.
+  read 8 MiB ranges in order: 86.3 s then 85.3 s, RSS growth 83 MiB then 58 MiB, because a range
+  of two pieces starts no read-ahead. The same with 32 MiB ranges: 67.8 s then 29.6 s, RSS growth
+  89 MiB then 253 MiB. On a 256 MiB read budget, 250 readers at 200 KiB/s get 178 to 181
+  refusals (503) at depth 0 and 175 to 186 at depth 3: readers this slow start no read-ahead. 8
+  fast readers and 242 readers at 200 KiB/s get 173 and 178 refusals at depth 0, 172 and 174 at
+  depth 3.
 - Measured on macOS, one daemon, a 1 GiB object, readers at 200 KiB/s: an idle daemon holds
   17 MiB; 64 readers peak at 664 MiB, 250 readers at 1.6 GiB, and 288 connected readers at
   2.2 GiB, so 5 to 10 MiB per reader. After the readers stop, the allocator keeps about 1.3 GiB,

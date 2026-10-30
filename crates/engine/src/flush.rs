@@ -171,6 +171,10 @@ impl<R: Remote + 'static> Engine<R> {
             let mut reader = SegmentReader::open(&path).await?;
 
             while let Some(record) = reader.next(&path).await? {
+                let data = match record.head.op {
+                    Op::Put { .. } => buffer::read_record_data(&path, &record).await?,
+                    _ => Vec::new(),
+                };
                 let next = match record.head.op {
                     Op::Put {
                         bucket,
@@ -179,20 +183,19 @@ impl<R: Remote + 'static> Engine<R> {
                         content_hash,
                     } => {
                         let policy = self.config.policy(&bucket, &key);
-                        let added =
-                            planner.add(&record.data, content_hash, metadata, policy, |id| {
-                                if !dedup {
-                                    return Ok(None);
-                                }
-                                let stored = self.stored_chunk(id);
-                                if let Ok(Some(_)) = &stored {
-                                    crate::sim::count_dedup();
-                                }
-                                stored
-                            })?;
+                        let added = planner.add(&data, content_hash, metadata, policy, |id| {
+                            if !dedup {
+                                return Ok(None);
+                            }
+                            let stored = self.stored_chunk(id);
+                            if let Ok(Some(_)) = &stored {
+                                crate::sim::count_dedup();
+                            }
+                            stored
+                        })?;
                         self.upload_packs(added.closed).await?;
                         if policy.cache == CacheMode::ReadWrite {
-                            self.cache_written(&record.data, &added.chunks).await;
+                            self.cache_written(&data, &added.chunks).await;
                         }
                         objects += 1;
                         Planned::Put {

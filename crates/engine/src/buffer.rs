@@ -35,6 +35,8 @@ const MAX_HEAD_LEN: u32 = 64 * 1024;
 
 /// Larger data is garbage: an S3 PUT holds 5 GiB at most.
 pub(crate) const MAX_DATA_LEN: u64 = 5 << 30;
+/// The largest piece of data that a read of the buffer holds at once.
+const READ_PIECE: u64 = 1 << 20;
 
 const SEGMENT_SUFFIX: &str = ".log";
 
@@ -149,9 +151,9 @@ pub(crate) fn encode_head(head: &Head) -> Vec<u8> {
 /// A record read back from a segment.
 pub(crate) struct Record {
     pub head: Head,
-    pub data: Vec<u8>,
-    /// Position of `data` in the segment file.
+    /// Position of the data in the segment file, and its length.
     pub data_offset: u64,
+    pub data_len: u64,
     /// Where the record starts and ends in the segment file.
     pub span: Range<u64>,
     /// The blake3 hash of the head bytes: the identity of the record.
@@ -248,11 +250,20 @@ impl SegmentReader {
         if data_len > MAX_DATA_LEN || !fits {
             return bad(None);
         }
-        let mut data = vec![0u8; data_len as usize];
+        // The data is hashed in pieces: the memory of a read does not grow with the record.
+        let mut hasher = blake3::Hasher::new();
+        let mut piece = vec![0u8; data_len.min(READ_PIECE) as usize];
+        let mut left = data_len;
+        while left > 0 {
+            let size = left.min(READ_PIECE) as usize;
+            if !read_full(&mut self.file, &mut piece[..size]).await? {
+                return bad(None);
+            }
+            hasher.update(&piece[..size]);
+            left -= size as u64;
+        }
         let mut prefix = [0u8; HEAD_PREFIX_LEN];
-        if !read_full(&mut self.file, &mut data).await?
-            || !read_full(&mut self.file, &mut prefix).await?
-        {
+        if !read_full(&mut self.file, &mut prefix).await? {
             return bad(None);
         }
         let head_len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
@@ -274,12 +285,12 @@ impl SegmentReader {
         };
         let record = Record {
             head,
-            data,
             data_offset,
+            data_len,
             span: start..end,
             head_hash,
         };
-        match data_matches(&record.head, &record.data) {
+        match data_matches(&record.head, data_len, hasher.finalize().as_bytes()) {
             true => Ok(Read::Record(record)),
             false => Ok(Read::BadData(record)),
         }
@@ -330,11 +341,20 @@ fn decode_head(head_hash: &[u8; 32], head_bytes: &[u8]) -> Option<Head> {
 }
 
 /// A put matches the hash in its head; any other op has no data.
-fn data_matches(head: &Head, data: &[u8]) -> bool {
+fn data_matches(head: &Head, data_len: u64, data_hash: &[u8; 32]) -> bool {
     match &head.op {
-        Op::Put { content_hash, .. } => blake3::hash(data).as_bytes() == content_hash,
-        _ => data.is_empty(),
+        Op::Put { content_hash, .. } => data_hash == content_hash,
+        _ => data_len == 0,
     }
+}
+
+/// The data of `record`, read again from its segment.
+pub(crate) async fn read_record_data(path: &Path, record: &Record) -> Result<Vec<u8>, EngineError> {
+    let mut file = File::open(path).await?;
+    file.seek(SeekFrom::Start(record.data_offset)).await?;
+    let mut data = vec![0u8; record.data_len as usize];
+    file.read_exact(&mut data).await?;
+    Ok(data)
 }
 
 /// Fills `buf`. Returns `false` when the file ends first.
@@ -573,12 +593,7 @@ impl Buffer {
         let end = loop {
             match reader.read().await? {
                 Read::Record(record) => {
-                    self.track(
-                        seq,
-                        &record.head,
-                        record.data_offset,
-                        record.data.len() as u64,
-                    );
+                    self.track(seq, &record.head, record.data_offset, record.data_len);
                     records += 1;
                 }
                 // Not tracked: the open moves it to the quarantine and fails.
@@ -1075,38 +1090,38 @@ async fn quarantine_late_until(
     for seq in list_segments(dir).await? {
         let path = segment_path(dir, seq);
         let mut reader = SegmentReader::open(&path).await?;
-        let (mut late, mut young) = (Vec::new(), Vec::new());
-        // A torn tail of the last segment is cut at open, as in a replay.
-        while let Ok(Some(record)) = reader.next(&path).await {
-            let bytes = encode_record(&record.head, &record.data);
-            match record.head.time < limit && young.is_empty() {
-                true => {
-                    moved.push(record.head.op.target());
-                    late.extend(bytes);
-                }
-                false => young.extend(bytes),
+        // Acks rise in buffer order: the late records are a prefix. The open cut a torn tail.
+        let mut late = Vec::new();
+        while let Read::Record(record) = reader.read().await? {
+            if record.head.time >= limit {
+                break;
             }
+            moved.push(record.head.op.target());
+            late.push(record.span);
         }
+        let len = tokio::fs::metadata(&path).await?.len();
         // An empty segment, such as the active one of a past open, holds no boundary.
-        if late.is_empty() && young.is_empty() {
+        if len == 0 {
             continue;
         }
         if late.is_empty() {
             break;
         }
+        let young = late.last().is_some_and(|span| span.end < len);
 
         create_quarantine(quarantine).await?;
-        create_durable(quarantine, &format!("{seq:020}"), &late).await?;
+        let target = quarantine.join(format!("{seq:020}{SEGMENT_SUFFIX}"));
+        copy_spans_durable(&path, &late, quarantine, &target).await?;
         check(&mut step)?;
-        match young.is_empty() {
-            true => {
+        match young {
+            false => {
                 remove_if_present(&path).await?;
                 sync_dir(dir).await?;
             }
-            false => write_durable(dir, &path, &young).await?,
+            true => remove_spans(dir, seq, &late).await?,
         }
         check(&mut step)?;
-        if !young.is_empty() {
+        if young {
             break;
         }
     }
@@ -1355,6 +1370,7 @@ impl QuarantineReader {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let data = read_record_data(path, &record).await?;
             return Ok(Some(QuarantinedRecord {
                 file,
                 number: *number,
@@ -1364,7 +1380,7 @@ impl QuarantineReader {
                     hlc: record.head.time,
                     corrupt,
                 },
-                data: record.data,
+                data,
             }));
         }
     }
@@ -1430,20 +1446,6 @@ async fn free_name(dir: &Path, stem: &str, suffix: &str) -> Result<PathBuf, Engi
         }
         n += 1;
     }
-}
-
-/// Writes `bytes` to a new quarantine file `<stem>.log`. A move starts only with no segment in
-/// the quarantine, so the name is free; a taken name fails, as a quarantine file is never
-/// replaced.
-async fn create_durable(dir: &Path, stem: &str, bytes: &[u8]) -> Result<(), EngineError> {
-    let path = dir.join(format!("{stem}{SEGMENT_SUFFIX}"));
-    if tokio::fs::try_exists(&path).await? {
-        return Err(EngineError::Corrupt(format!(
-            "{}: a quarantine file is never replaced",
-            path.display()
-        )));
-    }
-    write_durable(dir, &path, bytes).await
 }
 
 /// Writes `bytes` to `path` through a fsynced temporary file and a rename, then fsyncs `dir`.
@@ -1701,7 +1703,10 @@ mod tests {
         assert_eq!(sealed.len(), 1);
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].head, put("a", b"one"));
-        assert_eq!(read[1].data, b"two");
+        let data = read_record_data(&segment_path(dir.path(), sealed[0]), &read[1])
+            .await
+            .unwrap();
+        assert_eq!(data, b"two");
     }
 
     #[tokio::test]

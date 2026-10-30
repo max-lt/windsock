@@ -182,7 +182,9 @@ checks the free disk for that value. A restart goes back to `cache_bytes`. The o
 first. A read that has a chunk file open keeps its data. The next read of an evicted chunk goes to
 the remote. The directory `data/admin` has mode 0700 and the socket 0600: only the user of the
 daemon can use them. At start, the daemon refuses a `data/admin` that is a link, belongs to another
-user or that other users can open, and replaces a socket that a stopped daemon left.
+user or that other users can open, and replaces a socket that a stopped daemon left. A Unix socket
+path takes at most 103 bytes: with a longer `data_dir/admin/admin.sock`, the start stops with an
+error that asks for a shorter `data_dir`.
 
 ## Configuration
 

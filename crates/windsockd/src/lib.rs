@@ -30,7 +30,7 @@ use zeroize::Zeroizing;
 pub use config::{Config, KeySource};
 pub use engine::{BucketInfo, CacheState, ObjectInfo};
 pub use model::NodeId;
-pub use node::{Node, NodeStatus, Page};
+pub use node::{MAX_PAGE, Node, NodeStatus, Page};
 pub use s3api::KeyStore;
 
 use config::RemoteConfig;

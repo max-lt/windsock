@@ -18,6 +18,8 @@ use crate::Node;
 
 const ADMIN_DIR: &str = "admin";
 const SOCKET: &str = "admin.sock";
+/// The longest socket path: macOS keeps 104 bytes for it with the final NUL, Linux 108.
+const MAX_SOCKET_PATH: usize = 103;
 /// A request or a reply is one short line.
 const MAX_LINE: u64 = 128;
 /// A client that sends no full line in this time is dropped.
@@ -51,6 +53,15 @@ fn parse(line: &str) -> Result<Request, String> {
 /// Call it once the engine is open: the engine lock keeps a second daemon out of this data
 /// directory, so the socket found here is never the one of a live daemon.
 pub(crate) fn prepare(data_dir: &Path) -> Result<PathBuf> {
+    let path = socket_path(data_dir);
+    let length = path.as_os_str().len();
+    if length > MAX_SOCKET_PATH {
+        bail!(
+            "the admin socket {} is {length} bytes, over the Unix limit of {MAX_SOCKET_PATH}: use a \
+             shorter data_dir",
+            path.display()
+        );
+    }
     let dir = data_dir.join(ADMIN_DIR);
     let uid = rustix::process::getuid().as_raw();
     match std::fs::symlink_metadata(&dir) {
@@ -76,7 +87,6 @@ pub(crate) fn prepare(data_dir: &Path) -> Result<PathBuf> {
         Ok(_) => {}
     }
 
-    let path = dir.join(SOCKET);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -227,5 +237,16 @@ mod tests {
         assert!(errors[1].contains("not a link"), "{}", errors[1]);
         assert!(errors[2].contains("not a socket"), "{}", errors[2]);
         assert!(path.exists());
+    }
+    #[test]
+    fn test_prepare_refuses_a_socket_path_over_the_limit_and_names_the_fix() {
+        let base = tempfile::tempdir().unwrap();
+        let data = base.path().join("d".repeat(MAX_SOCKET_PATH));
+        std::fs::create_dir_all(&data).unwrap();
+
+        let error = prepare(&data).unwrap_err().to_string();
+
+        assert!(error.contains("shorter data_dir"), "{error}");
+        assert!(!data.join(ADMIN_DIR).exists());
     }
 }

@@ -171,3 +171,45 @@ async fn test_node_handle_reads_state_and_sets_the_cache_limit() {
     assert_eq!((trimmed.limit, trimmed.bytes), (0, 0));
     assert!(too_high.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_page_is_capped_whatever_max_the_caller_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let config = config_without_keys(dir.path(), port);
+    let keys = common::test_keys();
+    let store = Arc::new(Keys::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert(keys.0.clone(), keys.1.clone());
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let daemon = tokio::spawn(async move {
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(&config, store, std::future::pending(), on_open).await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&address).await;
+    common::call_at(&address, &keys, "PUT", "/demo", b"").await;
+    for i in 0..=windsockd::MAX_PAGE {
+        let path = format!("/demo/k{i:05}");
+        common::call_at(&address, &keys, "PUT", &path, b"x").await;
+    }
+
+    let first = node.list("demo", "", None, usize::MAX).await.unwrap();
+    let rest = node
+        .list("demo", "", first.next.as_deref(), usize::MAX)
+        .await
+        .unwrap();
+    daemon.abort();
+
+    assert_eq!(windsockd::MAX_PAGE, 1000);
+    assert_eq!(first.objects.len(), windsockd::MAX_PAGE);
+    assert_eq!(first.next.as_deref(), Some("k00999"));
+    assert_eq!(rest.objects.len(), 1);
+    assert_eq!(rest.next, None);
+}

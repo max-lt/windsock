@@ -28,6 +28,9 @@ pub struct NodeStatus {
     pub other_gc_node: Option<NodeId>,
 }
 
+/// The most objects in one page of [`Node::list`], as for S3 ListObjects: a larger `max` gets this.
+pub const MAX_PAGE: usize = 1000;
+
 /// One page of a listing. The ETag of an object is the hex of its `content_hash`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
@@ -75,7 +78,8 @@ impl Node {
         self.0.buckets().await
     }
 
-    /// At most `max` objects of `bucket` under `prefix`, in key order, after the key `after`.
+    /// At most `max` objects of `bucket` under `prefix`, in key order, after the key `after`. A
+    /// `max` over [`MAX_PAGE`] gets [`MAX_PAGE`].
     pub async fn list(
         &self,
         bucket: &str,
@@ -139,7 +143,7 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
             prefix,
             delimiter: None,
             after: after.map(|key| ListAfter::Key(key.to_string())),
-            max_keys: max,
+            max_keys: max.min(MAX_PAGE),
         };
         let page = self.engine.list_page(bucket, &query).await?;
         let objects: Vec<ObjectInfo> = page

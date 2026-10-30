@@ -647,15 +647,21 @@ async fn test_slow_and_endless_bodies_hit_the_attempt_timeout() {
 }
 
 /// A burst of reads shares a capped number of connections.
+/// The descriptor budget holds MAX_IN_FLIGHT connections in use and MAX_IDLE idle ones. A call
+/// frees its slot before hyper puts its connection back in the pool, so the next call can open a
+/// new one: the count of connections opened over the burst can pass MAX_IN_FLIGHT.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_a_burst_of_reads_opens_a_capped_number_of_connections() {
+async fn test_a_burst_of_reads_keeps_a_capped_number_of_connections_open() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let accepted = Arc::new(AtomicU32::new(0));
-    let counter = accepted.clone();
+    let open = Arc::new(AtomicU32::new(0));
+    let most_open = Arc::new(AtomicU32::new(0));
+    let (counter, most) = (open.clone(), most_open.clone());
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            counter.fetch_add(1, Ordering::SeqCst);
+            let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            let counter = counter.clone();
             tokio::spawn(async move {
                 let service = hyper::service::service_fn(|_| async {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -665,6 +671,7 @@ async fn test_a_burst_of_reads_opens_a_capped_number_of_connections() {
                     .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
                     .await
                     .ok();
+                counter.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -680,8 +687,11 @@ async fn test_a_burst_of_reads_opens_a_capped_number_of_connections() {
         assert_eq!(read.await.unwrap().unwrap().unwrap(), "data");
     }
 
-    let opened = accepted.load(Ordering::SeqCst) as usize;
-    assert!(opened <= s3remote::MAX_IN_FLIGHT, "{opened} connections");
+    let most = most_open.load(Ordering::SeqCst) as usize;
+    assert!(
+        most <= s3remote::MAX_IN_FLIGHT + s3remote::MAX_IDLE,
+        "{most} connections open at once"
+    );
 }
 
 #[tokio::test]

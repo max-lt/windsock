@@ -1394,3 +1394,18 @@ async fn test_read_budget_under_its_floor_is_refused_at_open() {
     };
     assert!(reason.contains("read_budget"), "{reason}");
 }
+
+/// A process that embeds the engine spawns its open on a multi-thread runtime.
+#[test]
+fn test_open_future_is_send() {
+    fn send<T: Send>(_: &T) {}
+    let dir = tempfile::tempdir().unwrap();
+    let future = Engine::open(
+        dir.path(),
+        Arc::new(MemoryRemote::default()),
+        SigningKey::from_bytes(&[1; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        Config::default(),
+    );
+    send(&future);
+}

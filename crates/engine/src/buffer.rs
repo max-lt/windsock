@@ -966,7 +966,7 @@ async fn quarantine_late_until(
     dir: &Path,
     quarantine: &Path,
     limit: u64,
-    stop: &mut dyn FnMut(u32) -> bool,
+    stop: &mut (dyn FnMut(u32) -> bool + Send),
 ) -> Result<Vec<String>, EngineError> {
     let mut step = 0;
     let mut check = |step: &mut u32| {

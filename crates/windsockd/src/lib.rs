@@ -1,6 +1,7 @@
 //! The Windsock daemon as a library. The `windsockd` binary calls [`run`]. A process that keeps
 //! the S3 keys itself, such as a console, calls [`serve_with`] with its [`KeyStore`].
 
+mod admin;
 pub mod config;
 mod disk;
 mod listener;
@@ -76,6 +77,12 @@ pub async fn serve_with(
         on_open: Box::new(on_open),
     };
     start(config, Mode::Serve(serving)).await
+}
+
+/// Sets the cache limit of the daemon that runs with `config`, through its admin socket. 0
+/// empties the cache. A restart goes back to `cache_bytes`.
+pub async fn cache_trim(config: &Config, bytes: u64) -> Result<()> {
+    admin::cache_trim(&config.data_dir, bytes).await
 }
 
 /// Checks the storage contract of the remote of `config` once.
@@ -400,7 +407,13 @@ async fn serve<R: Sweep + 'static>(
         parts: config.engine.parts_limit_bytes,
         gc_enabled: config.gc.enabled,
     };
-    on_open(Node::new(engine.clone(), s3.uploads.clone(), limits));
+    let node = Node::new(engine.clone(), s3.uploads.clone(), limits);
+    let socket = admin::prepare(&config.data_dir)?;
+    background.push(tokio::spawn(admin::serve(
+        admin::bind(&socket)?,
+        node.clone(),
+    )));
+    on_open(node);
     let expirer = s3.uploads.clone();
     let max_age = Duration::from_secs(config.uploads_expire_secs);
     background.push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {
@@ -469,6 +482,9 @@ async fn serve<R: Sweep + 'static>(
     // A flush cut by the abort is safe: its intent file finishes it at the next flush.
     for task in background {
         task.abort();
+    }
+    if let Err(e) = std::fs::remove_file(&socket) {
+        warn!(%e, socket = %socket.display(), "cannot remove the admin socket");
     }
 
     outcome

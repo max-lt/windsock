@@ -296,9 +296,10 @@ A daemon keeps these descriptors open. Each count has a cap.
 | Remote connections    | 64 in use, 32 idle                       | `s3remote::MAX_IN_FLIGHT`, `s3remote::MAX_IDLE` |
 | Buffer                | the active segment, the intent, the lock | 2 to 3 in the soak                              |
 | Chunk cache           | one file for each read in progress       | 0 to 1 in the soak                              |
+| Admin socket          | the listener and one request at a time   | `admin::serve`                                  |
 | S3 client connections | `max_connections`, each with one file    | (soft fd limit - 256) / 2                       |
 
-The daemon keeps 256 descriptors for the first four kinds, and 2 for each S3 connection: its
+The daemon keeps 256 descriptors for the first five kinds, and 2 for each S3 connection: its
 socket, and one file that a request can hold at once (a buffer segment, a spool file, a cache file or a
 multipart part). At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
 start, and the error names `ulimit -n`. A `max_connections` that needs more than the soft limit

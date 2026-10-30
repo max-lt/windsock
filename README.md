@@ -169,6 +169,21 @@ frees the buffer disk as the remote takes the segments. Reads go on.
 If the chunk cache disk is full or cannot be written, the proxy logs `cache writes fail, reads go to
 the remote` once, and `cache writes work again` when a write works. Reads go on from the remote.
 
+## Change the cache size of a running proxy
+
+```bash
+windsockd cache-trim /etc/windsock/windsock.toml            # empty the chunk cache
+windsockd cache-trim /etc/windsock/windsock.toml 2147483648 # keep at most 2 GiB
+```
+
+The command reaches the running daemon through `data/admin/admin.sock` and prints the new limit,
+the bytes held and `cache_bytes`. The limit is at most `engine.cache_bytes`, because the start
+checks the free disk for that value. A restart goes back to `cache_bytes`. The oldest chunks go
+first. A read that has a chunk file open keeps its data. The next read of an evicted chunk goes to
+the remote. The directory `data/admin` has mode 0700 and the socket 0600: only the user of the
+daemon can use them. At start, the daemon refuses a `data/admin` that is a link, belongs to another
+user or that other users can open, and replaces a socket that a stopped daemon left.
+
 ## Configuration
 
 `windsockd init` writes all the settings with their default values. Relative paths are relative to

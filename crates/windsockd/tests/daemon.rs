@@ -946,3 +946,88 @@ async fn test_presigned_signature_is_never_logged() {
     }
     assert!(daemon.stop());
 }
+
+/// Files under `dir`, at any depth.
+fn files_under(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .map(|path| match path.is_dir() {
+            true => files_under(&path),
+            false => 1,
+        })
+        .sum()
+}
+
+fn cache_trim(config: &Path, size: Option<&str>) -> std::process::Output {
+    let mut command = Command::new(BIN);
+    command.arg("cache-trim").arg(config);
+    if let Some(size) = size {
+        command.arg(size);
+    }
+    command.output().unwrap()
+}
+
+#[tokio::test]
+async fn test_cache_trim_empties_the_cache_of_the_running_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 100, "enabled = false");
+    let daemon = start(&config, "info");
+    let keys = common::test_keys();
+    call(&daemon, &keys, "PUT", "/demo", b"").await;
+    call(&daemon, &keys, "PUT", "/demo/k", &vec![7; 300_000]).await;
+    let cache = dir.path().join("data/engine/cache");
+    let admin = dir.path().join("data/admin");
+    // The flush puts the written chunks in the cache.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while files_under(&cache) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cached = files_under(&cache);
+
+    let refused = cache_trim(&config, Some("1000000000000000"));
+    let trimmed = cache_trim(&config, None);
+    let read = call(&daemon, &keys, "GET", "/demo/k", b"").await;
+
+    assert!(cached > 0);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cache_bytes"));
+    assert!(
+        trimmed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trimmed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&trimmed.stderr).contains("limit=0"));
+    assert_eq!(files_under(&cache), 0);
+    assert_eq!(read.body, vec![7; 300_000]);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&admin), 0o700);
+    assert_eq!(mode(&admin.join("admin.sock")), 0o600);
+    assert!(daemon.stop());
+    assert!(!admin.join("admin.sock").exists());
+}
+
+#[tokio::test]
+async fn test_daemon_replaces_the_socket_that_a_crash_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote");
+    let config = common::cluster_config(dir.path(), &remote, 100, "enabled = false");
+    start(&config, "info").crash();
+    let left = dir.path().join("data/admin/admin.sock").exists();
+
+    let daemon = start(&config, "info");
+    let trimmed = cache_trim(&config, Some("0"));
+
+    assert!(left);
+    assert!(
+        trimmed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trimmed.stderr)
+    );
+    assert!(daemon.stop());
+}

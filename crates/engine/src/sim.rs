@@ -32,6 +32,12 @@ pub enum Point {
     QuarantineRewrite,
     /// The flush read a put and checked its data. Its chunk pass reads the data again next.
     FlushVerified,
+    /// A multipart complete wrote part of the object to its spool.
+    CompleteAssembly,
+    /// The complete wrote the hash of the object in its claimed upload; the commit comes next.
+    CompleteMarked,
+    /// The object is committed; the parts are still on disk.
+    CompleteCommitted,
 }
 
 #[cfg(feature = "sim")]
@@ -63,7 +69,7 @@ pub fn arm_crash(point: Option<Point>) {
 
 /// Fails once at the armed point. The caller drops the engine, as a kill would.
 #[cfg(feature = "sim")]
-pub(crate) fn crash_point(point: Point) -> Result<()> {
+pub fn crash_point(point: Point) -> Result<()> {
     match ARMED.with(|armed| armed.get()) {
         Some(armed) if armed == point => {
             ARMED.with(|armed| armed.set(None));
@@ -75,7 +81,7 @@ pub(crate) fn crash_point(point: Point) -> Result<()> {
 
 #[cfg(not(feature = "sim"))]
 #[inline(always)]
-pub(crate) fn crash_point(_point: Point) -> Result<()> {
+pub fn crash_point(_point: Point) -> Result<()> {
     Ok(())
 }
 

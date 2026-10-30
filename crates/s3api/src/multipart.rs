@@ -14,7 +14,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use tracing::warn;
+use engine::{Engine, EngineError};
+use remote::Remote;
+use tracing::{info, warn};
 
 use crate::S3Error;
 use crate::xml::PartInfo;
@@ -23,6 +25,11 @@ use crate::xml::PartInfo;
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const META: &str = "meta";
+/// In a claimed upload: the hex blake3 hash of the object that its complete commits next.
+const MARKER: &str = "committing";
+/// Completes that run at one time. Each one holds a part file, a spool file and 1 MiB of
+/// memory; more get 503 SlowDown.
+pub const MAX_COMPLETES: usize = 4;
 const MAX_PART: u16 = 10_000;
 
 fn unix_nanos() -> u64 {
@@ -64,9 +71,11 @@ fn is_upload_id(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The parts of a complete, joined, and the metadata given at initiation.
-pub(crate) struct Assembled {
-    pub data: Vec<u8>,
+/// The part files of a complete in object order, their size, and the metadata given at
+/// initiation.
+pub(crate) struct CompletePlan {
+    pub parts: Vec<PathBuf>,
+    pub size: u64,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -78,6 +87,7 @@ pub struct Uploads {
     held: AtomicU64,
     /// When this process first saw each upload, on its monotonic clock.
     first_seen: Mutex<HashMap<String, Instant>>,
+    completes: tokio::sync::Semaphore,
 }
 
 impl Uploads {
@@ -88,6 +98,7 @@ impl Uploads {
             limit,
             held: AtomicU64::new(0),
             first_seen: Mutex::new(HashMap::new()),
+            completes: tokio::sync::Semaphore::new(MAX_COMPLETES),
         }
     }
 
@@ -102,7 +113,10 @@ impl Uploads {
         };
         while let Some(entry) = entries.next_entry().await.map_err(io)? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(Claim::Complete.suffix()) {
+            // A marked complete may have committed: [`Uploads::settle`] decides with the engine.
+            if let Some(id) = name.strip_suffix(Claim::Complete.suffix())
+                && !entry.path().join(MARKER).exists()
+            {
                 tokio::fs::rename(entry.path(), self.dir.join(id))
                     .await
                     .map_err(io)?;
@@ -111,6 +125,76 @@ impl Uploads {
             }
         }
         self.rescan().await
+    }
+
+    /// Call after [`Uploads::start`], once the engine is open. A complete that a crash stopped
+    /// after its mark ends here: its parts go when the engine holds its object, else its upload
+    /// comes back for another complete.
+    pub async fn settle<R: Remote + 'static>(&self, engine: &Engine<R>) -> Result<(), S3Error> {
+        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(io)? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(Claim::Complete.suffix()) else {
+                continue;
+            };
+            let claimed = entry.path();
+            let marked = tokio::fs::read_to_string(claimed.join(MARKER))
+                .await
+                .map_err(io)?;
+            let bytes = tokio::fs::read(claimed.join(META)).await.map_err(io)?;
+            let meta: UploadMeta = postcard::from_bytes(&bytes)
+                .map_err(|e| S3Error::internal(format!("{}: {e}", claimed.display())))?;
+            let committed = match engine.head(&meta.bucket, &meta.key).await {
+                Ok(info) => hex::encode(info.content_hash) == marked.trim(),
+                Err(EngineError::NoSuchKey { .. } | EngineError::NoSuchBucket(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            info!(
+                upload_id = id,
+                committed, "ended a complete that a crash stopped"
+            );
+            match committed {
+                true => {
+                    self.remove(&claimed).await?;
+                }
+                false => tokio::fs::rename(&claimed, self.dir.join(id))
+                    .await
+                    .map_err(io)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the hash of the object that the complete of `claimed` commits next, durably: a
+    /// start after a crash compares it with the engine.
+    pub(crate) async fn mark(&self, claimed: &Path, content_hash: [u8; 32]) -> Result<(), S3Error> {
+        let path = claimed.join(MARKER);
+        let mut file = tokio::fs::File::create(&path).await.map_err(io)?;
+        file.write_all(hex::encode(content_hash).as_bytes())
+            .await
+            .map_err(io)?;
+        file.sync_all().await.map_err(io)?;
+        tokio::fs::File::open(claimed)
+            .await
+            .map_err(io)?
+            .sync_all()
+            .await
+            .map_err(io)
+    }
+
+    /// A slot for one complete, or 503 SlowDown when [`MAX_COMPLETES`] run.
+    pub(crate) fn complete_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, S3Error> {
+        self.completes.try_acquire().map_err(|_| {
+            S3Error::new(
+                "SlowDown",
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{MAX_COMPLETES} completes run at once: try again"),
+            )
+        })
     }
 
     /// Sets the held bytes to the parts on disk, and returns them.
@@ -281,6 +365,10 @@ impl Uploads {
 
     /// Gives a claimed upload back, after a complete that failed: the client can try again.
     pub(crate) async fn unclaim(&self, upload_id: &str, claimed: &Path) -> Result<(), S3Error> {
+        match tokio::fs::remove_file(claimed.join(MARKER)).await {
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(io(e)),
+            _ => {}
+        }
         tokio::fs::rename(claimed, self.upload_dir(upload_id)?)
             .await
             .map_err(io)
@@ -419,14 +507,15 @@ impl Uploads {
         }
     }
 
-    /// Joins the requested parts, in ascending order, each with the ETag it was given.
-    /// Refuses before any read when the parts hold more than `limit` bytes together.
-    pub(crate) async fn assemble(
+    /// Checks the requested parts, in ascending order, each with the ETag it was given, and
+    /// gives their files and their size. Refuses when they hold more than `limit` bytes together.
+    /// Reads no part.
+    pub(crate) async fn plan(
         &self,
         claimed: &Path,
         requested: &[(u16, String)],
         limit: u64,
-    ) -> Result<Assembled, S3Error> {
+    ) -> Result<CompletePlan, S3Error> {
         let bytes = tokio::fs::read(claimed.join(META)).await.map_err(io)?;
         let meta: UploadMeta = postcard::from_bytes(&bytes)
             .map_err(|e| S3Error::internal(format!("{}: {e}", claimed.display())))?;
@@ -470,16 +559,12 @@ impl Uploads {
             ));
         }
 
-        let mut data = Vec::new();
-        for (number, etag) in requested {
-            let part = tokio::fs::read(dir.join(part_name(*number, etag)))
-                .await
-                .map_err(io)?;
-            data.extend_from_slice(&part);
-        }
-
-        Ok(Assembled {
-            data,
+        Ok(CompletePlan {
+            parts: requested
+                .iter()
+                .map(|(number, etag)| dir.join(part_name(*number, etag)))
+                .collect(),
+            size,
             metadata: meta.metadata,
         })
     }
@@ -578,15 +663,24 @@ mod tests {
         (dir, uploads)
     }
 
-    /// Claims the upload, joins the parts, and gives the upload back.
+    /// Claims the upload, plans the complete, reads the planned parts in order, and gives the
+    /// upload back.
     async fn join(
         uploads: &Uploads,
         id: &str,
         requested: &[(u16, String)],
         limit: u64,
-    ) -> Result<Assembled, S3Error> {
+    ) -> Result<Vec<u8>, S3Error> {
         let claimed = uploads.claim(id, "b", "k", Claim::Complete).await?;
-        let joined = uploads.assemble(&claimed, requested, limit).await;
+        let joined = uploads.plan(&claimed, requested, limit).await.map(|plan| {
+            let data: Vec<u8> = plan
+                .parts
+                .iter()
+                .flat_map(|part| std::fs::read(part).unwrap())
+                .collect();
+            assert_eq!(data.len() as u64, plan.size);
+            data
+        });
         uploads.unclaim(id, &claimed).await.unwrap();
         joined
     }
@@ -626,11 +720,11 @@ mod tests {
             .await
             .unwrap();
 
-        let assembled = join(&uploads, &id, &[(1, first), (2, second)], u64::MAX)
+        let joined = join(&uploads, &id, &[(1, first), (2, second)], u64::MAX)
             .await
             .unwrap();
 
-        assert_eq!(assembled.data, b"hello world");
+        assert_eq!(joined, b"hello world");
         assert_eq!(uploads.parts(&id, "b", "k").await.unwrap().len(), 2);
     }
 
@@ -654,7 +748,7 @@ mod tests {
         let (_dir, uploads) = uploads().await;
         let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
         let etag = uploads.put_part(&id, "b", "k", "1", b"x").await.unwrap();
-        let code = |r: Result<Assembled, S3Error>| r.err().unwrap().code;
+        let code = |r: Result<Vec<u8>, S3Error>| r.err().unwrap().code;
 
         assert_eq!(
             code(join(&uploads, &id, &[(2, etag.clone()), (1, etag)], u64::MAX).await),

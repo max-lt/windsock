@@ -8,6 +8,7 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::http::{Request, Response, StatusCode};
 use ed25519_dalek::SigningKey;
+use engine::sim::Point;
 use engine::{Config, Engine};
 use http_body_util::BodyExt;
 use remote::DirRemote;
@@ -57,6 +58,7 @@ async fn server_in(dir: TempDir, config: Config, parts_limit: u64) -> Server {
     );
     config.uploads = Arc::new(s3api::Uploads::new(dir.path().join("uploads"), parts_limit));
     config.uploads.start().await.unwrap();
+    config.uploads.settle(&engine).await.unwrap();
     let uploads = config.uploads.clone();
     let app = s3api::router(engine.clone(), config);
 
@@ -2473,4 +2475,146 @@ async fn test_large_unsigned_trailer_put_streams_and_reads_back() {
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert!(read.body == data);
     assert_eq!(spool_files(&server), 0);
+}
+
+/// The server again on its directory, as after a crash: the engine and the uploads open anew.
+async fn restarted(server: Server) -> Server {
+    let Server {
+        _dir: dir,
+        engine,
+        app,
+        ..
+    } = server;
+    drop(app);
+    drop(engine);
+    server_in(dir, Config::default(), s3api::DEFAULT_PARTS_LIMIT).await
+}
+
+/// Two parts of 2 MiB each: the etags and the object they make.
+async fn two_big_parts(server: &Server, id: &str) -> (Vec<String>, Vec<u8>) {
+    let parts = ["a".repeat(2 << 20), "b".repeat(2 << 20)];
+    let mut etags = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let reply = upload_part(server, id, i as u32 + 1, part).await;
+        etags.push(reply.header("etag").unwrap().to_string());
+    }
+    (etags, parts.concat().into_bytes())
+}
+
+async fn complete_all(server: &Server, id: &str, etags: &[String]) -> Reply {
+    let parts: Vec<(u32, &str)> = etags
+        .iter()
+        .enumerate()
+        .map(|(i, etag)| (i as u32 + 1, etag.as_str()))
+        .collect();
+    complete(server, id, &parts).await
+}
+
+async fn list_parts(server: &Server, id: &str) -> Reply {
+    run(server, call("GET", &format!("/bkt/big?uploadId={id}"))).await
+}
+
+#[tokio::test]
+async fn test_complete_streams_its_parts_through_a_spool() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let (etags, object) = two_big_parts(&server, &id).await;
+
+    let done = complete_all(&server, &id, &etags).await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert!(
+        done.text()
+            .contains(&blake3::hash(&object).to_hex().to_string())
+    );
+    assert!(read.body == object);
+    assert_eq!(spool_files(&server), 0);
+    assert_eq!(
+        list_parts(&server, &id).await.xml("Code").unwrap(),
+        "NoSuchUpload"
+    );
+}
+
+#[tokio::test]
+async fn test_complete_with_no_buffer_room_gets_503_and_keeps_its_parts() {
+    let config = Config {
+        buffer_limit: 6 << 20,
+        ..Config::default()
+    };
+    let server = bucket_on(server_with(config).await).await;
+    let id = start_upload(&server).await;
+    let (etags, object) = two_big_parts(&server, &id).await;
+    // 3 MiB in the buffer: the 4 MiB of the object do not fit next to them.
+    put(&server, "filler", &"f".repeat(3 << 20)).await;
+
+    let full = complete_all(&server, &id, &etags).await;
+    let parts = list_parts(&server, &id).await;
+    server.engine.flush().await.unwrap();
+    let done = complete_all(&server, &id, &etags).await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    assert_eq!(
+        full.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        full.text()
+    );
+    assert_eq!(full.xml("Code").unwrap(), "SlowDown");
+    assert!(full.header("retry-after").is_some());
+    assert_eq!(parts.status, StatusCode::OK);
+    assert_eq!(parts.text().matches("<Part>").count(), 2);
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert!(read.body == object);
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_crash_before_the_commit_gives_the_upload_back_for_a_new_complete() {
+    for point in [Point::CompleteAssembly, Point::CompleteMarked] {
+        let server = with_bucket().await;
+        let id = start_upload(&server).await;
+        let (etags, object) = two_big_parts(&server, &id).await;
+
+        engine::sim::arm_crash(Some(point));
+        let crashed = complete_all(&server, &id, &etags).await;
+        engine::sim::arm_crash(None);
+        let server = restarted(server).await;
+        let parts = list_parts(&server, &id).await;
+        let spooled = spool_files(&server);
+        let done = complete_all(&server, &id, &etags).await;
+        let read = run(&server, call("GET", "/bkt/big")).await;
+
+        assert_eq!(
+            crashed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{point:?}"
+        );
+        assert_eq!(parts.text().matches("<Part>").count(), 2, "{point:?}");
+        assert_eq!(spooled, 0, "{point:?}");
+        assert_eq!(done.status, StatusCode::OK, "{point:?}: {}", done.text());
+        assert!(read.body == object, "{point:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_crash_after_the_commit_keeps_the_object_and_the_start_removes_the_parts() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let (etags, object) = two_big_parts(&server, &id).await;
+
+    engine::sim::arm_crash(Some(Point::CompleteCommitted));
+    let crashed = complete_all(&server, &id, &etags).await;
+    engine::sim::arm_crash(None);
+    let server = restarted(server).await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+    let parts = list_parts(&server, &id).await;
+    let again = complete_all(&server, &id, &etags).await;
+
+    assert_eq!(crashed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(read.body == object);
+    assert_eq!(parts.xml("Code").unwrap(), "NoSuchUpload");
+    assert_eq!(again.status, StatusCode::NOT_FOUND);
+    assert_eq!(again.xml("Code").unwrap(), "NoSuchUpload");
+    assert_eq!(server.uploads.held(), 0);
 }

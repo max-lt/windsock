@@ -211,6 +211,56 @@ pub(crate) async fn object_delete<R: Remote + 'static>(
     empty(StatusCode::NO_CONTENT)
 }
 
+/// Streams the parts of a claimed upload to a spool, in pieces of at most 1 MiB, and commits it.
+/// The buffer room of the whole object is taken first, so completes that start together cannot
+/// pass the buffer limit together. The hash of the spool, made as it is written, is the content
+/// hash; it goes into the claimed upload before the commit.
+async fn complete<R: Remote + 'static>(
+    state: &AppState<R>,
+    (bucket, key): (&str, &str),
+    claimed: &std::path::Path,
+    requested: &[(u16, String)],
+    mode: WriteMode,
+) -> Result<ObjectInfo, S3Error> {
+    use tokio::io::AsyncReadExt;
+
+    let plan = state
+        .uploads
+        .plan(claimed, requested, state.engine.max_object_size())
+        .await?;
+    let mut spool = state
+        .engine
+        .begin_put_sized(bucket, key, plan.metadata, mode, plan.size)
+        .await?;
+    let mut piece = vec![0u8; PUT_PIECE];
+    for part in &plan.parts {
+        let mut file = tokio::fs::File::open(part)
+            .await
+            .map_err(|e| S3Error::internal(format!("{}: {e}", part.display())))?;
+        loop {
+            let size = file
+                .read(&mut piece)
+                .await
+                .map_err(|e| S3Error::internal(format!("{}: {e}", part.display())))?;
+            if size == 0 {
+                break;
+            }
+            state.engine.spool_write(&mut spool, &piece[..size]).await?;
+            engine::sim::crash_point(Point::CompleteAssembly)?;
+        }
+    }
+    if spool.len() != plan.size {
+        return Err(S3Error::internal(format!(
+            "the parts hold {} bytes, and {} at the start of the complete",
+            spool.len(),
+            plan.size
+        )));
+    }
+    state.uploads.mark(claimed, spool.content_hash()).await?;
+    engine::sim::crash_point(Point::CompleteMarked)?;
+    Ok(state.engine.finish_put(spool).await?)
+}
+
 pub(crate) async fn object_post<R: Remote + 'static>(
     State(state): State<AppState<R>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -236,29 +286,13 @@ pub(crate) async fn object_post<R: Remote + 'static>(
 
     let mode = write_mode(&headers)?;
     let requested = xml::parse_complete(&body)?;
+    let _slot = state.uploads.complete_slot()?;
     // One complete owns the upload: a second one at the same time gets NoSuchUpload.
     let claimed = state
         .uploads
         .claim(upload_id, &bucket, &key, Claim::Complete)
         .await?;
-    let written = async {
-        let assembled = state
-            .uploads
-            .assemble(&claimed, &requested, state.engine.max_object_size())
-            .await?;
-        let info = state
-            .engine
-            .put(
-                &bucket,
-                &key,
-                Bytes::from(assembled.data),
-                assembled.metadata,
-                mode,
-            )
-            .await?;
-        Ok::<_, S3Error>(info)
-    }
-    .await;
+    let written = complete(&state, (&bucket, &key), &claimed, &requested, mode).await;
     let info = match written {
         Ok(info) => info,
         Err(e) => {
@@ -266,6 +300,8 @@ pub(crate) async fn object_post<R: Remote + 'static>(
             return Err(e);
         }
     };
+    // From here the object is committed: a crash leaves the parts to the next start.
+    engine::sim::crash_point(Point::CompleteCommitted)?;
     state.uploads.remove(&claimed).await?;
 
     info!(

@@ -399,6 +399,10 @@ async fn serve<R: Sweep + 'static>(
         .start()
         .await
         .context("cannot read the multipart uploads")?;
+    s3.uploads
+        .settle(&engine)
+        .await
+        .context("cannot end a complete that a crash stopped")?;
     if parts > 0 {
         info!(bytes = parts, "multipart parts wait for a complete");
     }

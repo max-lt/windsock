@@ -303,10 +303,21 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   one pack target (`pack_target`, 64 MiB by default) and one piece, not the object. Measured on
   macOS, release build, one buffered object flushed at SIGTERM: 100 MiB peaked at 83 MiB, and
   1 GiB at 96 MiB; the replay at start of either peaked at 8 MiB.
-- A CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB per
-  request, about 3 times the object: a PUT of 1 GiB held in memory raised the daemon to 3.1 GiB,
-  so one at the 5 GiB cap takes about 15 GiB. No limit covers them all together. Size the memory
-  for them, or put a limit in front of the proxy.
+- A CompleteMultipartUpload copies its parts to a spool file in pieces of at most 1 MiB, and
+  takes the buffer room of the whole object first: with no room, it gets `503 SlowDown` with
+  `Retry-After`, and the parts stay. At most `MAX_COMPLETES` (4) run at once; more get
+  `503 SlowDown`. On disk, the parts and the spool exist together, so a complete needs up to 2
+  times the object: 10 GiB for an object at the 5 GiB cap. Measured on macOS (NVMe, release
+  build): a complete of 1 GiB took 1.1 s, of 5 GiB 4.8 s, and 4 completes of 1 GiB at once took
+  1.2 s and raised the daemon by 0.8 MiB. The proxy sends nothing while a complete copies: a
+  client whose read timeout is shorter than the copy sees a timeout. A slower disk makes the copy
+  longer, about 50 s for 5 GiB at 100 MB/s.
+- A crash during a complete: before its commit, the next start gives the upload back with its
+  parts, and the complete can run again. After its commit, the next start removes the parts; the
+  object is there, and a second complete of the upload gets `404 NoSuchUpload`.
+- An UploadPart holds its part in memory, up to 5 GiB, and a CopyObject the whole object, about
+  3 times its size: a PUT of 1 GiB held in memory raised the daemon to 3.1 GiB. No limit covers
+  them all together. Size the memory for them, or put a limit in front of the proxy.
 
 ## Scale
 

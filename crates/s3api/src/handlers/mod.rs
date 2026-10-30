@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
+use engine::sim::Point;
 use engine::{Engine, ObjectInfo, ObjectReader, ReadRoom, WriteMode};
 use remote::Remote;
 use tracing::{info, warn};

@@ -55,3 +55,10 @@ path = "fuzz_targets/s3_headers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "chunk_decode"
+path = "fuzz_targets/chunk_decode.rs"
+test = false
+doc = false
+bench = false

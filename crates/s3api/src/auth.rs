@@ -113,7 +113,7 @@ fn payload(
     let hash = header(headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
     let incomplete = |e: sigv4::ChunkError| match e {
         sigv4::ChunkError::BadSignature => signature_mismatch(),
-        sigv4::ChunkError::Malformed => {
+        sigv4::ChunkError::Malformed | sigv4::ChunkError::Incomplete => {
             S3Error::new("IncompleteBody", StatusCode::BAD_REQUEST, e.to_string())
         }
     };

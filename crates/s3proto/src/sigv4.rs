@@ -8,6 +8,8 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+pub use crate::chunked::{ChunkDecoder, ChunkError, decode_chunked};
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// The body is not part of the signature.
@@ -228,18 +230,20 @@ impl std::fmt::Debug for ChunkSigner {
 
 impl ChunkSigner {
     fn sign_chunk(&mut self, data: &[u8]) -> String {
+        self.sign_chunk_digest(&sha256_hex(data))
+    }
+
+    /// The signature of the next chunk, from the hex SHA-256 of its data.
+    pub(crate) fn sign_chunk_digest(&mut self, sha256_hex: &str) -> String {
         let to_sign = format!(
-            "{ALGORITHM}-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{}",
-            self.timestamp,
-            self.scope,
-            self.previous,
-            sha256_hex(data)
+            "{ALGORITHM}-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{sha256_hex}",
+            self.timestamp, self.scope, self.previous,
         );
         self.previous = hex::encode(hmac(&self.key, to_sign.as_bytes()));
         self.previous.clone()
     }
 
-    fn sign_trailer(&mut self, trailer: &str) -> String {
+    pub(crate) fn sign_trailer(&mut self, trailer: &str) -> String {
         let to_sign = format!(
             "{ALGORITHM}-TRAILER\n{}\n{}\n{}\n{}",
             self.timestamp,
@@ -248,94 +252,6 @@ impl ChunkSigner {
             sha256_hex(trailer.as_bytes())
         );
         hex::encode(hmac(&self.key, to_sign.as_bytes()))
-    }
-}
-
-/// An `aws-chunked` body that does not decode, or a chunk signature that does not match.
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ChunkError {
-    #[error("malformed aws-chunked body")]
-    Malformed,
-    #[error("chunk signature does not match")]
-    BadSignature,
-}
-
-fn line(body: &[u8]) -> Result<(&str, &[u8]), ChunkError> {
-    let end = body
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .ok_or(ChunkError::Malformed)?;
-    let text = std::str::from_utf8(&body[..end]).map_err(|_| ChunkError::Malformed)?;
-    Ok((text, &body[end + 2..]))
-}
-
-/// Decodes an `aws-chunked` body. With a signer, every chunk signature and the
-/// trailer signature, when there is one, must match.
-pub fn decode_chunked(
-    mut body: &[u8],
-    mut signer: Option<ChunkSigner>,
-) -> Result<Vec<u8>, ChunkError> {
-    let mut out = Vec::new();
-
-    loop {
-        let (header, rest) = line(body)?;
-        let (size, extension) = header.split_once(';').unwrap_or((header, ""));
-        let size = usize::from_str_radix(size.trim(), 16).map_err(|_| ChunkError::Malformed)?;
-
-        if rest.len() < size {
-            return Err(ChunkError::Malformed);
-        }
-        let (data, rest) = rest.split_at(size);
-
-        if let Some(signer) = signer.as_mut() {
-            let given = extension
-                .strip_prefix("chunk-signature=")
-                .ok_or(ChunkError::BadSignature)?;
-            if !same_signature(&signer.sign_chunk(data), given) {
-                return Err(ChunkError::BadSignature);
-            }
-        }
-
-        if size == 0 {
-            return decode_trailers(rest, signer).map(|()| out);
-        }
-
-        out.extend_from_slice(data);
-        body = rest.strip_prefix(b"\r\n").ok_or(ChunkError::Malformed)?;
-    }
-}
-
-/// After the last chunk: optional trailer lines, an optional trailer signature, an empty line.
-fn decode_trailers(mut rest: &[u8], mut signer: Option<ChunkSigner>) -> Result<(), ChunkError> {
-    let mut trailers = String::new();
-
-    loop {
-        if rest.is_empty() {
-            // Some clients end the body right after the last chunk line.
-            return if trailers.is_empty() {
-                Ok(())
-            } else {
-                Err(ChunkError::Malformed)
-            };
-        }
-
-        let (text, next) = line(rest)?;
-        rest = next;
-
-        if text.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(given) = text.strip_prefix("x-amz-trailer-signature:") {
-            let signer = signer.as_mut().ok_or(ChunkError::BadSignature)?;
-            if !same_signature(&signer.sign_trailer(&trailers), given.trim()) {
-                return Err(ChunkError::BadSignature);
-            }
-            continue;
-        }
-
-        trailers.push_str(text);
-        trailers.push('\n');
     }
 }
 
@@ -575,10 +491,10 @@ mod tests {
     }
 
     #[test]
-    fn test_truncated_chunk_is_malformed() {
+    fn test_truncated_chunk_is_incomplete_and_a_bad_size_malformed() {
         assert_eq!(
             decode_chunked(b"a\r\nhello", None),
-            Err(ChunkError::Malformed)
+            Err(ChunkError::Incomplete)
         );
         assert_eq!(decode_chunked(b"zz\r\n", None), Err(ChunkError::Malformed));
     }

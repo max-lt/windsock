@@ -299,9 +299,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   measure with aws-chunked PUTs (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`, chunks of 64 KiB): 64
   writers raised the daemon from 53 MiB to 60 MiB, and 250 writers from 60 MiB to 155 MiB, about
   390 KiB per writer, with 2.9 GiB in spool files and none after the stop.
-- The flush and the replay at start read each buffered object whole into memory: after one PUT of
-  100 MiB, its flush raised the daemon to 224 MiB. So a spooled PUT of 5 GiB takes more than
-  5 GiB of memory at its flush.
+- The flush and the replay at start read a buffered object in pieces of 1 MiB. The flush holds
+  one pack target (`pack_target`, 64 MiB by default) and one piece, not the object. Measured on
+  macOS, release build, one buffered object flushed at SIGTERM: 100 MiB peaked at 83 MiB, and
+  1 GiB at 96 MiB; the replay at start of either peaked at 8 MiB.
 - A CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB per
   request, about 3 times the object: a PUT of 1 GiB held in memory raised the daemon to 3.1 GiB,
   so one at the 5 GiB cap takes about 15 GiB. No limit covers them all together. Size the memory

@@ -116,6 +116,8 @@ pub enum EngineError {
     ClockAhead { wait_secs: u64 },
     #[error("configuration: {0}")]
     Config(String),
+    #[error("a cache limit of {requested} bytes is above cache_bytes ({max})")]
+    CacheLimit { requested: u64, max: u64 },
     /// A crash point of the simulation test fired: drop the engine.
     #[cfg(feature = "sim")]
     #[error("simulated crash after {0:?}")]
@@ -181,6 +183,14 @@ pub struct LocalUsage {
     pub index: u64,
     pub cache: u64,
     pub buffer: u64,
+}
+
+/// The chunk cache: its bound, the bytes it holds, and the highest bound (`cache_bytes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheState {
+    pub limit: u64,
+    pub bytes: u64,
+    pub max: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

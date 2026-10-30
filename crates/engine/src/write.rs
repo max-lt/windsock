@@ -216,6 +216,37 @@ impl<R: Remote + 'static> Engine<R> {
         })
     }
 
+    pub fn cache_state(&self) -> CacheState {
+        let (limit, bytes) = self
+            .cache
+            .as_ref()
+            .map_or((0, 0), |cache| (cache.limit(), cache.bytes()));
+        CacheState {
+            limit,
+            bytes,
+            max: self.config.cache_bytes,
+        }
+    }
+
+    /// Sets the bound of the chunk cache and evicts the oldest chunks above it. 0 empties the
+    /// cache. The bound stays at most `cache_bytes`: the start checked the free disk for that.
+    /// A restart goes back to `cache_bytes`.
+    pub async fn set_cache_limit(&self, bytes: u64) -> Result<CacheState> {
+        let max = self.config.cache_bytes;
+        if bytes > max {
+            return Err(EngineError::CacheLimit {
+                requested: bytes,
+                max,
+            });
+        }
+        if let Some(cache) = &self.cache {
+            cache.set_limit(bytes).await;
+        }
+        let state = self.cache_state();
+        info!(limit = state.limit, bytes = state.bytes, "cache limit set");
+        Ok(state)
+    }
+
     /// Bytes in the buffer that are not in the remote yet.
     pub async fn buffered_bytes(&self) -> u64 {
         self.buffer.lock().await.bytes()

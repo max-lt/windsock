@@ -270,3 +270,38 @@ async fn test_concurrent_misses_fetch_each_chunk_once() {
     assert!(one_read > 0);
     assert_eq!(remote.range_reads() - before, one_read);
 }
+
+#[tokio::test]
+async fn test_cache_limit_zero_sends_reads_to_the_remote_and_a_raise_caches_again() {
+    let remote = Arc::new(CountingRemote::default());
+    let a = proxy(&remote, 1, config(CacheMode::ReadWrite, 1 << 30)).await;
+    write(&a, "c/k", &random_bytes(1, 256 * 1024)).await;
+    let cached = reads_for(&remote, &a, "c/k").await;
+
+    let trimmed = a.engine.set_cache_limit(0).await.unwrap();
+    let cold = reads_for(&remote, &a, "c/k").await;
+    let again = reads_for(&remote, &a, "c/k").await;
+    let raised = a.engine.set_cache_limit(1 << 30).await.unwrap();
+    reads_for(&remote, &a, "c/k").await;
+    let warm = reads_for(&remote, &a, "c/k").await;
+
+    assert_eq!(cached, 0);
+    assert_eq!((trimmed.limit, trimmed.bytes, trimmed.max), (0, 0, 1 << 30));
+    assert!(cold > 0 && again > 0);
+    assert_eq!(raised.limit, 1 << 30);
+    assert_eq!(warm, 0);
+}
+
+#[tokio::test]
+async fn test_cache_limit_above_the_configuration_is_refused() {
+    let remote = Arc::new(CountingRemote::default());
+    let a = proxy(&remote, 1, config(CacheMode::ReadWrite, 1 << 20)).await;
+
+    let result = a.engine.set_cache_limit((1 << 20) + 1).await;
+
+    assert!(
+        matches!(result, Err(engine::EngineError::CacheLimit { requested, max }) if requested == (1 << 20) + 1 && max == 1 << 20),
+        "{result:?}"
+    );
+    assert_eq!(a.engine.cache_state().limit, 1 << 20);
+}

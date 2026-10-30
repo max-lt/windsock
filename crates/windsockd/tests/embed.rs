@@ -58,8 +58,13 @@ async fn test_serve_with_refuses_keys_in_the_configuration() {
     let path = common::cluster_config(dir.path(), &dir.path().join("remote"), 100, "");
     let config = windsockd::Config::load(&path).unwrap();
 
-    let result =
-        windsockd::serve_with(&config, Arc::new(Keys::default()), std::future::pending()).await;
+    let result = windsockd::serve_with(
+        &config,
+        Arc::new(Keys::default()),
+        std::future::pending(),
+        drop,
+    )
+    .await;
 
     let error = result.unwrap_err().to_string();
     assert!(error.contains("[[keys]]"), "{error}");
@@ -84,7 +89,7 @@ async fn test_serve_with_signs_with_the_store_and_flushes_at_shutdown() {
         let shutdown = async {
             let _ = stopped.await;
         };
-        windsockd::serve_with(&config, served, shutdown).await
+        windsockd::serve_with(&config, served, shutdown, drop).await
     });
     wait_until_listening(&address).await;
 
@@ -103,4 +108,66 @@ async fn test_serve_with_signs_with_the_store_and_flushes_at_shutdown() {
     assert_eq!(revoked.status, StatusCode::FORBIDDEN);
     result.unwrap();
     assert!(!common::chains(&dir.path().join("remote")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_node_handle_reads_state_and_sets_the_cache_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let config = config_without_keys(dir.path(), port);
+    let keys = common::test_keys();
+    let store = Arc::new(Keys::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert(keys.0.clone(), keys.1.clone());
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(&config, store, shutdown, on_open).await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&address).await;
+    common::call_at(&address, &keys, "PUT", "/demo", b"").await;
+    common::call_at(&address, &keys, "PUT", "/demo/a", b"first").await;
+    common::call_at(&address, &keys, "PUT", "/demo/b", b"second").await;
+
+    let status = node.status().await;
+    let buckets = node.buckets().await.unwrap();
+    let first = node.list("demo", "", None, 1).await.unwrap();
+    let second = node
+        .list("demo", "", first.next.as_deref(), 1)
+        .await
+        .unwrap();
+    let trimmed = node.set_cache_limit(0).await.unwrap();
+    let too_high = node.set_cache_limit(status.cache.max + 1).await;
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+
+    assert!(status.buffered_bytes > 0);
+    assert!(!status.quarantined && !status.index_poisoned && !status.draining);
+    assert!(!status.gc_enabled);
+    assert_eq!(status.other_gc_node, None);
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].name, "demo");
+    let keys = |page: &windsockd::Page| {
+        page.objects
+            .iter()
+            .map(|object| object.key.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&first), ["a"]);
+    assert_eq!(first.next.as_deref(), Some("a"));
+    assert_eq!(keys(&second), ["b"]);
+    assert_eq!(second.next, None);
+    assert_eq!((trimmed.limit, trimmed.bytes), (0, 0));
+    assert!(too_high.is_err());
 }

@@ -4,6 +4,7 @@
 pub mod config;
 mod disk;
 mod listener;
+mod node;
 pub mod quarantine;
 
 use std::collections::HashMap;
@@ -26,6 +27,9 @@ use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 pub use config::{Config, KeySource};
+pub use engine::{BucketInfo, CacheState, ObjectInfo};
+pub use model::NodeId;
+pub use node::{Node, NodeStatus, Page};
 pub use s3api::KeyStore;
 
 use config::RemoteConfig;
@@ -48,19 +52,30 @@ const UPLOADS_EXPIRE_EVERY: Duration = Duration::from_secs(3600);
 /// Serves with the [[keys]] of `config` until SIGINT or SIGTERM, then flushes the buffer.
 pub async fn run(config: &Config) -> Result<()> {
     config.check_keys(KeySource::Config)?;
-    let keys = Arc::new(s3api::StaticKeys::new(config.keys()));
-    start(config, Mode::Serve(keys, Box::pin(shutdown_signal()))).await
+    let serving = Serving {
+        keys: Arc::new(s3api::StaticKeys::new(config.keys())),
+        shutdown: Box::pin(shutdown_signal()),
+        on_open: Box::new(drop),
+    };
+    start(config, Mode::Serve(serving)).await
 }
 
 /// Serves with the keys of `keys` until `shutdown` returns, then flushes the buffer. A SIGINT or
-/// SIGTERM after `shutdown` stops at once. `config` must have no [[keys]] entry.
+/// SIGTERM after `shutdown` stops at once. `config` must have no [[keys]] entry. `on_open` gets
+/// the [`Node`] once the engine is open, before the S3 port listens.
 pub async fn serve_with(
     config: &Config,
     keys: Arc<dyn KeyStore>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    on_open: impl FnOnce(Node) + Send + 'static,
 ) -> Result<()> {
     config.check_keys(KeySource::Store)?;
-    start(config, Mode::Serve(keys, Box::pin(shutdown))).await
+    let serving = Serving {
+        keys,
+        shutdown: Box::pin(shutdown),
+        on_open: Box::new(on_open),
+    };
+    start(config, Mode::Serve(serving)).await
 }
 
 /// Checks the storage contract of the remote of `config` once.
@@ -162,10 +177,17 @@ const SHORT_HORIZON_SECS: u64 = 3600;
 /// The first stop request: the daemon drains, then flushes the buffer.
 type Shutdown = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// How the daemon serves S3.
+struct Serving {
+    keys: Arc<dyn KeyStore>,
+    shutdown: Shutdown,
+    /// Gets the node once the engine is open.
+    on_open: Box<dyn FnOnce(Node) + Send>,
+}
+
 /// What `windsockd` does with the remote of a configuration.
 enum Mode {
-    /// Serve S3 with these keys until the shutdown future returns.
-    Serve(Arc<dyn KeyStore>, Shutdown),
+    Serve(Serving),
     /// Check the storage contract once, then exit.
     Diagnose,
 }
@@ -231,7 +253,7 @@ async fn act<R: Sweep + 'static>(
     mode: Mode,
 ) -> Result<()> {
     match mode {
-        Mode::Serve(keys, shutdown) => serve(config, remote, store, keys, shutdown).await,
+        Mode::Serve(serving) => serve(config, remote, store, serving).await,
         Mode::Diagnose => probe_contract(&*remote, store).await,
     }
 }
@@ -283,9 +305,13 @@ async fn serve<R: Sweep + 'static>(
     config: &Config,
     remote: Arc<R>,
     store: &str,
-    keys: Arc<dyn KeyStore>,
-    shutdown: Shutdown,
+    serving: Serving,
 ) -> Result<()> {
+    let Serving {
+        keys,
+        shutdown,
+        on_open,
+    } = serving;
     if config.gc.horizon_secs < SHORT_HORIZON_SECS {
         warn!(
             horizon_secs = config.gc.horizon_secs,
@@ -369,6 +395,12 @@ async fn serve<R: Sweep + 'static>(
     if parts > 0 {
         info!(bytes = parts, "multipart parts wait for a complete");
     }
+    let limits = node::Limits {
+        buffer: config.engine.buffer_limit_bytes,
+        parts: config.engine.parts_limit_bytes,
+        gc_enabled: config.gc.enabled,
+    };
+    on_open(Node::new(engine.clone(), s3.uploads.clone(), limits));
     let expirer = s3.uploads.clone();
     let max_age = Duration::from_secs(config.uploads_expire_secs);
     background.push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {

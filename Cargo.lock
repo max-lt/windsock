@@ -2176,6 +2176,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "model",
  "remote",
  "rustix",
  "s3api",

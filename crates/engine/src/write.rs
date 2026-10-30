@@ -170,6 +170,11 @@ impl<R: Remote + 'static> Engine<R> {
         self.quarantined.load(Ordering::SeqCst)
     }
 
+    /// True after [`Engine::drain`]: writes get refused.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     /// True when the local index refuses every call until a restart, as after a full disk.
     pub fn index_is_poisoned(&self) -> bool {
         self.index().is_poisoned()

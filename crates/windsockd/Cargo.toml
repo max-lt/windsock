@@ -6,11 +6,13 @@ publish.workspace = true
 
 [dependencies]
 engine.workspace = true
+model.workspace = true
 remote.workspace = true
 s3api.workspace = true
 s3remote.workspace = true
 s3proto.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -28,7 +30,6 @@ tracing-subscriber.workspace = true
 tls = ["s3remote/tls"]
 
 [dev-dependencies]
-async-trait.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

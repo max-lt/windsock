@@ -212,10 +212,21 @@ pub async fn call(
     path: &str,
     body: &[u8],
 ) -> Reply {
+    call_at(&daemon.address, keys, method, path, body).await
+}
+
+/// A signed request to `address`.
+pub async fn call_at(
+    address: &str,
+    keys: &(String, String),
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Reply {
     let mut request = Request::builder()
         .method(method)
-        .uri(format!("http://{}{path}", daemon.address));
-    for (name, value) in signed_headers(daemon, keys, method, path, body) {
+        .uri(format!("http://{address}{path}"));
+    for (name, value) in signed_headers_at(address, keys, method, path, body) {
         request = request.header(name, value);
     }
     let request = request
@@ -248,6 +259,17 @@ pub fn signed_headers(
     path: &str,
     body: &[u8],
 ) -> Vec<(String, String)> {
+    signed_headers_at(&daemon.address, keys, method, path, body)
+}
+
+/// The headers of a signed request to `address`, `authorization` included.
+pub fn signed_headers_at(
+    address: &str,
+    keys: &(String, String),
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<(String, String)> {
     let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,7 +278,7 @@ pub fn signed_headers(
     let timestamp = sigv4::timestamp(now);
     let payload_hash = sigv4::sha256_hex(body);
     let mut headers = vec![
-        ("host".to_string(), daemon.address.clone()),
+        ("host".to_string(), address.to_string()),
         ("x-amz-content-sha256".to_string(), payload_hash.clone()),
         ("x-amz-date".to_string(), timestamp.clone()),
     ];

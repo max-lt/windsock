@@ -37,7 +37,9 @@ pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub remote: RemoteConfig,
-    /// The keys that S3 clients sign with. Every key reaches every bucket.
+    /// The keys that S3 clients sign with. Every key reaches every bucket. Empty when a
+    /// [`s3api::KeyStore`] gives the keys.
+    #[serde(default)]
     pub keys: Vec<KeyConfig>,
     #[serde(default = "default_sync_interval")]
     pub sync_interval_secs: u64,
@@ -79,6 +81,15 @@ pub enum RemoteConfig {
         #[serde(default)]
         ca_file: Option<PathBuf>,
     },
+}
+
+/// Where the S3 keys come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    /// The [[keys]] entries of the configuration.
+    Config,
+    /// A [`s3api::KeyStore`] that the caller gives.
+    Store,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,12 +191,6 @@ impl Config {
         let mut config: Self =
             toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?;
 
-        if config.keys.is_empty() {
-            bail!(
-                "{}: at least one [[keys]] entry is required",
-                path.display()
-            );
-        }
         // A short expiry removes uploads that clients still write.
         if config.uploads_expire_secs < MIN_UPLOADS_EXPIRE_SECS {
             bail!(
@@ -208,6 +213,20 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// Refuses a configuration whose [[keys]] do not fit `source`: one source of keys only.
+    pub fn check_keys(&self, source: KeySource) -> Result<()> {
+        match (source, self.keys.is_empty()) {
+            (KeySource::Config, true) => {
+                bail!("the configuration needs at least one [[keys]] entry")
+            }
+            (KeySource::Store, false) => bail!(
+                "the configuration has [[keys]] entries and a key store gives the keys: remove \
+                 the [[keys]] entries"
+            ),
+            _ => Ok(()),
+        }
     }
 
     pub fn keys(&self) -> HashMap<String, String> {
@@ -370,17 +389,26 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_field_and_missing_keys_are_rejected() {
+    fn test_unknown_field_is_rejected() {
         assert!(toml::from_str::<Config>("data_dir = \"d\"\nlisten_on = \"x\"").is_err());
+    }
 
+    #[test]
+    fn test_keys_come_from_one_source_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("windsock.toml");
         std::fs::write(
             &path,
-            "data_dir = \"d\"\nkeys = []\n[remote]\ntype = \"dir\"\npath = \"r\"\n",
+            "data_dir = \"d\"\n[remote]\ntype = \"dir\"\npath = \"r\"\n",
         )
         .unwrap();
-        assert!(Config::load(&path).is_err());
+        let without = Config::load(&path).unwrap();
+        let with = Config::local().unwrap();
+
+        assert!(without.check_keys(KeySource::Config).is_err());
+        assert!(without.check_keys(KeySource::Store).is_ok());
+        assert!(with.check_keys(KeySource::Config).is_ok());
+        assert!(with.check_keys(KeySource::Store).is_err());
     }
 
     #[test]

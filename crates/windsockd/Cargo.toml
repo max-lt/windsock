@@ -28,6 +28,7 @@ tracing-subscriber.workspace = true
 tls = ["s3remote/tls"]
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

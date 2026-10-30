@@ -1,19 +1,16 @@
-//! The Windsock daemon: the S3 API on a local port, over an engine and a remote.
-//!
-//! ```text
-//! windsockd init <dir>      write <dir>/windsock.toml for one local proxy
-//! windsockd run <config>    serve until SIGINT or SIGTERM, then flush the buffer
-//! ```
+//! The Windsock daemon as a library. The `windsockd` binary calls [`run`]. A process that keeps
+//! the S3 keys itself, such as a console, calls [`serve_with`] with its [`KeyStore`].
 
-mod config;
+pub mod config;
 mod disk;
 mod listener;
-mod quarantine;
+pub mod quarantine;
 
+use std::collections::HashMap;
 use std::future::IntoFuture;
-use std::io::IsTerminal;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,10 +23,12 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-use config::{Config, RemoteConfig};
+pub use config::{Config, KeySource};
+pub use s3api::KeyStore;
+
+use config::RemoteConfig;
 use listener::{
     ConnectionActivity, LimitedListener, Timeouts, check_connections, connection_limit,
     raise_fd_limit, track_requests,
@@ -46,31 +45,27 @@ const SHUTDOWN_WARN_EVERY: Duration = Duration::from_secs(60);
 /// The expiry runs this often, so an upload lives at most this long past `uploads_expire_secs`.
 const UPLOADS_EXPIRE_EVERY: Duration = Duration::from_secs(3600);
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,fjall=warn,lsm_tree=warn")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+/// Serves with the [[keys]] of `config` until SIGINT or SIGTERM, then flushes the buffer.
+pub async fn run(config: &Config) -> Result<()> {
+    config.check_keys(KeySource::Config)?;
+    let keys = Arc::new(s3api::StaticKeys::new(config.keys()));
+    start(config, Mode::Serve(keys, Box::pin(shutdown_signal()))).await
+}
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["init", dir] => init(Path::new(dir)),
-        ["run", path] => run(&Config::load(Path::new(path))?, Mode::Serve).await,
-        ["diagnose", path] => run(&Config::load(Path::new(path))?, Mode::Diagnose).await,
-        ["quarantine", "list", path] => quarantine::list(&Config::load(Path::new(path))?).await,
-        ["quarantine", "export", path, out] => {
-            quarantine::export(&Config::load(Path::new(path))?, Path::new(out)).await
-        }
-        _ => bail!(
-            "usage: windsockd init <dir> | run <config> | diagnose <config> | quarantine list \
-             <config> | quarantine export <config> <new dir>"
-        ),
-    }
+/// Serves with the keys of `keys` until `shutdown` returns, then flushes the buffer. A SIGINT or
+/// SIGTERM after `shutdown` stops at once. `config` must have no [[keys]] entry.
+pub async fn serve_with(
+    config: &Config,
+    keys: Arc<dyn KeyStore>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    config.check_keys(KeySource::Store)?;
+    start(config, Mode::Serve(keys, Box::pin(shutdown))).await
+}
+
+/// Checks the storage contract of the remote of `config` once.
+pub async fn diagnose(config: &Config) -> Result<()> {
+    start(config, Mode::Diagnose).await
 }
 
 /// Writes a new file only, readable by its owner only: it holds secrets.
@@ -88,7 +83,8 @@ fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn init(dir: &Path) -> Result<()> {
+/// Writes `dir/windsock.toml` for one local proxy, with a new key pair and a new repository key.
+pub fn init(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(CONFIG_FILE);
     let text = toml::to_string(&Config::local()?).context("cannot write the configuration")?;
@@ -163,10 +159,13 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
 /// Below this, a slow flush can take longer than half the horizon and never commit.
 const SHORT_HORIZON_SECS: u64 = 3600;
 
+/// The first stop request: the daemon drains, then flushes the buffer.
+type Shutdown = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// What `windsockd` does with the remote of a configuration.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Serve,
+    /// Serve S3 with these keys until the shutdown future returns.
+    Serve(Arc<dyn KeyStore>, Shutdown),
     /// Check the storage contract once, then exit.
     Diagnose,
 }
@@ -182,8 +181,8 @@ fn connections(config: &Config) -> Result<usize> {
     }
 }
 
-async fn run(config: &Config, mode: Mode) -> Result<()> {
-    if mode == Mode::Serve {
+async fn start(config: &Config, mode: Mode) -> Result<()> {
+    if matches!(mode, Mode::Serve(..)) {
         connections(config)?;
     }
     match &config.remote {
@@ -232,12 +231,12 @@ async fn act<R: Sweep + 'static>(
     mode: Mode,
 ) -> Result<()> {
     match mode {
-        Mode::Serve => serve(config, remote, store).await,
-        Mode::Diagnose => diagnose(&*remote, store).await,
+        Mode::Serve(keys, shutdown) => serve(config, remote, store, keys, shutdown).await,
+        Mode::Diagnose => probe_contract(&*remote, store).await,
     }
 }
 
-async fn diagnose(remote: &impl Sweep, store: &str) -> Result<()> {
+async fn probe_contract(remote: &impl Sweep, store: &str) -> Result<()> {
     match remote::probe(remote).await {
         Ok(Verdict::Conformant) => {
             info!(
@@ -280,7 +279,13 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str) -> Result<()> {
+async fn serve<R: Sweep + 'static>(
+    config: &Config,
+    remote: Arc<R>,
+    store: &str,
+    keys: Arc<dyn KeyStore>,
+    shutdown: Shutdown,
+) -> Result<()> {
     if config.gc.horizon_secs < SHORT_HORIZON_SECS {
         warn!(
             horizon_secs = config.gc.horizon_secs,
@@ -329,20 +334,6 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
             async move { engine.sync().await.map(|_| ()).map_err(|e| e.to_string()) }
         },
     ));
-    // A failed index write poisons the store: only a restart opens it again.
-    let watched = engine.clone();
-    background.push(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if watched.index_is_poisoned() {
-                error!(
-                    "the local index refuses every call after a failed write, often a full \
-                     disk: stopping. The buffer is on disk and flushes at the next start"
-                );
-                std::process::exit(1);
-            }
-        }
-    }));
     if config.gc.enabled {
         info!(
             interval_secs = config.gc.interval_secs,
@@ -364,7 +355,8 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         ));
     }
 
-    let mut s3 = s3api::S3Config::new(config.keys(), config.data_dir.join("uploads"));
+    let mut s3 = s3api::S3Config::new(HashMap::new(), config.data_dir.join("uploads"));
+    s3.keys = keys;
     s3.uploads = Arc::new(s3api::Uploads::new(
         config.data_dir.join("uploads"),
         config.engine.parts_limit_bytes,
@@ -416,43 +408,68 @@ async fn serve<R: Sweep + 'static>(config: &Config, remote: Arc<R>, store: &str)
         listener,
         router.into_make_service_with_connect_info::<ConnectionActivity>(),
     )
-    .with_graceful_shutdown(drain_then_flush(engine.clone(), draining.clone()))
+    .with_graceful_shutdown(drain_then_flush(engine.clone(), draining.clone(), shutdown))
     .into_future();
     let second_signal = async {
         draining.notified().await;
         shutdown_signal().await;
     };
 
-    tokio::select! {
-        result = server => {
-            result?;
-            let bytes = engine.buffered_bytes().await;
-            if bytes > 0 {
-                bail!(
-                    "stopped with {bytes} buffered bytes that are not in the remote: the next \
-                     start moves the late writes to quarantine"
-                );
-            }
-            info!("buffer flushed: stopped");
-        }
+    let outcome = tokio::select! {
+        result = server => match result {
+            Ok(()) => stopped_after_flush(&engine).await,
+            Err(e) => Err(e.into()),
+        },
         () = second_signal => {
             let bytes = engine.buffered_bytes().await;
             warn!(bytes, "second signal: stopped before the remote has the buffer; it flushes at the next start");
+            Ok(())
         }
-    }
+        () = index_poisoned(&engine) => {
+            error!(
+                "the local index refuses every call after a failed write, often a full disk: \
+                 stopping. The buffer is on disk and flushes at the next start"
+            );
+            Err(anyhow::anyhow!("the local index refuses every call: stopped"))
+        }
+    };
 
     // A flush cut by the abort is safe: its intent file finishes it at the next flush.
     for task in background {
         task.abort();
     }
 
+    outcome
+}
+
+/// The end of a drain: an error when buffered writes did not reach the remote.
+async fn stopped_after_flush<R: Sweep + 'static>(engine: &Engine<R>) -> Result<()> {
+    let bytes = engine.buffered_bytes().await;
+    if bytes > 0 {
+        bail!(
+            "stopped with {bytes} buffered bytes that are not in the remote: the next start moves \
+             the late writes to quarantine"
+        );
+    }
+    info!("buffer flushed: stopped");
     Ok(())
 }
 
-/// At the first signal, refuses new writes and flushes the buffer. The server keeps serving
-/// reads, and 503 for writes, until the remote has every buffered write.
-async fn drain_then_flush<R: Sweep + 'static>(engine: Arc<Engine<R>>, draining: Arc<Notify>) {
-    shutdown_signal().await;
+/// Returns once a failed index write poisons the index: only a restart opens it again.
+async fn index_poisoned<R: Sweep + 'static>(engine: &Engine<R>) {
+    while !engine.index_is_poisoned() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// At `shutdown`, refuses new writes and flushes the buffer. The server keeps serving reads, and
+/// 503 for writes, until the remote has every buffered write.
+async fn drain_then_flush<R: Sweep + 'static>(
+    engine: Arc<Engine<R>>,
+    draining: Arc<Notify>,
+    shutdown: Shutdown,
+) {
+    shutdown.await;
     engine.drain();
     draining.notify_one();
     let bytes = engine.buffered_bytes().await;

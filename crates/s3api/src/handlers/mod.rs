@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::multipart::Claim;
 use crate::xml::{self, ListPage, ListedObject};
-use crate::{AppState, Caller, S3Error};
+use crate::{AppState, Caller, S3Error, StreamedBody};
 use s3proto::time::http_date;
 
 type Reply = Result<axum::response::Response, S3Error>;

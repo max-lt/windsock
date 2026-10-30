@@ -9,10 +9,28 @@ pub(crate) async fn object_put<R: Remote + 'static>(
     State(state): State<AppState<R>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Params,
+    streamed: Option<Extension<StreamedBody>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Reply {
     reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
+    if let Some(Extension(streamed)) = streamed {
+        let mode = write_mode(&headers)?;
+        let metadata = metadata(&headers)?;
+        let info = streamed_put(&state, &bucket, &key, metadata, mode, body, streamed).await?;
+        return Ok(reply(StatusCode::OK)
+            .header("etag", xml::quoted(&etag(&info)))
+            .body(Body::empty())
+            .expect("a hex ETag is a valid header value"));
+    }
+    // The middleware read this body already: it is in memory.
+    let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+        S3Error::new(
+            "IncompleteBody",
+            StatusCode::BAD_REQUEST,
+            "the body did not arrive whole",
+        )
+    })?;
 
     if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber")) {
         if headers.contains_key("x-amz-copy-source") {
@@ -290,4 +308,61 @@ fn object_body<R: Remote + 'static>(
             }
         });
     Body::from_stream(pieces)
+}
+
+/// The largest piece that a streamed PUT writes at once: the memory of one PUT.
+const PUT_PIECE: usize = 1024 * 1024;
+
+/// A PUT whose body goes to a spool file as it arrives. A cut body or a wrong SHA-256 drops the
+/// spool file, and nothing is written.
+async fn streamed_put<R: Remote + 'static>(
+    state: &AppState<R>,
+    bucket: &str,
+    key: &str,
+    metadata: BTreeMap<String, String>,
+    mode: WriteMode,
+    mut body: Body,
+    streamed: StreamedBody,
+) -> Result<ObjectInfo, S3Error> {
+    use http_body_util::BodyExt;
+    use sha2::Digest;
+
+    let mut spool = state.engine.begin_put(bucket, key, metadata, mode).await?;
+    let mut sha256 = streamed.sha256.as_ref().map(|_| sha2::Sha256::new());
+    let incomplete = || {
+        S3Error::new(
+            "IncompleteBody",
+            StatusCode::BAD_REQUEST,
+            "the body did not arrive whole",
+        )
+    };
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| incomplete())?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        for piece in data.chunks(PUT_PIECE) {
+            // A body with no Content-Length meets the limit only here.
+            if spool.len() + piece.len() as u64 > state.max_body as u64 {
+                return Err(S3Error::entity_too_large(state.max_body));
+            }
+            if let Some(sha256) = &mut sha256 {
+                sha256.update(piece);
+            }
+            state.engine.spool_write(&mut spool, piece).await?;
+        }
+    }
+    if streamed.length.is_some_and(|length| length != spool.len()) {
+        return Err(incomplete());
+    }
+    if let (Some(expected), Some(sha256)) = (&streamed.sha256, sha256)
+        && hex::encode(sha256.finalize()) != *expected
+    {
+        return Err(S3Error::new(
+            "XAmzContentSHA256Mismatch",
+            StatusCode::BAD_REQUEST,
+            "the body does not match x-amz-content-sha256",
+        ));
+    }
+    Ok(state.engine.finish_put(spool).await?)
 }

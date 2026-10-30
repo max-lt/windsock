@@ -12,6 +12,14 @@ pub enum Point {
     Commit,
     Apply,
     Release,
+    /// A streamed put: its data is fsynced in the spool file.
+    SpoolData,
+    /// Its head is written and fsynced after the data.
+    SpoolHead,
+    /// The spool file is renamed to a segment, and the directory is fsynced.
+    SpoolRename,
+    /// The put is durable, and its ack is not given yet.
+    SpoolAck,
 }
 
 #[cfg(feature = "sim")]

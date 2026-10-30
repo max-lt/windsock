@@ -63,6 +63,14 @@ impl S3Error {
         )
     }
 
+    pub fn entity_too_large(limit: usize) -> Self {
+        Self::new(
+            "EntityTooLarge",
+            StatusCode::BAD_REQUEST,
+            format!("the body is larger than {limit} bytes"),
+        )
+    }
+
     pub fn invalid_range(message: impl Into<String>) -> Self {
         Self::new("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE, message)
     }

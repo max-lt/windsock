@@ -16,6 +16,7 @@ mod plan;
 mod read;
 pub mod sim;
 mod snapshot;
+mod spool;
 mod sync;
 mod write;
 
@@ -23,7 +24,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ use pack::{Pack, PackEntry, PackError};
 pub use read::{ObjectReader, READ_STEP, ReadRoom};
 use remote::{Remote, RemoteError};
 pub use seal::{Keys, RepoKey};
+pub use spool::PutSpool;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -271,6 +273,8 @@ pub struct Engine<R> {
     buffer_failing: AtomicBool,
     /// The clock was more than R ahead of the wall clock at the last check: logged once.
     clock_ahead: AtomicBool,
+    /// Bytes in spool files of puts that stream their body. They count against `buffer_limit`.
+    spooled: Arc<AtomicU64>,
     /// The room of GET pieces in flight, in bytes.
     read_budget: Arc<tokio::sync::Semaphore>,
     /// A GET got no room at its first piece since the last one that got room: logged once.
@@ -560,6 +564,7 @@ impl<R: Remote + 'static> Engine<R> {
             clock_ahead: AtomicBool::new(false),
             read_budget,
             read_budget_short: AtomicBool::new(false),
+            spooled: Arc::new(AtomicU64::new(0)),
             own_high: Mutex::new(own_high),
             gc_waits: gc::Waits::default(),
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),

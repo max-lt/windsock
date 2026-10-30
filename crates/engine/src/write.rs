@@ -33,41 +33,7 @@ impl<R: Remote + 'static> Engine<R> {
 
         let (info, record) = self
             .retry_after_sync(|| async move {
-                let mut attempts = 0;
-                let (mut buffer, allowed) = loop {
-                    let buffer = self.buffer.lock().await;
-                    self.require_bucket(&buffer, bucket)?;
-
-                    let current = self.current(&buffer, bucket, key)?;
-                    let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
-                    if needs_object && !current.exists() {
-                        return Err(read::no_such_key(bucket, key));
-                    }
-                    let allowed = match mode {
-                        _ if create_only => !current.exists(),
-                        WriteMode::IfExists => true,
-                        WriteMode::IfMatch(hashes) => match self.local_content_hash(&current)? {
-                            Some(hash) => hashes.contains(&hash),
-                            // A remote read under the buffer lock would hold every write.
-                            None if attempts < MATCH_ATTEMPTS => {
-                                drop(buffer);
-                                attempts += 1;
-                                self.content_hash(current).await?;
-                                continue;
-                            }
-                            None => false,
-                        },
-                        WriteMode::Overwrite | WriteMode::CreateOnly => true,
-                    };
-                    break (buffer, allowed);
-                };
-                if !allowed {
-                    return Err(EngineError::PreconditionFailed {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
-                }
-
+                let mut buffer = self.lock_for_put(bucket, key, mode, create_only).await?;
                 let time = self.tick()?;
                 let op = Op::Put {
                     bucket: bucket.to_string(),
@@ -91,6 +57,51 @@ impl<R: Remote + 'static> Engine<R> {
 
         self.acknowledge(record).await?;
         Ok(info)
+    }
+
+    /// The buffer, locked, once the current object passes the check of `mode`. The check and the
+    /// write that follows are one step on this proxy.
+    pub(crate) async fn lock_for_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        mode: &WriteMode,
+        create_only: bool,
+    ) -> Result<tokio::sync::MutexGuard<'_, Buffer>> {
+        let mut attempts = 0;
+        loop {
+            let buffer = self.buffer.lock().await;
+            self.require_bucket(&buffer, bucket)?;
+
+            let current = self.current(&buffer, bucket, key)?;
+            let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
+            if needs_object && !current.exists() {
+                return Err(read::no_such_key(bucket, key));
+            }
+            let allowed = match mode {
+                _ if create_only => !current.exists(),
+                WriteMode::IfExists => true,
+                WriteMode::IfMatch(hashes) => match self.local_content_hash(&current)? {
+                    Some(hash) => hashes.contains(&hash),
+                    // A remote read under the buffer lock would hold every write.
+                    None if attempts < MATCH_ATTEMPTS => {
+                        drop(buffer);
+                        attempts += 1;
+                        self.content_hash(current).await?;
+                        continue;
+                    }
+                    None => false,
+                },
+                WriteMode::Overwrite | WriteMode::CreateOnly => true,
+            };
+            if !allowed {
+                return Err(EngineError::PreconditionFailed {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
+            return Ok(buffer);
+        }
     }
 
     /// Deletes a key. A missing key is not an error, as in S3.
@@ -211,7 +222,7 @@ impl<R: Remote + 'static> Engine<R> {
     }
 
     /// The HLC of a new ack. Fails at the end of the u64 range instead of a wrap to 0.
-    fn tick(&self) -> Result<u64> {
+    pub(crate) fn tick(&self) -> Result<u64> {
         self.clock
             .tick()
             .ok_or(EngineError::Journal(JournalError::ClockOverflow))
@@ -222,13 +233,8 @@ impl<R: Remote + 'static> Engine<R> {
         self.append_at(buffer, self.tick()?, op, data).await
     }
 
-    pub(crate) async fn append_at(
-        &self,
-        buffer: &mut Buffer,
-        time: u64,
-        op: Op,
-        data: &[u8],
-    ) -> Result<u64> {
+    /// Fails when the buffer takes no write now: a stop, a quarantine, or a clock far ahead.
+    pub(crate) fn check_writes(&self) -> Result<()> {
         if self.draining.load(Ordering::SeqCst) {
             return Err(EngineError::Draining);
         }
@@ -237,7 +243,17 @@ impl<R: Remote + 'static> Engine<R> {
                 "restart the proxy to move the buffer to quarantine".to_string(),
             ));
         }
-        self.check_clock()?;
+        self.check_clock()
+    }
+
+    pub(crate) async fn append_at(
+        &self,
+        buffer: &mut Buffer,
+        time: u64,
+        op: Op,
+        data: &[u8],
+    ) -> Result<u64> {
+        self.check_writes()?;
 
         let limit = self.config.buffer_limit;
 
@@ -250,7 +266,7 @@ impl<R: Remote + 'static> Engine<R> {
             });
         }
 
-        if buffer.bytes() + data.len() as u64 > limit {
+        if buffer.bytes() + self.spooled.load(Ordering::SeqCst) + data.len() as u64 > limit {
             return Err(EngineError::BufferFull { limit });
         }
 
@@ -267,11 +283,15 @@ impl<R: Remote + 'static> Engine<R> {
             info!("buffer writes work again");
         }
 
+        self.wake_flusher_when_full(buffer);
+        Ok(record)
+    }
+
+    /// A buffer that holds a pack target flushes now, not at the next flush delay.
+    pub(crate) fn wake_flusher_when_full(&self, buffer: &Buffer) {
         if buffer.bytes() >= self.config.pack_target as u64 {
             self.flush_wanted.notify_one();
         }
-
-        Ok(record)
     }
 }
 

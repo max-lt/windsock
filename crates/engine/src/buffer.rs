@@ -43,6 +43,8 @@ const FORMAT: u32 = 3;
 const FORMAT_FILE: &str = "format";
 const INTENT_FILE: &str = "intent";
 const INTENT_TEMP: &str = ".intent.tmp";
+/// Puts that stream their body write it here first. A spool file becomes a segment at its commit.
+pub(crate) const SPOOL_DIR: &str = "spool";
 
 /// Refuses a buffer directory of another record format. A directory with segments or an intent
 /// and no format file comes from format 1. An empty directory gets the format of this build,
@@ -106,6 +108,20 @@ pub(crate) enum Op {
     DeleteBucket {
         bucket: String,
     },
+}
+
+/// Refuses a head that the replay would refuse: it would block the flush for ever.
+pub(crate) fn check_head(head: &Head) -> Result<(), EngineError> {
+    let head_len = postcard::to_allocvec(head)
+        .expect("a record head always serializes")
+        .len() as u64;
+    if head_len > u64::from(MAX_HEAD_LEN) {
+        return Err(EngineError::MetadataTooLarge {
+            size: head_len,
+            limit: u64::from(MAX_HEAD_LEN),
+        });
+    }
+    Ok(())
 }
 
 /// Encodes a record: the data length, the data, then the head length, the head hash and the head.
@@ -392,6 +408,13 @@ impl Buffer {
 
         let existing = list_segments(&dir).await?;
         check_format(&dir, !existing.is_empty()).await?;
+        // A spool file of a put that a crash stopped was never acknowledged.
+        let spool = dir.join(SPOOL_DIR);
+        match tokio::fs::remove_dir_all(&spool).await {
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        tokio::fs::create_dir_all(&spool).await?;
         let mut buffer = Self {
             active: create_segment(&dir, existing.last().map_or(0, |last| last + 1)).await?,
             dir,
@@ -534,16 +557,7 @@ impl Buffer {
             return Err(EngineError::BufferBroken);
         }
 
-        // A head that the replay refuses would block the flush for ever.
-        let head_len = postcard::to_allocvec(&head)
-            .expect("a record head always serializes")
-            .len() as u64;
-        if head_len > u64::from(MAX_HEAD_LEN) {
-            return Err(EngineError::MetadataTooLarge {
-                size: head_len,
-                limit: u64::from(MAX_HEAD_LEN),
-            });
-        }
+        check_head(&head)?;
 
         let record = encode_record(&head, data);
         let data_offset = self.active.len + DATA_LEN_LEN as u64;
@@ -751,6 +765,44 @@ impl Buffer {
         let next = create_segment(&self.dir, self.active.seq + 1).await?;
         let sealed = std::mem::replace(&mut self.active, next);
         self.sealed.insert(sealed.seq, sealed.len);
+        Ok(())
+    }
+
+    /// Adds a spooled put as the next segment. The spool file holds the data and then the head,
+    /// both fsynced. The active segment is sealed first, so the order of the segments stays the
+    /// order of the acks. Returns the record number, durable at once.
+    pub async fn adopt(
+        &mut self,
+        spool: &Path,
+        head: &Head,
+        data_len: u64,
+    ) -> Result<u64, EngineError> {
+        if self.broken {
+            return Err(EngineError::BufferBroken);
+        }
+        if self.active.len > 0 {
+            self.rotate().await?;
+        }
+        // The active segment is empty: the spool takes its seq, and a new one comes after it.
+        let seq = self.active.seq;
+        tokio::fs::rename(spool, self.segment_path(seq)).await?;
+        // The active file has no name now: a write to it would get an ack and then be lost.
+        if let Err(e) = self.open_after_spool(seq).await {
+            self.broken = true;
+            return Err(e);
+        }
+        self.written += 1;
+        self.durable = self.written;
+        self.track(seq, head, DATA_LEN_LEN as u64, data_len);
+        Ok(self.written)
+    }
+
+    async fn open_after_spool(&mut self, seq: u64) -> Result<(), EngineError> {
+        sync_dir(&self.dir).await?;
+        crate::sim::crash_point(crate::sim::Point::SpoolRename)?;
+        let size = tokio::fs::metadata(self.segment_path(seq)).await?.len();
+        self.active = create_segment(&self.dir, seq + 1).await?;
+        self.sealed.insert(seq, size);
         Ok(())
     }
 

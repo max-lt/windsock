@@ -299,7 +299,7 @@ A daemon keeps these descriptors open. Each count has a cap.
 | S3 client connections | `max_connections`, each with one file    | (soft fd limit - 256) / 2                       |
 
 The daemon keeps 256 descriptors for the first four kinds, and 2 for each S3 connection: its
-socket, and one file that a request can hold at once (a buffer segment, a cache file or a
+socket, and one file that a request can hold at once (a buffer segment, a spool file, a cache file or a
 multipart part). At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
 start, and the error names `ulimit -n`. A `max_connections` that needs more than the soft limit
 also stops the start, with the value, the limit and the number needed. With a soft limit of 600

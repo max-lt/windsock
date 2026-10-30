@@ -13,7 +13,7 @@ use bytes::Bytes;
 use remote::Remote;
 use tracing::debug;
 
-use crate::{AppState, Caller, S3Error, presign};
+use crate::{AppState, Caller, S3Error, StreamedBody, presign};
 use s3proto::sigv4::{self, Authorization, ChunkSigner};
 use s3proto::time::parse_amz_date;
 
@@ -183,6 +183,48 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A PUT body up to this size goes through the buffer in one record, with the group fsync.
+const SMALL_PUT: u64 = 1024 * 1024;
+
+/// The body check of a PUT of an object that the handler streams: a larger or unknown length,
+/// and no aws-chunked body. `None` for any other request.
+fn streamed(parts: &Parts) -> Option<StreamedBody> {
+    if parts.method != Method::PUT || parts.headers.contains_key("x-amz-copy-source") {
+        return None;
+    }
+    let object = parts.uri.path().trim_start_matches('/').split_once('/');
+    if object.is_none_or(|(_, key)| key.is_empty()) {
+        return None;
+    }
+    let query = parts.uri.query().unwrap_or("");
+    let part = query.split('&').any(|pair| {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        name == "uploadId" || name == "partNumber"
+    });
+    let length = header(&parts.headers, "content-length").and_then(|v| v.parse::<u64>().ok());
+    let chunked =
+        header(&parts.headers, "transfer-encoding").is_some_and(|v| v.contains("chunked"));
+    let large = match length {
+        Some(length) => length > SMALL_PUT,
+        None => chunked,
+    };
+    if part || !large {
+        return None;
+    }
+    let hash = header(&parts.headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
+    match hash {
+        sigv4::UNSIGNED_PAYLOAD => Some(StreamedBody {
+            sha256: None,
+            length,
+        }),
+        hash if hash.starts_with("STREAMING-") => None,
+        hash => Some(StreamedBody {
+            sha256: Some(hash.to_ascii_lowercase()),
+            length,
+        }),
+    }
+}
+
 /// The longest XML request body: 10 000 parts or 1 000 keys fit in less.
 const MAX_XML_BODY: usize = 4 * 1024 * 1024;
 
@@ -218,6 +260,14 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
         }
     };
     parts.extensions.insert(Caller(access_key));
+    if let Some(stream) = streamed(&parts) {
+        let length = header(&parts.headers, "content-length").and_then(|v| v.parse::<u64>().ok());
+        if length.is_some_and(|length| length > state.max_body as u64) {
+            return Err(S3Error::entity_too_large(state.max_body));
+        }
+        parts.extensions.insert(stream);
+        return Ok(next.run(Request::from_parts(parts, body)).await);
+    }
 
     // A POST carries XML only. Its body must not take the memory of an object upload.
     let (limit, too_large) = match parts.method {

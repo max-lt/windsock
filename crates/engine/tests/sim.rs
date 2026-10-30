@@ -224,6 +224,8 @@ struct Stats {
     far_ahead: bool,
     /// The wall clocks stepped back more than R with writes in a buffer.
     step_back: bool,
+    /// A spooled put crashed at one of its steps.
+    spool_crash: bool,
     keyless: bool,
     slow_stale_plan: bool,
     /// Chunks that a flush found stored and did not upload again.
@@ -701,6 +703,9 @@ impl Sim {
 
     async fn put(&mut self, i: usize) -> Result<(), String> {
         let key = format!("k{}", self.rng.below(KEYS));
+        if self.rng.chance(2) {
+            return self.spooled_put(i, key).await;
+        }
         // Now and then one of a few large values: a later flush can dedup its chunks.
         let value = match self.rng.chance(30) {
             true => {
@@ -735,6 +740,71 @@ impl Sim {
             }
             Err(e) => self.quarantine(i, &e),
         }
+        Ok(())
+    }
+
+    /// A put that streams its body through a spool file, now and then with a crash at one of its
+    /// steps. After a crash the proxy starts again, and the put counts as acked when its value is
+    /// the buffered head of the key: it was durable before the crash.
+    async fn spooled_put(&mut self, i: usize, key: String) -> Result<(), String> {
+        let mut value = vec![0u8; (1 << 20) + 1];
+        for piece in value.chunks_mut(8) {
+            let bytes = self.rng.next().to_le_bytes();
+            piece.copy_from_slice(&bytes[..piece.len()]);
+        }
+        let points = [
+            Point::SpoolData,
+            Point::SpoolHead,
+            Point::SpoolRename,
+            Point::SpoolAck,
+        ];
+        // The open after a crash needs the remote: in an outage it would fail for ever.
+        let outage = self.proxies[i].outage.load(Ordering::SeqCst);
+        let point = (!outage && self.rng.chance(50))
+            .then(|| points[self.rng.below(points.len() as u64) as usize]);
+        engine::sim::arm_crash(point);
+        let result = async {
+            let engine = self.engine(i);
+            let mut spool = engine
+                .begin_put(BUCKET, &key, BTreeMap::new(), WriteMode::Overwrite)
+                .await?;
+            for piece in value.chunks(1 << 20) {
+                engine.spool_write(&mut spool, piece).await?;
+            }
+            engine.finish_put(spool).await
+        }
+        .await;
+        engine::sim::arm_crash(None);
+        self.log.push(format!(
+            "p{i} spooled put {key} {point:?}: {:?}",
+            result.as_ref().map(|r| r.last_modified)
+        ));
+        let hlc = match result {
+            Ok(info) => info.last_modified,
+            Err(EngineError::SimCrash(_)) => {
+                self.stats.spool_crash = true;
+                self.proxies[i].engine = None;
+                self.open(i).await?;
+                let hash = *blake3::hash(&value).as_bytes();
+                match self.engine(i).head(BUCKET, &key).await {
+                    Ok(info) if info.content_hash == hash => info.last_modified,
+                    _ => return Ok(()),
+                }
+            }
+            Err(e) => {
+                self.quarantine(i, &e);
+                return Ok(());
+            }
+        };
+        self.acked(i, hlc)?;
+        let node = self.proxies[i].node;
+        self.keys.entry(key).or_default().push(Acked {
+            hlc,
+            node,
+            value: Some(value),
+            proxy: i,
+            dropped: false,
+        });
         Ok(())
     }
 
@@ -1232,6 +1302,7 @@ struct Totals {
     marker_fault: u64,
     far_ahead: u64,
     step_back: u64,
+    spool_crash: u64,
     keyless: u64,
     slow_stale_plan: u64,
     dedup_hits: u64,
@@ -1254,6 +1325,7 @@ impl Totals {
         self.marker_fault += u64::from(stats.marker_fault);
         self.far_ahead += u64::from(stats.far_ahead);
         self.step_back += u64::from(stats.step_back);
+        self.spool_crash += u64::from(stats.spool_crash);
         self.slow_stale_plan += u64::from(stats.slow_stale_plan);
         self.keyless += u64::from(stats.keyless);
         self.dedup_hits += stats.dedup_hits;
@@ -1284,6 +1356,7 @@ impl Totals {
             ("a failed marker write", self.marker_fault),
             ("a clock more than R ahead", self.far_ahead),
             ("a wall step back over R with a buffer", self.step_back),
+            ("a spooled put that crashed", self.spool_crash),
             ("a StalePlan after a slow upload", self.slow_stale_plan),
             ("a chain from a writer with no repo key", self.keyless),
             ("a dedup hit", self.dedup_hits),

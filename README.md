@@ -242,8 +242,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Every key reaches every bucket: there are no rights per key. So the holder of a presigned URL
   has the rights of the key that signed it, on every bucket, until the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
   metadata, If-Match and If-None-Match. Sign Content-Type when it matters. A PUT URL works many
-  times until its expiry, each time for an object up to the buffer limit, and each PUT takes
-  about 3 times its object in memory (see below).
+  times until its expiry, each time for an object up to the buffer limit. Each PUT over 1 MiB
+  goes through a spool file (see below).
 - A multipart upload must complete on the proxy that started it.
 - A GET streams the object in pieces of at most 4 MiB. One GET holds at most about 16 MiB: the
   stored bytes, the raw chunks and the piece. The peak for GETs is `max_connections` times 16 MiB.
@@ -260,10 +260,15 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - A client that stops reading a GET body holds its stream until `idle_timeout_secs` (60 s by
   default) after the last write that made progress. Stalled readers can hold the whole read budget for that time: the 503 then protects the memory, not the service. Then the daemon closes the connection. A client
   that reads slowly keeps it open: there is no minimum rate.
-- A PUT, a CopyObject and a CompleteMultipartUpload hold the whole object in memory, up to 5 GiB
-  per request. No limit covers all requests together: 10 parallel PUTs of 5 GiB need 50 GiB of
-  memory. One PUT takes about 3 times its object: a PUT of 1 GiB raised the daemon to 3.1 GiB, so a PUT at the 5 GiB cap takes about 15 GiB. Size the memory for the largest objects times the parallel uploads, or put a limit in
-  front of the proxy.
+- A PUT with a Content-Length over 1 MiB, or a chunked body with no Content-Length, and no
+  aws-chunked body, writes its body to a spool file in the buffer as it arrives, in pieces of at
+  most 1 MiB: it holds about 1 MiB of memory, and the peak for such PUTs is `max_connections`
+  times 1 MiB. Its spool file counts against the buffer limit as it grows. A smaller PUT goes
+  through the buffer in one record, with the group fsync.
+- A PUT with an aws-chunked body, a CopyObject and a CompleteMultipartUpload hold the whole
+  object in memory, up to 5 GiB per request, about 3 times the object: a PUT of 1 GiB raised the
+  daemon to 3.1 GiB, so one at the 5 GiB cap takes about 15 GiB. No limit covers them all
+  together. Size the memory for them, or put a limit in front of the proxy.
 
 ## Scale
 

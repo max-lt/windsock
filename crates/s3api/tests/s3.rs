@@ -2068,3 +2068,99 @@ async fn test_presigned_request_gets_503_while_the_clock_is_ahead() {
         reply.text()
     );
 }
+
+/// A PUT of `body` with its Content-Length, signed with `hash` or the hash of the body.
+async fn sized_put(
+    server: &Server,
+    key: &str,
+    body: Vec<u8>,
+    length: usize,
+    hash: Option<String>,
+) -> Reply {
+    let uri = format!("/bkt/{key}");
+    let mut put = call("PUT", &uri)
+        .header("content-length", length.to_string())
+        .body(body);
+    put.payload_hash = hash;
+    run(server, put).await
+}
+
+fn spool_files(server: &Server) -> usize {
+    std::fs::read_dir(server._dir.path().join("engine/buffer/spool"))
+        .map_or(0, |entries| entries.count())
+}
+
+#[tokio::test]
+async fn test_large_put_streams_through_a_spool_file() {
+    let server = with_bucket().await;
+    let body = large_object();
+
+    let put = sized_put(&server, "big", body.clone(), body.len(), None).await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    assert_eq!(put.status, StatusCode::OK, "{}", put.text());
+    assert_eq!(
+        put.header("etag").unwrap(),
+        format!("\"{}\"", blake3::hash(&body))
+    );
+    assert!(read.body == body);
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_large_put_with_a_bad_body_writes_nothing() {
+    let server = with_bucket().await;
+    let body = large_object();
+    let wrong_hash = sigv4::sha256_hex(b"other");
+
+    let mismatch = sized_put(&server, "a", body.clone(), body.len(), Some(wrong_hash)).await;
+    let short = sized_put(
+        &server,
+        "b",
+        body[..body.len() / 2].to_vec(),
+        body.len(),
+        None,
+    )
+    .await;
+    let huge = sized_put(&server, "c", b"x".to_vec(), 6 << 30, None).await;
+
+    assert_eq!(mismatch.status, StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch.xml("Code").unwrap(), "XAmzContentSHA256Mismatch");
+    assert_eq!(short.status, StatusCode::BAD_REQUEST);
+    assert_eq!(short.xml("Code").unwrap(), "IncompleteBody");
+    assert_eq!(huge.status, StatusCode::BAD_REQUEST);
+    assert_eq!(huge.xml("Code").unwrap(), "EntityTooLarge");
+    for key in ["a", "b", "c"] {
+        let read = run(&server, call("GET", &format!("/bkt/{key}"))).await;
+        assert_eq!(read.status, StatusCode::NOT_FOUND, "{key}");
+    }
+    assert_eq!(spool_files(&server), 0);
+}
+
+#[tokio::test]
+async fn test_chunked_put_with_no_length_stops_at_the_body_limit() {
+    let mut server = with_bucket().await;
+    let mut config = S3Config::new(
+        HashMap::from([(ACCESS.to_string(), SECRET.to_string())]),
+        server._dir.path().join("uploads"),
+    );
+    config.uploads = server.uploads.clone();
+    config.max_body = 2 * 1024 * 1024;
+    server.app = s3api::router(server.engine.clone(), config);
+    let body = vec![7; 3 * 1024 * 1024];
+
+    let chunked = |uri: &'static str, body: Vec<u8>| {
+        call("PUT", uri)
+            .header("transfer-encoding", "chunked")
+            .body(body)
+    };
+    let over = run(&server, chunked("/bkt/a", body.clone())).await;
+    let under = run(&server, chunked("/bkt/b", body[..1024 * 1024 + 1].to_vec())).await;
+    let read = run(&server, call("GET", "/bkt/a")).await;
+
+    assert_eq!(over.status, StatusCode::BAD_REQUEST, "{}", over.text());
+    assert_eq!(over.xml("Code").unwrap(), "EntityTooLarge");
+    assert_eq!(under.status, StatusCode::OK, "{}", under.text());
+    assert_eq!(read.status, StatusCode::NOT_FOUND);
+    assert_eq!(spool_files(&server), 0);
+}

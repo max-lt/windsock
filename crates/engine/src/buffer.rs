@@ -783,11 +783,12 @@ impl Buffer {
         if self.active.len > 0 {
             self.rotate().await?;
         }
-        // The active segment is empty: the spool takes its seq, and a new one comes after it.
+        // The active segment is empty: the spool takes its seq. The next active segment exists
+        // first, so a spooled segment is never the last one, which a replay can cut as torn.
         let seq = self.active.seq;
-        tokio::fs::rename(spool, self.segment_path(seq)).await?;
-        // The active file has no name now: a write to it would get an ack and then be lost.
-        if let Err(e) = self.open_after_spool(seq).await {
+        // After a failed create or directory fsync, the state of the directory is unknown: later
+        // acks would depend on it.
+        if let Err(e) = self.adopt_steps(spool, seq).await {
             self.broken = true;
             return Err(e);
         }
@@ -797,12 +798,14 @@ impl Buffer {
         Ok(self.written)
     }
 
-    async fn open_after_spool(&mut self, seq: u64) -> Result<(), EngineError> {
+    async fn adopt_steps(&mut self, spool: &Path, seq: u64) -> Result<(), EngineError> {
+        self.active = create_segment(&self.dir, seq + 1).await?;
+        crate::sim::crash_point(crate::sim::Point::SpoolNext)?;
+        tokio::fs::rename(spool, self.segment_path(seq)).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;
         sync_dir(&self.dir).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolRename)?;
         let size = tokio::fs::metadata(self.segment_path(seq)).await?.len();
-        self.active = create_segment(&self.dir, seq + 1).await?;
         self.sealed.insert(seq, size);
         Ok(())
     }

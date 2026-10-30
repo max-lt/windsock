@@ -83,6 +83,7 @@ async fn test_crash_at_each_spool_step_acks_nothing_and_keeps_only_durable_puts(
     for (point, durable) in [
         (Point::SpoolData, false),
         (Point::SpoolHead, false),
+        (Point::SpoolNext, false),
         (Point::SpoolDirSync, true),
         (Point::SpoolRename, true),
         (Point::SpoolAck, true),
@@ -275,7 +276,9 @@ fn last_segment(dir: &Path) -> u64 {
 }
 
 #[tokio::test]
-async fn test_failure_after_the_rename_breaks_the_buffer_and_keeps_the_put() {
+async fn test_failure_around_the_rename_breaks_the_buffer() {
+    // The next segment comes before the rename: its failure leaves no put. The directory fsync
+    // comes after it: the put is on disk, with no ack.
     for dir_sync_fails in [true, false] {
         let remote = Arc::new(MemoryRemote::default());
         let dir = tempfile::tempdir().unwrap();
@@ -314,6 +317,14 @@ async fn test_failure_after_the_rename_breaks_the_buffer_and_keeps_the_put() {
             matches!(later, Err(EngineError::BufferBroken)),
             "{dir_sync_fails}: {later:?}"
         );
-        assert!(a.get(BUCKET, "k", None).await.unwrap().data == body);
+        let read = a.get(BUCKET, "k", None).await;
+        match dir_sync_fails {
+            true => assert!(read.unwrap().data == body),
+            false => assert!(
+                matches!(read, Err(EngineError::NoSuchKey { .. })),
+                "{read:?}"
+            ),
+        }
+        assert_eq!(spool_files(dir.path()), 0);
     }
 }

@@ -16,6 +16,8 @@ pub enum Point {
     SpoolData,
     /// Its head is written and fsynced after the data.
     SpoolHead,
+    /// The next active segment exists and is durable. The rename of the spool file comes next.
+    SpoolNext,
     /// The spool file has its segment name. The directory fsync comes next.
     SpoolDirSync,
     /// The spool file is renamed to a segment, and the directory is fsynced.

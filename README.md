@@ -220,6 +220,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Keys come from the configuration file. There are no per-bucket permissions.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.
+- The proxy does not check the value of `Content-MD5` or of `x-amz-checksum-*`, in a header or in
+  an aws-chunked trailer. It checks `x-amz-content-sha256` and the trailer signature.
 - A PUT and a CompleteMultipartUpload take `If-None-Match: *` and `If-Match` (a list of ETags, or
   `*`). A mismatch gets 412 `PreconditionFailed`. `If-Match` on a missing key gets 404 `NoSuchKey`.
   The check and the write are one step on one proxy. Across proxies there is no check: two

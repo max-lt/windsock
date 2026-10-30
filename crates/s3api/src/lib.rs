@@ -24,7 +24,7 @@ use engine::Engine;
 use remote::Remote;
 
 pub use error::S3Error;
-pub use keys::{KeyStore, KeyStoreError, Secret, StaticKeys};
+pub use keys::{KEY_STORE_DEADLINE, KeyStore, KeyStoreError, Secret, StaticKeys};
 pub use s3proto::sigv4;
 
 pub use multipart::Uploads;

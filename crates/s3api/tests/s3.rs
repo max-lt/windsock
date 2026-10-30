@@ -2203,11 +2203,16 @@ async fn test_buffered_bodies_with_no_length_stop_at_the_body_limit() {
 struct LiveKeys {
     keys: std::sync::Mutex<HashMap<String, String>>,
     down: std::sync::atomic::AtomicBool,
+    /// Every lookup waits for ever.
+    hang: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
 impl KeyStore for LiveKeys {
     async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+        if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(KeyStoreError::new("the key database is locked"));
         }
@@ -2279,4 +2284,23 @@ async fn test_key_store_failure_denies_the_request_with_503() {
         assert!(!reply.text().contains("locked"), "{}", reply.text());
     }
     assert_eq!(read.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_key_store_that_never_answers_gets_503_at_the_deadline() {
+    let store = Arc::new(LiveKeys::default());
+    let server = with_key_store(store.clone()).await;
+
+    store.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let start = std::time::Instant::now();
+    let reply = tokio::time::timeout(
+        s3api::KEY_STORE_DEADLINE * 3,
+        run(&server, call("GET", "/bkt/k")),
+    )
+    .await
+    .expect("the deadline ends the lookup");
+
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.xml("Code").unwrap(), "ServiceUnavailable");
+    assert!(start.elapsed() >= s3api::KEY_STORE_DEADLINE);
 }

@@ -2,6 +2,7 @@
 //! request and keeps no copy, so a change in the store applies at the next request.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use tracing::warn;
@@ -40,6 +41,14 @@ impl KeyStoreError {
 }
 
 /// The source of the secret keys.
+///
+/// - s3api keeps no cache: each request costs one lookup, also for an unknown key. The store
+///   caches its answers, the negative ones too, to protect itself.
+/// - SigV4 needs the secret in clear, so the store holds secrets that it can read back. The
+///   process that embeds windsockd protects them at rest.
+/// - A key revoked during a streamed PUT does not stop that PUT. The next request fails.
+/// - The secret is wiped from memory at the end of the request.
+/// - A lookup longer than [`KEY_STORE_DEADLINE`] gets 503.
 #[async_trait::async_trait]
 pub trait KeyStore: Send + Sync {
     /// The secret of `access_key`. `None` when the key is unknown or revoked.
@@ -69,9 +78,28 @@ impl KeyStore for StaticKeys {
     }
 }
 
+/// The longest wait for one lookup: a store that hangs must not hold the connection.
+pub const KEY_STORE_DEADLINE: Duration = Duration::from_secs(2);
+
+fn unavailable() -> S3Error {
+    S3Error::new(
+        "ServiceUnavailable",
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the key store is not available",
+    )
+}
+
 /// The secret of `access_key`, or the S3 error that denies the request.
 pub(crate) async fn secret_of(store: &dyn KeyStore, access_key: &str) -> Result<Secret, S3Error> {
-    match store.secret(access_key).await {
+    let Ok(answer) = tokio::time::timeout(KEY_STORE_DEADLINE, store.secret(access_key)).await
+    else {
+        warn!(
+            deadline_ms = KEY_STORE_DEADLINE.as_millis() as u64,
+            "key store did not answer in time: the request is denied"
+        );
+        return Err(unavailable());
+    };
+    match answer {
         Ok(Some(secret)) => Ok(secret),
         Ok(None) => Err(S3Error::new(
             "InvalidAccessKeyId",
@@ -81,11 +109,7 @@ pub(crate) async fn secret_of(store: &dyn KeyStore, access_key: &str) -> Result<
         Err(e) => {
             // The client sees no text of the store: it can name files or hosts.
             warn!(%e, "key store failed: the request is denied");
-            Err(S3Error::new(
-                "ServiceUnavailable",
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the key store is not available",
-            ))
+            Err(unavailable())
         }
     }
 }

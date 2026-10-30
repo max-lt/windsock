@@ -79,6 +79,101 @@ pub fn fixed_chunks<'a>(keys: &'a Keys, data: &'a [u8]) -> impl Iterator<Item = 
     })
 }
 
+/// How an input is cut into chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cuts {
+    /// [`chunks`].
+    ContentDefined,
+    /// [`fixed_chunks`].
+    Fixed,
+}
+
+/// A chunk with its own copy of its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedChunk {
+    pub id: ChunkId,
+    pub offset: usize,
+    pub data: Vec<u8>,
+}
+
+/// The chunks of an input that comes in pieces: the same chunks as [`chunks`] or
+/// [`fixed_chunks`] over the whole input. A content-defined cut depends only on the
+/// [`MAX_SIZE`] bytes after the start of its chunk, so a chunk goes out once that many bytes are
+/// in. The chunker holds at most [`MAX_SIZE`] bytes and one piece.
+pub struct StreamChunker {
+    keys: Keys,
+    cuts: Cuts,
+    pending: Vec<u8>,
+    /// Offset of `pending` in the input.
+    offset: usize,
+}
+
+impl StreamChunker {
+    pub fn new(keys: Keys, cuts: Cuts) -> Self {
+        Self {
+            keys,
+            cuts,
+            pending: Vec::new(),
+            offset: 0,
+        }
+    }
+
+    /// The chunks that `piece` completes.
+    pub fn push(&mut self, piece: &[u8]) -> Vec<OwnedChunk> {
+        self.pending.extend_from_slice(piece);
+        self.take(End::More)
+    }
+
+    /// The last chunks, at the end of the input.
+    pub fn finish(mut self) -> Vec<OwnedChunk> {
+        self.take(End::Reached)
+    }
+
+    fn take(&mut self, end: End) -> Vec<OwnedChunk> {
+        let len = self.pending.len();
+        let spans: Vec<(usize, usize)> = match self.cuts {
+            Cuts::ContentDefined => FastCDC::with_level_and_seed(
+                &self.pending,
+                MIN_SIZE,
+                AVG_SIZE,
+                MAX_SIZE,
+                Normalization::Level1,
+                self.keys.cdc_seed(),
+            )
+            .map(|c| (c.offset, c.length))
+            .collect(),
+            Cuts::Fixed => (0..len)
+                .step_by(MAX_SIZE)
+                .map(|offset| (offset, MAX_SIZE.min(len - offset)))
+                .collect(),
+        };
+        let mut out = Vec::new();
+        let mut used = 0;
+        for (offset, length) in spans {
+            // More input can still move the cut of this chunk.
+            if end == End::More && offset + MAX_SIZE > len {
+                break;
+            }
+            let data = self.pending[offset..offset + length].to_vec();
+            out.push(OwnedChunk {
+                id: self.keys.chunk_id(&data),
+                offset: self.offset + offset,
+                data,
+            });
+            used = offset + length;
+        }
+        self.pending.drain(..used);
+        self.offset += used;
+        out
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    More,
+    Reached,
+}
+
 /// Compresses a raw chunk. Keeps the raw bytes when zstd does not make them smaller.
 pub fn compress(raw: &[u8]) -> (Compression, Cow<'_, [u8]>) {
     let compressed = compress_to_vec(raw, CompressionLevel::Fastest);
@@ -307,5 +402,43 @@ mod tests {
             fixed_chunks(keys(), &data).next().unwrap().id,
             fixed_chunks(&other, &data).next().unwrap().id
         );
+    }
+    /// The chunks of `data` fed to a [`StreamChunker`] in pieces of `piece` bytes.
+    fn streamed(cuts: Cuts, data: &[u8], piece: usize) -> Vec<(ChunkId, usize, usize)> {
+        let mut chunker = StreamChunker::new(keys().clone(), cuts);
+        let mut out = Vec::new();
+        for part in data.chunks(piece.max(1)) {
+            out.extend(chunker.push(part));
+        }
+        out.extend(chunker.finish());
+        out.into_iter()
+            .map(|chunk| (chunk.id, chunk.offset, chunk.data.len()))
+            .collect()
+    }
+
+    #[test]
+    fn test_streamed_chunks_are_the_chunks_of_the_whole_input() {
+        for len in [0, 1, MIN_SIZE - 1, 3 * AVG_SIZE + 5, 5 * MAX_SIZE + 123] {
+            let data = random_bytes(len as u8, len);
+            let whole: Vec<_> = chunks(keys(), &data)
+                .map(|c| (c.id, c.offset, c.data.len()))
+                .collect();
+            let fixed: Vec<_> = fixed_chunks(keys(), &data)
+                .map(|c| (c.id, c.offset, c.data.len()))
+                .collect();
+
+            for piece in [1, 7, 4096, 100_000, 1 << 20] {
+                // Each push cuts all the bytes it holds again: tiny pieces stay on small inputs.
+                if piece < 4096 && len > MIN_SIZE {
+                    continue;
+                }
+                assert_eq!(
+                    streamed(Cuts::ContentDefined, &data, piece),
+                    whole,
+                    "{len} {piece}"
+                );
+                assert_eq!(streamed(Cuts::Fixed, &data, piece), fixed, "{len} {piece}");
+            }
+        }
     }
 }

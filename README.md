@@ -293,7 +293,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   chunk, the trailer signature and `x-amz-decoded-content-length` match.
 - Measured on macOS, one daemon, PUTs of a 100 MiB file at 200 KiB/s for 60 s: 64 writers raised
   the daemon from 224 MiB to 241 MiB, and 250 writers from 43 MiB to 106 MiB, about 260 KiB per
-  writer, with 2.9 GiB in spool files. When the clients stopped, no spool file stayed.
+  writer, with 2.9 GiB in spool files. When the clients stopped, no spool file stayed. The same
+  measure with aws-chunked PUTs (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`, chunks of 64 KiB): 64
+  writers raised the daemon from 53 MiB to 60 MiB, and 250 writers from 60 MiB to 155 MiB, about
+  390 KiB per writer, with 2.9 GiB in spool files and none after the stop.
 - The flush and the replay at start read each buffered object whole into memory: after one PUT of
   100 MiB, its flush raised the daemon to 224 MiB. So a spooled PUT of 5 GiB takes more than
   5 GiB of memory at its flush.

@@ -382,17 +382,6 @@ impl<R: Remote + 'static> Engine<R> {
             })
             .collect()
     }
-
-    /// Keeps the chunks of a flushed object, for a prefix whose policy keeps writes.
-    pub(crate) async fn cache_written(&self, data: &[u8], chunks: &[(ChunkId, Range<usize>)]) {
-        let Some(cache) = &self.cache else {
-            return;
-        };
-
-        for (id, range) in chunks {
-            keep(cache, *id, &data[range.clone()]).await;
-        }
-    }
 }
 
 pub(crate) fn stored(state: &ObjectState) -> Current {

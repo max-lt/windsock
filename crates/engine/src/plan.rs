@@ -8,9 +8,9 @@ use model::{ChunkId, PackId};
 use pack::{Nonce, Pack, PackBuilder, PackEntry};
 use seal::Keys;
 
+use crate::config::Policy;
 #[cfg(test)]
-use crate::config::CacheMode;
-use crate::config::{Chunking, Policy};
+use crate::config::{CacheMode, Chunking};
 use crate::manifest::{ChunkRef, Manifest};
 
 /// Nonces for the packs and manifests of one flush.
@@ -60,11 +60,19 @@ struct PlannedObject {
 }
 
 /// The result of [`Planner::add`].
+#[cfg(test)]
 pub(crate) struct Added {
     /// Packs that closed: upload them now.
     pub closed: Vec<Pack>,
-    /// Every chunk of the object and its bytes in the object, in object order.
-    pub chunks: Vec<(ChunkId, Range<usize>)>,
+}
+
+/// An object that the planner takes chunk by chunk.
+pub(crate) struct OpenObject {
+    /// The object gets packs of its own.
+    own: bool,
+    own_pack: Option<OpenPack>,
+    object: PlannedObject,
+    policy: Policy,
 }
 
 /// Puts the new chunks of a batch of objects into packs.
@@ -98,9 +106,83 @@ impl Planner {
         }
     }
 
-    /// Adds the next object of the batch.
-    ///
-    /// `stored` gives the location of a chunk that is already in the remote.
+    /// Starts the next object of the batch. Its chunks come with [`Planner::add_chunk`], in
+    /// object order, then [`Planner::end`].
+    pub fn begin(
+        &self,
+        size: u64,
+        content_hash: [u8; 32],
+        metadata: BTreeMap<String, String>,
+        policy: Policy,
+    ) -> OpenObject {
+        OpenObject {
+            own: size >= self.own_pack_threshold as u64,
+            own_pack: None,
+            object: PlannedObject {
+                size,
+                content_hash,
+                metadata,
+                slots: Vec::new(),
+            },
+            policy,
+        }
+    }
+
+    /// Places the next chunk of `object`. `stored` gives the location of a chunk that is already
+    /// in the remote. Returns a pack that this chunk filled: upload it now.
+    pub fn add_chunk<E>(
+        &mut self,
+        object: &mut OpenObject,
+        chunk: Chunk<'_>,
+        stored: impl FnOnce(ChunkId) -> Result<Option<ChunkRef>, E>,
+    ) -> Result<Option<Pack>, E> {
+        if let Some(slot) = self.placed.get(&chunk.id) {
+            object.object.slots.push(*slot);
+            return Ok(None);
+        }
+        if let Some(location) = stored(chunk.id)? {
+            object.object.slots.push(Slot::Stored(location));
+            return Ok(None);
+        }
+
+        let target = match object.own {
+            true => &mut object.own_pack,
+            false => &mut self.shared,
+        };
+        let open = target.get_or_insert_with(|| {
+            self.pack_ids.push(None);
+            OpenPack {
+                number: self.pack_ids.len() - 1,
+                builder: PackBuilder::with_capacity(
+                    self.nonces.next(),
+                    &self.keys,
+                    self.pack_target + 2 * chunking::MAX_SIZE,
+                ),
+            }
+        });
+        let slot = Slot::Building {
+            pack: open.number,
+            entry: open.builder.add(chunk, object.policy.compression),
+        };
+        self.placed.insert(chunk.id, slot);
+        object.object.slots.push(slot);
+
+        if open.builder.size() < self.pack_target {
+            return Ok(None);
+        }
+        let full = target.take().expect("the pack was just opened");
+        Ok(Some(close(&mut self.pack_ids, full)))
+    }
+
+    /// Ends `object`. Returns its own pack when one is open: upload it now.
+    pub fn end(&mut self, object: OpenObject) -> Option<Pack> {
+        let closed = object.own_pack.map(|open| close(&mut self.pack_ids, open));
+        self.objects.push(object.object);
+        closed
+    }
+
+    /// Adds a whole object of the batch.
+    #[cfg(test)]
     pub fn add<E>(
         &mut self,
         data: &[u8],
@@ -109,62 +191,18 @@ impl Planner {
         policy: Policy,
         mut stored: impl FnMut(ChunkId) -> Result<Option<ChunkRef>, E>,
     ) -> Result<Added, E> {
+        let keys = self.keys.clone();
         let chunks: Vec<Chunk<'_>> = match policy.chunking {
-            Chunking::ContentDefined => chunking::chunks(&self.keys, data).collect(),
-            Chunking::Fixed => chunking::fixed_chunks(&self.keys, data).collect(),
+            Chunking::ContentDefined => chunking::chunks(&keys, data).collect(),
+            Chunking::Fixed => chunking::fixed_chunks(&keys, data).collect(),
         };
-        let spans = chunks
-            .iter()
-            .map(|c| (c.id, c.offset..c.offset + c.data.len()))
-            .collect();
-        let own = data.len() >= self.own_pack_threshold;
-        let mut own_pack = None;
+        let mut object = self.begin(data.len() as u64, content_hash, metadata, policy);
         let mut closed = Vec::new();
-        let mut slots = Vec::with_capacity(chunks.len());
-
         for chunk in chunks {
-            if let Some(slot) = self.placed.get(&chunk.id) {
-                slots.push(*slot);
-                continue;
-            }
-
-            if let Some(location) = stored(chunk.id)? {
-                slots.push(Slot::Stored(location));
-                continue;
-            }
-
-            let target = if own { &mut own_pack } else { &mut self.shared };
-            let open = target.get_or_insert_with(|| {
-                self.pack_ids.push(None);
-                OpenPack {
-                    number: self.pack_ids.len() - 1,
-                    builder: PackBuilder::new(self.nonces.next(), &self.keys),
-                }
-            });
-            let slot = Slot::Building {
-                pack: open.number,
-                entry: open.builder.add(chunk, policy.compression),
-            };
-            self.placed.insert(chunk.id, slot);
-            slots.push(slot);
-
-            if open.builder.size() >= self.pack_target {
-                let full = target.take().expect("the pack was just opened");
-                closed.push(close(&mut self.pack_ids, full));
-            }
+            closed.extend(self.add_chunk(&mut object, chunk, &mut stored)?);
         }
-
-        closed.extend(own_pack.map(|open| close(&mut self.pack_ids, open)));
-        self.objects.push(PlannedObject {
-            size: data.len() as u64,
-            content_hash,
-            metadata,
-            slots,
-        });
-        Ok(Added {
-            closed,
-            chunks: spans,
-        })
+        closed.extend(self.end(object));
+        Ok(Added { closed })
     }
 
     /// Closes the last shared pack. Returns it, and the manifests in the order of `add`.

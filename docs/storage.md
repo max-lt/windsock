@@ -200,6 +200,18 @@ and fails. `windsockd quarantine list` marks such a record `corrupt` in its last
 operator does the steps of "What the operator does": the body in the quarantine is damaged, so
 keep a write only from the copy that the client holds.
 
+A flush reads each put twice. The first pass hashes the data against the head before any pack
+of it goes to the remote. The second pass reads the data again in pieces of 1 MiB, cuts it into
+chunks, uploads each pack as it fills, and hashes the data again: the log entry goes up only
+when that hash matches too, so a change between the two passes gets no log entry. The memory of
+a flush is one pack target and one piece, not the object. When a pass finds a mismatch, the
+flush stops with no log entry. The proxy logs one
+`ERROR buffered data does not match its head: no flush until a restart moves it to quarantine`
+with the key, once until a restart. `Node::status()` shows `quarantined = true`. The flusher
+stops. Writes go on until the buffer limit, then get `503 SlowDown`. The next start moves the
+record to the quarantine, as above. Packs that the stopped flush uploaded have no log entry: the
+GC deletes them as orphans.
+
 A power loss can give this refusal. An append writes the data and the head of a put in one write,
 and the fsync comes after it: after a power loss, the head can be on disk and part of the data
 not. Such a put had no ack. The refusal and `windsockd quarantine list` show its key with

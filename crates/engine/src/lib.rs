@@ -279,6 +279,9 @@ pub struct Engine<R> {
     draining: AtomicBool,
     /// A buffered write is older than R at flush: no write and no flush until a restart.
     quarantined: AtomicBool,
+    /// A flush met data that does not match its head: no flush until a restart moves it to the
+    /// quarantine. Writes go on, up to the buffer limit.
+    bad_data: AtomicBool,
     /// The last buffer append failed: logged once until an append works.
     buffer_failing: AtomicBool,
     /// The clock was more than R ahead of the wall clock at the last check: logged once.
@@ -589,6 +592,7 @@ impl<R: Remote + 'static> Engine<R> {
             flush_wanted: Notify::new(),
             draining: AtomicBool::new(false),
             quarantined: AtomicBool::new(false),
+            bad_data: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
             clock_ahead: AtomicBool::new(false),
             read_budget,

@@ -30,6 +30,8 @@ pub enum Point {
     QuarantineCopy,
     /// The segment of that record is written again without it.
     QuarantineRewrite,
+    /// The flush read a put and checked its data. Its chunk pass reads the data again next.
+    FlushVerified,
 }
 
 #[cfg(feature = "sim")]
@@ -76,3 +78,37 @@ pub(crate) fn crash_point(point: Point) -> Result<()> {
 pub(crate) fn crash_point(_point: Point) -> Result<()> {
     Ok(())
 }
+
+/// A test action and the point where it runs.
+#[cfg(feature = "sim")]
+type Action = Option<(Point, Box<dyn FnOnce()>)>;
+
+#[cfg(feature = "sim")]
+thread_local! {
+    static ACTION: std::cell::RefCell<Action> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `action` at the next pass at `point` on this thread, and goes on: a test changes a file
+/// there.
+#[cfg(feature = "sim")]
+pub fn arm_action(point: Point, action: impl FnOnce() + 'static) {
+    ACTION.with(|armed| *armed.borrow_mut() = Some((point, Box::new(action))));
+}
+
+#[cfg(feature = "sim")]
+pub(crate) fn action_point(point: Point) {
+    let action = ACTION.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        match armed.as_ref() {
+            Some((at, _)) if *at == point => armed.take().map(|(_, action)| action),
+            _ => None,
+        }
+    });
+    if let Some(action) = action {
+        action();
+    }
+}
+
+#[cfg(not(feature = "sim"))]
+#[inline(always)]
+pub(crate) fn action_point(_point: Point) {}

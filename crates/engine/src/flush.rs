@@ -1,6 +1,11 @@
 //! The flush: plan packs, upload them, commit one journal entry for the batch.
 
+use chunking::{Cuts, OwnedChunk, StreamChunker};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
 use super::*;
+use crate::buffer::Read;
+use crate::plan::OpenObject;
 
 /// Upper bound on the buffered data that one journal entry covers.
 const SEGMENTS_PER_ENTRY: usize = 16;
@@ -77,6 +82,97 @@ impl<R: Remote + 'static> Engine<R> {
                 }
             }
         })
+    }
+
+    /// Pass 2 of a put: reads its data `(segment, offset, length)` again in pieces, cuts it into
+    /// chunks, places them, and uploads each pack as it fills. The memory is one pack target and
+    /// one piece, not the object. Returns the blake3 hash of the data that it read.
+    async fn plan_data(
+        &self,
+        planner: &mut Planner,
+        mut object: OpenObject,
+        (path, offset, len): (&Path, u64, u64),
+        policy: Policy,
+        dedup: bool,
+    ) -> Result<[u8; 32]> {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let cuts = match policy.chunking {
+            Chunking::ContentDefined => Cuts::ContentDefined,
+            Chunking::Fixed => Cuts::Fixed,
+        };
+        let mut chunker = StreamChunker::new(self.keys.clone(), cuts);
+        let mut hasher = blake3::Hasher::new();
+        let mut piece = vec![0u8; len.min(buffer::READ_PIECE) as usize];
+        let mut left = len;
+        while left > 0 {
+            let size = left.min(buffer::READ_PIECE) as usize;
+            file.read_exact(&mut piece[..size]).await?;
+            hasher.update(&piece[..size]);
+            left -= size as u64;
+            for chunk in chunker.push(&piece[..size]) {
+                self.plan_chunk(planner, &mut object, chunk, policy, dedup)
+                    .await?;
+            }
+        }
+        for chunk in chunker.finish() {
+            self.plan_chunk(planner, &mut object, chunk, policy, dedup)
+                .await?;
+        }
+        if let Some(pack) = planner.end(object) {
+            self.upload_packs(vec![pack]).await?;
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    async fn plan_chunk(
+        &self,
+        planner: &mut Planner,
+        object: &mut OpenObject,
+        chunk: OwnedChunk,
+        policy: Policy,
+        dedup: bool,
+    ) -> Result<()> {
+        let view = chunking::Chunk {
+            id: chunk.id,
+            offset: chunk.offset,
+            data: &chunk.data,
+        };
+        let full = planner.add_chunk(object, view, |id| {
+            if !dedup {
+                return Ok(None);
+            }
+            let stored = self.stored_chunk(id);
+            if let Ok(Some(_)) = &stored {
+                crate::sim::count_dedup();
+            }
+            stored
+        })?;
+        if let Some(pack) = full {
+            self.upload_packs(vec![pack]).await?;
+        }
+        if policy.cache == CacheMode::ReadWrite
+            && let Some(cache) = &self.cache
+        {
+            crate::read::keep(cache, chunk.id, &chunk.data).await;
+        }
+        Ok(())
+    }
+
+    /// A put whose data does not match its head: no pack of it and no log entry. One ERROR per
+    /// streak; the flusher stops until a restart moves it to the quarantine, and writes go on.
+    fn bad_data_found(&self, target: &str) -> EngineError {
+        if !self.bad_data.swap(true, Ordering::SeqCst) {
+            error!(
+                key = target,
+                "buffered data does not match its head: no flush until a restart moves it to \
+                 quarantine"
+            );
+        }
+        EngineError::Corrupt(format!(
+            "{target}: its buffered data does not match its head. No flush until a restart \
+             moves it to the quarantine"
+        ))
     }
 
     /// Finishes the commit of a flush that a crash or an error interrupted.
@@ -170,11 +266,22 @@ impl<R: Remote + 'static> Engine<R> {
             crate::sim::crash_point(crate::sim::Point::SegmentRead)?;
             let mut reader = SegmentReader::open(&path).await?;
 
-            while let Some(record) = reader.next(&path).await? {
-                let data = match record.head.op {
-                    Op::Put { .. } => buffer::read_record_data(&path, &record).await?,
-                    _ => Vec::new(),
+            loop {
+                let record = match reader.read().await? {
+                    Read::Record(record) => record,
+                    Read::End => break,
+                    // Pass 1: the reader hashed the data against its head. No pack of it goes up.
+                    Read::BadData(record) => {
+                        return Err(self.bad_data_found(&record.head.op.target()));
+                    }
+                    Read::BadHead { start, .. } => {
+                        return Err(EngineError::Corrupt(format!(
+                            "{}: invalid record at offset {start}",
+                            path.display()
+                        )));
+                    }
                 };
+                let (data_offset, data_len) = (record.data_offset, record.data_len);
                 let next = match record.head.op {
                     Op::Put {
                         bucket,
@@ -182,20 +289,17 @@ impl<R: Remote + 'static> Engine<R> {
                         metadata,
                         content_hash,
                     } => {
+                        crate::sim::action_point(crate::sim::Point::FlushVerified);
+                        let target = format!("{bucket}/{key}");
                         let policy = self.config.policy(&bucket, &key);
-                        let added = planner.add(&data, content_hash, metadata, policy, |id| {
-                            if !dedup {
-                                return Ok(None);
-                            }
-                            let stored = self.stored_chunk(id);
-                            if let Ok(Some(_)) = &stored {
-                                crate::sim::count_dedup();
-                            }
-                            stored
-                        })?;
-                        self.upload_packs(added.closed).await?;
-                        if policy.cache == CacheMode::ReadWrite {
-                            self.cache_written(&data, &added.chunks).await;
+                        let object = planner.begin(data_len, content_hash, metadata, policy);
+                        let data = (path.as_path(), data_offset, data_len);
+                        let hash = self
+                            .plan_data(&mut planner, object, data, policy, dedup)
+                            .await?;
+                        // Pass 2 hashed what it planned: a change since pass 1 gets no log entry.
+                        if hash != content_hash {
+                            return Err(self.bad_data_found(&target));
                         }
                         objects += 1;
                         Planned::Put {

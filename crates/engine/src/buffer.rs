@@ -36,7 +36,7 @@ const MAX_HEAD_LEN: u32 = 64 * 1024;
 /// Larger data is garbage: an S3 PUT holds 5 GiB at most.
 pub(crate) const MAX_DATA_LEN: u64 = 5 << 30;
 /// The largest piece of data that a read of the buffer holds at once.
-const READ_PIECE: u64 = 1 << 20;
+pub(crate) const READ_PIECE: u64 = 1 << 20;
 
 const SEGMENT_SUFFIX: &str = ".log";
 
@@ -196,24 +196,6 @@ impl SegmentReader {
             offset: offset.min(len),
             len,
         })
-    }
-
-    /// Next record, or `None` at the end. A torn or corrupt record is an error.
-    pub async fn next(&mut self, path: &Path) -> Result<Option<Record>, EngineError> {
-        match self.read().await? {
-            Read::Record(record) => Ok(Some(record)),
-            Read::End => Ok(None),
-            Read::BadHead { start, .. } => Err(EngineError::Corrupt(format!(
-                "{}: invalid record at offset {start}",
-                path.display()
-            ))),
-            Read::BadData(record) => Err(EngineError::Corrupt(format!(
-                "{}: the data of {} at offset {} does not match its head",
-                path.display(),
-                record.head.op.target(),
-                record.span.start
-            ))),
-        }
     }
 
     /// Next record of a quarantine file, with `true` when its data does not match its head.
@@ -1496,7 +1478,7 @@ mod tests {
         let path = buffer.segment_path(seq);
         let mut reader = SegmentReader::open(&path).await.unwrap();
         let mut out = Vec::new();
-        while let Some(record) = reader.next(&path).await.unwrap() {
+        while let Some((record, _)) = reader.next_held(&path).await.unwrap() {
             out.push(record);
         }
         out
@@ -1518,7 +1500,7 @@ mod tests {
         for seq in seqs {
             let path = segment_path(dir, seq);
             let mut reader = SegmentReader::open(&path).await.unwrap();
-            while let Some(record) = reader.next(&path).await.unwrap() {
+            while let Some((record, _)) = reader.next_held(&path).await.unwrap() {
                 out.push((record.head.time, record.head.op.target()));
             }
         }

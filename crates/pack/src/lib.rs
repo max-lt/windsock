@@ -84,7 +84,14 @@ pub struct PackBuilder {
 
 impl PackBuilder {
     pub fn new(nonce: Nonce, keys: &Keys) -> Self {
-        let mut bytes = Vec::new();
+        Self::with_capacity(nonce, keys, 0)
+    }
+
+    /// A builder whose bytes reserve `capacity` at once. Packs of one size reuse the memory of the
+    /// last one; a pack that grows by doubling leaves blocks of every size that an allocator can
+    /// keep.
+    pub fn with_capacity(nonce: Nonce, keys: &Keys, capacity: usize) -> Self {
+        let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
         bytes.extend_from_slice(&nonce);

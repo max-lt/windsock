@@ -166,9 +166,10 @@ impl<R: Remote + 'static> Engine<R> {
         self.clock.last()
     }
 
-    /// True when a buffered write is older than the late limit: no flush until a restart.
+    /// True when a buffered write is older than the late limit, or its data does not match its
+    /// head: no flush until a restart.
     pub fn is_quarantined(&self) -> bool {
-        self.quarantined.load(Ordering::SeqCst)
+        self.quarantined.load(Ordering::SeqCst) || self.bad_data.load(Ordering::SeqCst)
     }
 
     /// True after [`Engine::drain`]: writes get refused.
@@ -399,7 +400,7 @@ mod tests {
         for seq in buffer::segment_seqs(&buffer_dir).await {
             let path = buffer::segment_path(&buffer_dir, seq);
             let mut reader = buffer::SegmentReader::open(&path).await.unwrap();
-            while let Some(record) = reader.next(&path).await.unwrap() {
+            while let Some((record, _)) = reader.next_held(&path).await.unwrap() {
                 times.push(record.head.time);
             }
         }

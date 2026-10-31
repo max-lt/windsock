@@ -33,6 +33,8 @@ pub struct Model {
     /// Each value that a key ever had or may have had: a copy can read any of them on a proxy that
     /// is behind.
     history: Mutex<BTreeMap<String, BTreeSet<Value>>>,
+    /// Reads that returned a value that their key never had, and the reads checked.
+    reads: Mutex<(Vec<String>, u64)>,
 }
 
 impl Model {
@@ -69,6 +71,20 @@ impl Model {
     /// A copy of `source` to `key`. An acked copy gives the value that its ETag names. A copy that
     /// may have had an effect adds each value that `source` ever had.
     pub fn record_copy(&self, key: &str, source: &str, value: Value, outcome: Outcome) {
+        if let (Outcome::Acked, Some(copied)) = (outcome, value) {
+            let had = self
+                .history
+                .lock()
+                .expect("no panic while the lock is held")
+                .get(source)
+                .is_some_and(|values| values.contains(&Some(copied)));
+            if !had {
+                let mut reads = self.reads.lock().expect("no panic while the lock is held");
+                reads.0.push(format!(
+                    "a copy of {source} to {key} gave {copied:?}, a value that the source never had"
+                ));
+            }
+        }
         if let (Outcome::Acked, Some(_)) | (Outcome::Refused, _) = (outcome, value) {
             return self.record(key, value, outcome);
         }
@@ -103,6 +119,32 @@ impl Model {
             .lock()
             .expect("no panic while the lock is held")
             .0
+            .clone()
+    }
+
+    /// Checks a whole GET of `key` that returned `value`. One worker writes each key, one operation
+    /// at a time, so every value that a proxy can give, also one that is behind, is in the history.
+    pub fn check_read(&self, key: &str, value: Value) {
+        let known = self
+            .history
+            .lock()
+            .expect("no panic while the lock is held")
+            .get(key)
+            .is_some_and(|values| values.contains(&value));
+        let mut reads = self.reads.lock().expect("no panic while the lock is held");
+        reads.1 += 1;
+        if !known {
+            reads.0.push(format!(
+                "GET {key} gave {value:?}, a value that it never had"
+            ));
+        }
+    }
+
+    /// The reads that broke the model, and the count of reads checked.
+    pub fn read_faults(&self) -> (Vec<String>, u64) {
+        self.reads
+            .lock()
+            .expect("no panic while the lock is held")
             .clone()
     }
 
@@ -204,6 +246,35 @@ mod tests {
         let want = BTreeSet::from([digest(b"a"), digest(b"b"), digest(b"c")]);
         assert_eq!(model.allowed()["dst"], want);
         assert_eq!(model.allowed()["other"], BTreeSet::from([digest(b"b")]));
+    }
+
+    #[test]
+    fn test_read_of_a_value_that_the_key_never_had_is_a_fault() {
+        let model = Model::default();
+        model.record("k", digest(b"a"), Outcome::Acked);
+        model.record("k", digest(b"b"), Outcome::Acked);
+        model.record("k", digest(b"c"), Outcome::Refused);
+
+        model.check_read("k", digest(b"a"));
+        model.check_read("k", digest(b"c"));
+        model.check_read("other", digest(b"a"));
+
+        let (faults, reads) = model.read_faults();
+        assert_eq!(reads, 3);
+        assert_eq!(faults.len(), 2, "{faults:?}");
+    }
+
+    #[test]
+    fn test_acked_copy_of_a_value_that_the_source_never_had_is_a_fault() {
+        let model = Model::default();
+        model.record("src", digest(b"a"), Outcome::Acked);
+
+        model.record_copy("dst", "src", digest(b"a"), Outcome::Acked);
+        model.record_copy("dst", "src", digest(b"x"), Outcome::Acked);
+
+        let (faults, _) = model.read_faults();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(faults[0].contains("never had"), "{faults:?}");
     }
 
     #[test]

@@ -416,7 +416,8 @@ The chaos soak runs 3 daemons on one directory remote under mixed S3 traffic, wi
 restarts, a full disk under the buffer and the index, and a stop longer than H. The traffic holds
 puts up to 24 MiB, multipart uploads with parts up to 6 MB, copies, and GETs of large objects that
 read ahead, some by clients that go away at a random point. At the end, every proxy must read the
-same value for each key, and one that the acks allow. It needs macOS
+same value for each key, and one that the acks allow. During the load, the body of each whole GET and the
+ETag of each acked copy must be a value that the key or the copy source had. It needs macOS
 (`hdiutil`), `rsync` and `lsof`, and exits 1 when a check fails:
 
 ```bash

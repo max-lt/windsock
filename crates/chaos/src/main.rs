@@ -119,7 +119,7 @@ async fn worker(
                 Some(outcome)
             }
             1 => {
-                let _ = p.s3.get(&path).await;
+                check_get(&model, &key, p.s3.get(&path).await);
                 None
             }
             2 => {
@@ -175,7 +175,7 @@ async fn worker(
                 None
             }
             _ => {
-                let _ = p.s3.get(&big_path).await;
+                check_get(&model, &big, p.s3.get(&big_path).await);
                 None
             }
         };
@@ -185,6 +185,15 @@ async fn worker(
             tokio::time::sleep(REFUSED_PAUSE).await;
         }
         tokio::time::sleep(LEVELS[level].1).await;
+    }
+}
+
+/// Checks the body of a whole GET that ended with 200 against the history of its key.
+fn check_get(model: &Model, key: &str, reply: Result<s3::Reply, s3::Failure>) {
+    if let Ok(reply) = reply
+        && reply.status == 200
+    {
+        model.check_read(key, digest(&reply.body));
     }
 }
 
@@ -419,6 +428,11 @@ async fn soak(args: &Args, proxies: Arc<Vec<Proxy>>) -> Result<bool, String> {
     let hits = alarms(&proxies);
 
     println!("RESULT keys {} bad {}", allowed.len(), bad.len());
+    let (read_faults, reads) = model.read_faults();
+    println!("RESULT reads {reads} bad {}", read_faults.len());
+    for fault in read_faults.iter().take(10) {
+        println!("RESULT bad read {fault}");
+    }
     for (key, seen) in bad.iter().take(10) {
         println!("RESULT bad {key}: {seen:?}, allowed {:?}", allowed[key]);
     }
@@ -439,7 +453,7 @@ async fn soak(args: &Args, proxies: Arc<Vec<Proxy>>) -> Result<bool, String> {
     for sample in samples.lock().await.iter() {
         println!("RESULT usage {sample}");
     }
-    Ok(bad.is_empty() && hits.is_empty())
+    Ok(bad.is_empty() && hits.is_empty() && read_faults.is_empty())
 }
 
 #[tokio::main]

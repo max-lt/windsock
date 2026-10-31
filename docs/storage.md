@@ -381,7 +381,8 @@ hyper hands the connection to the next call: a test of 1000 reads at once, and o
 server delay, measured 64 remote connections open at the peak, under the 96 of the budget. At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
 start, and the error names `ulimit -n`. A `max_connections` that needs more than the soft limit
 also stops the start, with the value, the limit and the number needed. With a soft limit of 600
-and 172 connections open, a test measured 190 descriptors at the peak. In a
+and 172 connections that each hold a GET of a buffered object open, a test measured 362
+descriptors at the peak: 2 per connection and 18 more. In a
 chaos soak on macOS, the index tables grew from 2 to 22 in 7 minutes.
 
 ## GC deletes and the clock of the GC host

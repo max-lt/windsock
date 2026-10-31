@@ -3345,3 +3345,44 @@ async fn test_crash_during_a_copy_leaves_no_spool_and_no_object() {
     assert_eq!(read.status, StatusCode::NOT_FOUND);
     assert_eq!(spool_files(&server), 0);
 }
+
+/// A store over a synchronous database, as the KeyStore docs show it: the blocking lookup runs on
+/// a blocking thread, so the deadline can still end the request.
+struct BlockingKeys {
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl KeyStore for BlockingKeys {
+    async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+        let (delay, access_key) = (self.delay, access_key.to_string());
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(delay);
+            (access_key == ACCESS).then(|| Secret::new(SECRET.to_string()))
+        })
+        .await
+        .map_err(|e| KeyStoreError::new(e.to_string()))
+    }
+}
+
+#[tokio::test]
+async fn test_blocking_store_on_a_blocking_thread_gets_503_at_the_deadline() {
+    let mut server = with_bucket().await;
+    let mut config = S3Config::new(HashMap::new(), server._dir.path().join("uploads"));
+    config.uploads = server.uploads.clone();
+    config.keys = Arc::new(BlockingKeys {
+        delay: s3api::KEY_STORE_DEADLINE + Duration::from_secs(1),
+    });
+    server.app = s3api::router(server.engine.clone(), config);
+
+    let start = std::time::Instant::now();
+    let reply = run(&server, call("GET", "/bkt?list-type=2")).await;
+
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    let waited = start.elapsed();
+    assert!(waited >= s3api::KEY_STORE_DEADLINE, "{waited:?}");
+    assert!(
+        waited < s3api::KEY_STORE_DEADLINE + Duration::from_secs(1),
+        "{waited:?}"
+    );
+}

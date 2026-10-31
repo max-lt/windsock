@@ -49,6 +49,18 @@ impl KeyStoreError {
 /// - A key revoked during a streamed PUT does not stop that PUT. The next request fails.
 /// - The secret is wiped from memory at the end of the request.
 /// - A lookup longer than [`KEY_STORE_DEADLINE`] gets 503.
+/// - `secret` must not block its thread: the deadline is a timer on the same runtime, and a
+///   blocked thread also stops every other request on it. A store over a synchronous database
+///   runs its lookup with `spawn_blocking`:
+///
+/// ```ignore
+/// async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+///     let (db, key) = (self.db.clone(), access_key.to_string());
+///     tokio::task::spawn_blocking(move || db.secret_of(&key).map(|s| s.map(Secret::new)))
+///         .await
+///         .map_err(|e| KeyStoreError::new(e.to_string()))?
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait KeyStore: Send + Sync {
     /// The secret of `access_key`. `None` when the key is unknown or revoked.

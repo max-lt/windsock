@@ -146,7 +146,9 @@ impl<R: Sweep + 'static> Engine<R> {
         }
 
         // The prune assumes no proxy clock is more than R behind the others.
-        let stable = self.index().stable_hlc()?;
+        let stable = self
+            .index()
+            .stable_hlc(self.config.retire_quiet().as_nanos() as u64)?;
         let now = buffer::unix_nanos();
         if stable > now.saturating_add(retention) {
             warn!(

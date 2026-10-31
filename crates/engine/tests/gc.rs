@@ -858,12 +858,17 @@ fn version_count(engine: &Engine<TestRemote>, key: &str) -> usize {
         .map_or(0, |state| state.versions.len())
 }
 
-/// Proxy `a` writes two versions of k, 10 s apart, and runs the GC 10 s later, with R = 1 s.
-/// Returns the versions of k that stay. With `stopped`, a second proxy wrote once before and
-/// stopped for good.
+/// Proxy `a`, which retires quiet chains, writes two versions of k, 10 s apart, runs the GC 10 s
+/// later, writes once more, and runs the GC again, with R = 1 s. Returns the versions of k that
+/// stay. With `stopped`, a second proxy wrote once before and stopped for good: the first GC
+/// retires it, and the later write is the entry above the Retire that a reader needs.
 async fn prune_with(stopped: bool) -> usize {
     let remote = Arc::new(TestRemote::new());
-    let a = proxy(&remote, 1).await;
+    let config = Config {
+        retire_chains: true,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     a.engine.flush().await.unwrap();
     if stopped {
@@ -880,6 +885,9 @@ async fn prune_with(stopped: bool) -> usize {
     a.engine.flush().await.unwrap();
     advance(Duration::from_secs(10));
     a.engine.gc().await.unwrap();
+    put(&a.engine, "z", b"later").await;
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
     version_count(&a.engine, "k")
 }
 
@@ -888,10 +896,9 @@ async fn test_version_prune_drops_an_old_version_with_live_chains_only() {
     assert_eq!(prune_with(false).await, 1);
 }
 
-/// The stable HLC is the lowest last HLC over the chains, so a chain that stopped for good
-/// keeps every later version of every key.
+/// The stable HLC skips a chain that stopped for good once the GC retired it: the version prune
+/// goes on.
 #[tokio::test]
-#[ignore = "fixed by the Retire code"]
 async fn test_stopped_chain_does_not_block_the_version_prune() {
     assert_eq!(prune_with(true).await, 1);
 }

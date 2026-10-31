@@ -794,9 +794,29 @@ impl Index {
     /// entry. A future entry can still carry an ack under it: a buffered write of a proxy with no
     /// chain yet, or a write late by up to `retention - late_margin`. The late write rule of the
     /// engine covers that gap.
-    pub fn stable_hlc(&self) -> Result<u64> {
+    ///
+    /// A chain retired at its frontier does not count once its Retire entry is at least `quiet`
+    /// above its last HLC, and another entry, of another chain or later in the chain of the Retire,
+    /// is at or above the Retire entry: the reader checks the quiet time and trusts no writer.
+    pub fn stable_hlc(&self, quiet: u64) -> Result<u64> {
         let frontiers = self.frontiers()?;
-        let applied = frontiers.values().map(|f| f.last_hlc);
+        let marks = self.retire_marks()?;
+        let skipped = |node: &NodeId, frontier: &Frontier| {
+            marks.iter().any(|mark| {
+                mark.node == *node
+                    && mark.upto == frontier.next_seq
+                    && mark.hlc >= frontier.last_hlc.saturating_add(quiet)
+                    && frontiers.iter().any(|(other, f)| {
+                        other != node
+                            && f.last_hlc >= mark.hlc
+                            && (*other != mark.by || f.next_seq > mark.seq + 1)
+                    })
+            })
+        };
+        let applied = frontiers
+            .iter()
+            .filter(|(node, frontier)| !skipped(node, frontier))
+            .map(|(_, f)| f.last_hlc);
         // A waiting entry can carry acks far under its own HLC.
         let pending = self.pending.iter().map(|e| {
             let acks = e.actions.iter().flatten().filter_map(Action::hlc);
@@ -1329,7 +1349,7 @@ mod tests {
             BTreeSet::from([manifest(3), manifest(4)])
         );
         assert_eq!(
-            index.stable_hlc().unwrap(),
+            index.stable_hlc(u64::MAX).unwrap(),
             7,
             "a pending entry lowers the stable HLC"
         );
@@ -1357,10 +1377,10 @@ mod tests {
             &test_sealer(),
         );
 
-        assert_eq!(index.stable_hlc().unwrap(), 0);
+        assert_eq!(index.stable_hlc(u64::MAX).unwrap(), 0);
         index.apply(vec![slow, fast]).unwrap();
 
-        assert_eq!(index.stable_hlc().unwrap(), 10);
+        assert_eq!(index.stable_hlc(u64::MAX).unwrap(), 10);
     }
 
     #[test]
@@ -1752,6 +1772,78 @@ mod tests {
         assert!(!left_out.contains_key(&first.node), "{left_out:?}");
         assert!(left_out.contains_key(&retired.node));
         assert_eq!(back.get(&first.node).map(|l| l.seq), Some(1));
+    }
+
+    /// Entry `seq` of node `seed` at `hlc`, after `prev`, with `seen` and `actions`.
+    fn entry_at(
+        seed: u8,
+        prev: Option<&Entry>,
+        hlc: u64,
+        seen: Seen,
+        actions: Vec<Action>,
+    ) -> Entry {
+        let (seq, prev) = prev.map_or((0, [0; 32]), |p| (p.seq + 1, p.hash()));
+        Entry::sign(&key(seed), seq, prev, hlc, seen, actions, &test_sealer())
+    }
+
+    /// Chain 1 writes at HLC 100. Chain 3 retires it at `retire_hlc`, then writes at `after`.
+    /// Chain 2 writes at `other`. Then chain 1 writes again at `again`. The stable HLC with a
+    /// quiet time of 50.
+    fn stable_with(
+        retire_hlc: u64,
+        after: Option<u64>,
+        other: Option<u64>,
+        again: Option<u64>,
+    ) -> u64 {
+        let quiet = entry_at(1, None, 100, Seen::new(), put("k", 1));
+        let link = Link {
+            seq: 0,
+            hash: quiet.hash(),
+        };
+        let retire = vec![Action::Retire {
+            node: quiet.node,
+            upto: 1,
+        }];
+        let retired = entry_at(
+            3,
+            None,
+            retire_hlc,
+            Seen::from([(quiet.node, link)]),
+            retire,
+        );
+        let mut entries = vec![quiet.clone(), retired.clone()];
+        if let Some(hlc) = after {
+            entries.push(entry_at(3, Some(&retired), hlc, Seen::new(), put("x", 3)));
+        }
+        if let Some(hlc) = other {
+            entries.push(entry_at(2, None, hlc, Seen::new(), put("y", 2)));
+        }
+        if let Some(hlc) = again {
+            entries.push(entry_at(1, Some(&quiet), hlc, Seen::new(), put("k", 4)));
+        }
+        let mut index = Index::open_temporary().unwrap();
+        index.apply(entries).unwrap();
+        index.stable_hlc(50).unwrap()
+    }
+
+    #[test]
+    fn test_stable_hlc_skips_a_chain_retired_after_its_quiet_time() {
+        assert_eq!(stable_with(150, None, Some(200), None), 150);
+        // A later entry of the writer of the Retire also shows that its HLC is not ahead.
+        assert_eq!(stable_with(150, Some(160), None, None), 160);
+    }
+
+    #[test]
+    fn test_stable_hlc_keeps_a_chain_retired_too_early_or_with_no_later_hlc() {
+        assert_eq!(stable_with(149, None, Some(200), None), 100);
+        assert_eq!(stable_with(150, None, None, None), 100);
+        assert_eq!(stable_with(150, None, Some(149), None), 100);
+    }
+
+    #[test]
+    fn test_stable_hlc_takes_a_retired_chain_again_once_it_writes() {
+        // The Retire is far above the new entry, so only the frontier keeps the chain.
+        assert_eq!(stable_with(300, None, Some(400), Some(130)), 130);
     }
 
     /// Only a writer whose links reach the Retire entry knew the retired entries.

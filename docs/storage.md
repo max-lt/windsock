@@ -138,7 +138,12 @@ the life of a remote. To change them, start a new remote and copy the objects th
 The version prune drops versions below the stable HLC less R. The stable HLC is the lowest last
 HLC over the applied chains, so a stopped chain blocks the version prune until it is retired: a
 proxy that stops for good, or a chain from a lost `data_dir`, keeps its last HLC for ever, and old
-versions stay readable in every proxy from that point.
+versions stay readable in every proxy from that point. With `gc.retire_chains`, the GC retires a chain with no entry
+for Q = max(R, H) + M. A reader then leaves that chain out of the stable HLC when the Retire entry
+is at least Q above the last HLC of the chain, and the reader applied another entry at or above
+the Retire entry: of another chain, or later in the chain of the Retire. The reader checks both,
+so a Retire written too early moves nothing. A chain that writes again counts again; versions
+that a prune dropped stay dropped.
 
 Late writes. A buffered write can reach the journal long after its ack, for example after a
 restart or a long remote outage. A prune can then have removed a newer delete of its key, and a

@@ -317,7 +317,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Every other request body is read whole into memory, up to a cap: 1 MiB for a PUT of an
   object, 4 MiB for an XML body (a POST or a bucket PUT), 64 KiB for any other request, a copy
   included. A Content-Length over the cap gets `400` before the body is read. The peak for these
-  bodies is `max_connections` times 4 MiB.
+  bodies is `max_connections` times 4 MiB. The signature check uses the headers and the declared payload hash
+  only: a request with a bad signature gets `403` before any byte of its body is read. The hash of
+  the body is checked after the read.
 - An aws-chunked body is decoded as it arrives: a header or trailer
   line takes at most 4 KiB, all trailers 16 KiB, and a declared chunk size reserves no memory.
   Each chunk signature is checked at the end of its chunk, and nothing is written before the last

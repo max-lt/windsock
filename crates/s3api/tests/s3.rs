@@ -2341,6 +2341,27 @@ async fn test_request_with_no_streamed_body_is_refused_before_its_body_is_read()
     }
 }
 
+/// The signature check uses the headers only: a client with no valid key makes no read.
+#[tokio::test]
+async fn test_request_with_a_wrong_signature_reads_no_body() {
+    let server = with_bucket().await;
+    let body = 4u64 * 1024 * 1024;
+    for (method, uri) in [("POST", "/bkt?delete"), ("PUT", "/bkt/k")] {
+        let mut call = call(method, uri).header("content-length", body.to_string());
+        call.secret = "wrong";
+
+        let (reply, taken) = send_counted(&server, call, body).await;
+
+        assert_eq!(
+            reply.status,
+            StatusCode::FORBIDDEN,
+            "{method}: {}",
+            reply.text()
+        );
+        assert_eq!(taken, 0, "{method}");
+    }
+}
+
 #[tokio::test]
 async fn test_copy_body_with_no_length_stops_at_a_small_cap() {
     let server = with_bucket().await;

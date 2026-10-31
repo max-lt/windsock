@@ -371,10 +371,12 @@ A daemon keeps these descriptors open. Each count has a cap.
 | Chunk cache           | one file for each read in progress       | 0 to 1 in the soak                              |
 | Admin socket          | the listener and one request at a time   | `admin::serve`                                  |
 | S3 client connections | `max_connections`, each with one file    | (soft fd limit - 256) / 2                       |
+| Spool copies          | 16 at once, one more file each           | `s3api::MAX_COPIES`                             |
 
-The daemon keeps 256 descriptors for the first five kinds, and 2 for each S3 connection: its
-socket, and one file that a request can hold at once (a buffer segment, a spool file, a cache file or a
-multipart part). At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
+The daemon keeps 256 descriptors for the first five kinds and the spool copies, and 2 for each S3
+connection: its socket, and one file that a request can hold at once (a buffer segment, a spool
+file, a cache file or a multipart part). A copy of a buffered source holds 3: its socket, its
+spool file and the source segment. At most 16 copies run at once, so their extra file fits in the 256. More copies get `503 SlowDown` with `Retry-After`. At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
 start, and the error names `ulimit -n`. A `max_connections` that needs more than the soft limit
 also stops the start, with the value, the limit and the number needed. With a soft limit of 600
 and 172 connections open, a test measured 190 descriptors at the peak. In a

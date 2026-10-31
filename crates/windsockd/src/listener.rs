@@ -39,8 +39,8 @@ pub const FD_MINIMUM: u64 = 512;
 pub const MAX_DEFAULT_CONNECTIONS: usize = 4096;
 
 /// The default connection limit for a soft descriptor limit `soft` (`None`: no limit), at most
-/// MAX_DEFAULT_CONNECTIONS. A connection can
-/// hold its socket and one file at once: a buffer segment, a cache file or a multipart part.
+/// MAX_DEFAULT_CONNECTIONS. A connection can hold its socket and one file at once: a buffer
+/// segment, a cache file or a multipart part. The third file of a copy is in FD_RESERVE.
 pub fn connection_limit(soft: Option<u64>) -> Result<usize, String> {
     let limit = match soft {
         None => MAX_DEFAULT_CONNECTIONS as u64,

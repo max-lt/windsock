@@ -377,7 +377,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   The reader fixes the source version at the start: a delete or an overwrite of the source during
   the copy does not change what it copies. A source that is still only in the buffer works.
   `If-Match`, `If-None-Match: *` and a create-only prefix apply to the destination, as for a PUT. A
-  copy onto itself (metadata `REPLACE`) works. A client that goes away drops the spool file. The
+  copy onto itself (metadata `REPLACE`) works. At most 16 copies run at once; more get `503 SlowDown` with
+  `Retry-After`. A client that goes away drops the spool file. The
   read pieces are up to 4 MiB, as for a GET, and count in the read budget; the 1 MiB bound is for
   the write pieces. Measured on macOS, release build, a flushed source of 1 GiB: one copy took
   2.2 s, and 8 copies at once 3.9 s. With the cache off, one copy raised the RSS by 18 MiB.

@@ -36,6 +36,11 @@ const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 /// size can complete. The parts are outside the buffer limit, so plain writes keep their room.
 pub const DEFAULT_PARTS_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Spool copies that run at once. A copy of a buffered source holds 3 descriptors: its socket, its
+/// spool file and the source segment. More get 503 SlowDown, and the extra descriptor of each
+/// fits in the engine reserve.
+pub const MAX_COPIES: usize = 16;
+
 pub struct S3Config {
     /// The secret keys, asked on every request.
     pub keys: Arc<dyn KeyStore>,
@@ -78,6 +83,7 @@ pub(crate) struct AppState<R> {
     keys: Arc<dyn KeyStore>,
     uploads: Arc<Uploads>,
     max_body: usize,
+    copies: Arc<tokio::sync::Semaphore>,
 }
 
 impl<R> Clone for AppState<R> {
@@ -87,6 +93,7 @@ impl<R> Clone for AppState<R> {
             keys: self.keys.clone(),
             uploads: self.uploads.clone(),
             max_body: self.max_body,
+            copies: self.copies.clone(),
         }
     }
 }
@@ -98,6 +105,7 @@ pub fn router<R: Remote + 'static>(engine: Arc<Engine<R>>, config: S3Config) -> 
         keys: config.keys,
         uploads: config.uploads,
         max_body: config.max_body,
+        copies: Arc::new(tokio::sync::Semaphore::new(MAX_COPIES)),
     };
 
     let bucket = get(handlers::bucket_get::<R>)

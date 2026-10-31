@@ -3269,6 +3269,52 @@ async fn test_copy_with_no_read_room_gets_503_after_the_first_piece_wait() {
     assert_eq!(after.status, StatusCode::OK, "{}", after.text());
 }
 
+/// Each copy holds descriptors while it waits: past MAX_COPIES, a copy gets 503 at once.
+#[tokio::test]
+async fn test_copy_over_the_copy_cap_gets_503_at_once() {
+    let server = small_budget().await;
+    let data = vec![3u8; 2 * engine::READ_STEP];
+    run(&server, call("PUT", "/bkt/src").body(data)).await;
+    let mut held = Vec::new();
+    for _ in 0..engine::MIN_READ_BUDGET as usize / engine::READ_STEP {
+        held.push(get_response(&server, "/bkt/src").await);
+    }
+    let waiting: Vec<_> = (0..s3api::MAX_COPIES)
+        .map(|i| {
+            let uri = format!("/bkt/dst{i}");
+            let request = call("PUT", &uri)
+                .header("x-amz-copy-source", "/bkt/src")
+                .request();
+            tokio::spawn(server.app.clone().oneshot(request))
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = std::time::Instant::now();
+    let over = run(&server, copy_call("/bkt/over", "/bkt/src")).await;
+
+    assert_eq!(
+        over.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        over.text()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the copy waited"
+    );
+    assert!(
+        over.text().contains("copies run at once"),
+        "{}",
+        over.text()
+    );
+    assert!(over.header("retry-after").is_some());
+    drop(held);
+    for copy in waiting {
+        copy.await.unwrap().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn test_crash_during_a_copy_leaves_no_spool_and_no_object() {
     let server = with_bucket().await;

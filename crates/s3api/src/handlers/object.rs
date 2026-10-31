@@ -109,6 +109,13 @@ async fn copy_object<R: Remote + 'static>(
         ));
     }
 
+    let _slot = state.copies.try_acquire().map_err(|_| {
+        S3Error::new(
+            "SlowDown",
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{} copies run at once: try again", crate::MAX_COPIES),
+        )
+    })?;
     // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
     let mut room = Some(state.engine.read_room(Some(FIRST_PIECE_WAIT)).await?);
     // The reader fixes the source version now: a later delete or overwrite of the source does

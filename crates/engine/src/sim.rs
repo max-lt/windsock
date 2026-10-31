@@ -46,6 +46,14 @@ pub enum Point {
     PartReplace,
     /// A copy wrote one piece of its source to its spool.
     CopyPiece,
+    /// A copy by reference has its manifest in memory and wrote nothing to the remote yet.
+    CopyRefPlan,
+    /// The manifest of a copy by reference is in the remote; its entry comes next.
+    CopyRefManifest,
+    /// The entry of a copy by reference is in the remote; the apply comes next.
+    CopyRefCommit,
+    /// The copy by reference is in the index; the reply comes next.
+    CopyRefApply,
 }
 
 #[cfg(feature = "sim")]

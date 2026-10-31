@@ -224,6 +224,7 @@ the configuration file.
 | `engine.parts_limit_bytes`  | 5 GiB                                | The parts of all open multipart uploads together, on the disk of `data_dir`, outside the buffer limit. A part fails with `503 SlowDown` above this while other uploads hold the room, and plain writes go on. A part that cannot fit even with no other upload, with the other parts of its upload, gets `400 EntityTooLarge`. Clients free the room with ListMultipartUploads and AbortMultipartUpload, or the expiry removes the uploads                         |
 | `engine.read_budget_bytes`  | 1 GiB                                | The pieces of GETs in flight on all connections together, 4 MiB each. A GET whose first piece finds no room in 5 s gets `503 SlowDown`. Later pieces wait. The minimum is 64 MiB and the maximum 1 TiB. The room counts pieces, not memory: a piece gives its room back when less than 408 KiB of it waits in the socket queue, so a reader can hold 2 pieces (8 MiB) against 4 MiB of room. Measured: 250 slow readers on the budget of 1 GiB peak at 1.6 GiB RSS |
 | `engine.read_ahead`         | `3`                                  | Pieces that a GET of the remote reads ahead at most, `0` to `8`. `0` turns read-ahead off                                                                                                                                                                                                                                                                                                                                                                          |
+| `engine.copy_ref_min`       | `0`                                  | A CopyObject of a source of at least this many bytes writes a new manifest of the stored chunks and moves no data. `0` turns it off. It stays off by default until the model check of the copy passes on a build machine                                                                                                                                                                                                                                           |
 | `gc.enabled`                | `false`                              | Set to `true` on one proxy per remote. Windsock does not enforce this: see Limits                                                                                                                                                                                                                                                                                                                                                                                  |
 | `gc.interval_secs`          | `3600`                               | How often the GC runs                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `gc.horizon_secs`           | `86400`                              | GC horizon. Use the same value on every proxy of a remote. Keep it far above the time of one flush: under one hour, the daemon logs a warning                                                                                                                                                                                                                                                                                                                      |
@@ -392,6 +393,29 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   read pieces are up to 4 MiB, as for a GET, and count in the read budget; the 1 MiB bound is for
   the write pieces. Measured on macOS, release build, a flushed source of 1 GiB: one copy took
   2.2 s, and 8 copies at once 3.9 s. With the cache off, one copy raised the RSS by 18 MiB.
+- With `engine.copy_ref_min` above 0, a CopyObject of a source of at least that size goes by
+  reference. The copy reads no data: it writes a new manifest of the chunks that the index of
+  this proxy locates, and one journal entry, under GC rules 1 and 2 as a dedup. It costs 1
+  manifest PUT (none for a manifest of 4 KiB or less, which goes in the entry) and 1 entry
+  create. The ack waits for the entry in the remote and its apply in the index, not for a local
+  fsync. It reads no pack, so it does not find a damaged pack of the source; a later read of the
+  copy finds it, as a read of the source does. At most 4 copies by reference run at once; each
+  holds 2 times the size of the source manifest in the read budget. A copy goes through the spool
+  in place of a reference when:
+  - `engine.copy_ref_min` is 0, or the source is smaller;
+  - the source is still only in the buffer of this proxy;
+  - the destination has a buffered write on this proxy;
+  - no complete sync is younger than H/2 (a broken chain);
+  - the sync before the copy fails on the remote, or takes more than 10 s;
+  - a chunk of the source has no location in the index (its pack is condemned);
+  - the destination prefix has another chunking or compression than the source prefix.
+
+  After the first remote write of a copy by reference, it never goes through the spool: the
+  entry can be in the remote. A remote error then fails the copy, and the next flush applies an
+  entry that landed. With a sync younger than H/2, the manifest PUT is the first remote call, so
+  a remote that is down fails the copy. While a copy by reference runs, a conditional write to
+  its destination on this proxy (`If-None-Match: *`, `If-Match`, a create-only prefix) gets
+  `409 ConditionalRequestConflict`.
 
 ## Scale
 

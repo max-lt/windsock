@@ -130,7 +130,8 @@ async fn copy_object<R: Remote + 'static>(
             mode,
             FIRST_PIECE_WAIT,
         )
-        .await?;
+        .await?
+        .info;
 
     xml_reply(xml::copy_result(&etag(&info), info.last_modified))
 }

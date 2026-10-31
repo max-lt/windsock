@@ -3215,6 +3215,41 @@ async fn test_large_copy_streams_from_a_buffered_and_a_flushed_source() {
     assert_eq!(spool_files(&server), 0);
 }
 
+/// A copy by reference and a spool copy give the ETag of the source.
+#[tokio::test]
+async fn test_copy_by_reference_and_through_the_spool_give_one_etag() {
+    let server = bucket_on(
+        server_with(Config {
+            copy_ref_min: 1,
+            ..Config::default()
+        })
+        .await,
+    )
+    .await;
+    let data = large_object();
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+
+    let spooled = run(&server, copy_call("/bkt/spooled", "/bkt/src")).await;
+    server.engine.flush().await.unwrap();
+    let referenced = run(&server, copy_call("/bkt/referenced", "/bkt/src")).await;
+    let buffered = server.engine.buffered_bytes().await;
+    let reads = [
+        run(&server, call("GET", "/bkt/spooled")).await,
+        run(&server, call("GET", "/bkt/referenced")).await,
+    ];
+
+    assert_eq!(buffered, 0, "the copy by reference went to the buffer");
+    let etag = blake3::hash(&data).to_hex().to_string();
+    for copy in [&spooled, &referenced] {
+        assert_eq!(copy.status, StatusCode::OK, "{}", copy.text());
+        assert!(copy.text().contains(&etag), "{}", copy.text());
+    }
+    for read in reads {
+        assert!(read.body == data);
+        assert_eq!(read.header("etag"), Some(format!("\"{etag}\"").as_str()));
+    }
+}
+
 #[tokio::test]
 async fn test_large_copy_onto_itself_replaces_the_metadata() {
     let server = with_bucket().await;

@@ -54,6 +54,19 @@ pub struct ChunkLocation {
     pub seen_at: u64,
 }
 
+/// The chunk locations of an index, apart from its lock.
+#[derive(Clone)]
+pub struct ChunkLocations(Keyspace);
+
+impl ChunkLocations {
+    pub fn get(&self, id: ChunkId) -> Result<Option<ChunkLocation>> {
+        Ok(match self.0.get(id.as_bytes())? {
+            Some(value) => Some(postcard::from_bytes(&value)?),
+            None => None,
+        })
+    }
+}
+
 enum Readiness {
     Ready,
     Wait,
@@ -637,10 +650,12 @@ impl Index {
     }
 
     pub fn chunk(&self, id: ChunkId) -> Result<Option<ChunkLocation>> {
-        Ok(match self.chunks.get(id.as_bytes())? {
-            Some(value) => Some(postcard::from_bytes(&value)?),
-            None => None,
-        })
+        self.chunk_locations().get(id)
+    }
+
+    /// A handle on the chunk locations that a blocking task can own.
+    pub fn chunk_locations(&self) -> ChunkLocations {
+        ChunkLocations(self.chunks.clone())
     }
 
     /// Stores the bytes of a manifest. The caller checks them against `id`.

@@ -52,6 +52,7 @@ use plan::{Nonces, Planner};
 
 pub use buffer::{QuarantineReader, QuarantinedRecord, QuarantinedWrite};
 pub use config::{CacheMode, Chunking, Config, Policy, PrefixPolicy};
+pub use copy::{Copied, CopyPath, SpoolReason};
 pub use gc::GcReport;
 pub use index::MAX_OPEN_FILES as INDEX_MAX_OPEN_FILES;
 pub use index::ObjectState;
@@ -115,6 +116,9 @@ pub enum EngineError {
     BucketNotEmpty(String),
     #[error("key already exists: {bucket}/{key}")]
     PreconditionFailed { bucket: String, key: String },
+    /// A conditional write meets a copy by reference to the same key that is not applied yet.
+    #[error("a copy to {bucket}/{key} is in flight: try again")]
+    Conflict { bucket: String, key: String },
     #[error("range {start}..{end} is outside the object ({size} bytes)")]
     InvalidRange { start: u64, end: u64, size: u64 },
     #[error("the proxy is stopping and takes no new write")]
@@ -328,6 +332,10 @@ pub struct Engine<R> {
     orphans_file: PathBuf,
     /// Another node that wrote a condemn in the last H: a second GC runner.
     other_gc_node: Mutex<Option<NodeId>>,
+    /// Copies by reference that may run now: each one holds two manifests in memory.
+    ref_copies: tokio::sync::Semaphore,
+    /// The targets of copies by reference that are not applied yet: in no buffer and no index.
+    ref_targets: Mutex<BTreeMap<(String, String), usize>>,
 }
 
 /// The writes that the quarantine of the engine directory `dir` holds: what an operator decides
@@ -655,6 +663,8 @@ impl<R: Remote + 'static> Engine<R> {
             orphans_seen: Mutex::new(snapshot::read_orphans(&dir.join(ORPHANS_FILE))),
             orphans_file: dir.join(ORPHANS_FILE),
             other_gc_node: Mutex::new(None),
+            ref_copies: tokio::sync::Semaphore::new(copy::MAX_REF_COPIES),
+            ref_targets: Mutex::new(BTreeMap::new()),
         };
 
         engine.check_repo_key().await?;

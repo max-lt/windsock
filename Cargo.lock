@@ -511,6 +511,7 @@ dependencies = [
  "chunking",
  "ed25519-dalek",
  "engine",
+ "futures-util",
  "hex",
  "index",
  "journal",

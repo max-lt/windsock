@@ -96,6 +96,7 @@ impl From<EngineError> for S3Error {
             EngineError::PreconditionFailed { .. } => {
                 ("PreconditionFailed", StatusCode::PRECONDITION_FAILED)
             }
+            EngineError::Conflict { .. } => ("ConditionalRequestConflict", StatusCode::CONFLICT),
             EngineError::InvalidRange { .. } => ("InvalidRange", StatusCode::RANGE_NOT_SATISFIABLE),
             // Another proxy, or this one after its restart, takes the write.
             EngineError::Draining => ("ServiceUnavailable", StatusCode::SERVICE_UNAVAILABLE),
@@ -156,6 +157,20 @@ mod tests {
         assert_eq!(
             (error.code, error.status),
             ("SlowDown", StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// S3 gives 409 to a conditional write that meets another write in flight to its key.
+    #[test]
+    fn test_write_during_a_copy_by_reference_gets_a_conflict() {
+        let error = S3Error::from(EngineError::Conflict {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+        });
+
+        assert_eq!(
+            (error.code, error.status),
+            ("ConditionalRequestConflict", StatusCode::CONFLICT)
         );
     }
 }

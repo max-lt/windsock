@@ -30,6 +30,7 @@ sim = ["journal/sim"]
 [dev-dependencies]
 engine = { path = ".", features = ["sim"] }
 async-trait.workspace = true
+futures-util = { workspace = true, features = ["alloc"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tracing-subscriber.workspace = true

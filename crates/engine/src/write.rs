@@ -77,6 +77,13 @@ impl<R: Remote + 'static> Engine<R> {
             self.require_bucket(&buffer, bucket)?;
 
             let current = self.current(&buffer, bucket, key)?;
+            let conditional = create_only || *mode != WriteMode::Overwrite;
+            if conditional && self.ref_target_in_flight(bucket, key) {
+                return Err(EngineError::Conflict {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                });
+            }
             let needs_object = matches!(mode, WriteMode::IfExists | WriteMode::IfMatch(_));
             if needs_object && !current.exists() {
                 return Err(read::no_such_key(bucket, key));

@@ -112,6 +112,9 @@ pub struct EngineConfig {
     pub read_budget_bytes: u64,
     /// Pieces that a GET of the remote reads ahead at most. 0 turns read-ahead off.
     pub read_ahead: usize,
+    /// A copy of an object of at least this size writes a new manifest of the stored chunks and
+    /// moves no data. 0, the default, turns it off.
+    pub copy_ref_min: u64,
 }
 
 impl Default for EngineConfig {
@@ -124,6 +127,7 @@ impl Default for EngineConfig {
             parts_limit_bytes: s3api::DEFAULT_PARTS_LIMIT,
             read_budget_bytes: engine.read_budget,
             read_ahead: engine.read_ahead,
+            copy_ref_min: engine.copy_ref_min,
         }
     }
 }
@@ -257,6 +261,7 @@ impl Config {
             buffer_limit: self.engine.buffer_limit_bytes,
             read_budget: self.engine.read_budget_bytes,
             read_ahead: self.engine.read_ahead,
+            copy_ref_min: self.engine.copy_ref_min,
             gc_horizon: Duration::from_secs(self.gc.horizon_secs),
             retention: Duration::from_secs(self.gc.retention_secs),
             late_margin: Duration::from_secs(self.gc.late_margin_secs),

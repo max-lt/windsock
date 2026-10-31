@@ -1003,3 +1003,133 @@ async fn test_gc_retires_chains_in_batches_when_the_header_guard_trips() {
     assert!(flushed.is_ok(), "{flushed:?}");
     assert!(last_seen(&remote, &a.engine).await.len() < 10);
 }
+
+/// Every copy of at least 1 byte goes by reference.
+fn copy_config() -> Config {
+    Config {
+        copy_ref_min: 1,
+        ..config(Duration::ZERO)
+    }
+}
+
+async fn copy(
+    engine: &Engine<TestRemote>,
+    source: &str,
+    target: &str,
+    metadata: Option<BTreeMap<String, String>>,
+) -> Result<engine::Copied, EngineError> {
+    let wait = Duration::from_secs(5);
+    engine
+        .copy(
+            (BUCKET, source),
+            (BUCKET, target),
+            metadata,
+            WriteMode::Overwrite,
+            wait,
+        )
+        .await
+}
+
+/// A copy by reference names the packs of its source: they stay live after the source goes.
+#[tokio::test]
+async fn test_reference_copy_keeps_its_packs_after_the_source_goes() {
+    let remote = Arc::new(TestRemote::new());
+    let a = proxy_with(&remote, 1, copy_config()).await;
+    let data = random_bytes(1, 1_000_000);
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "src", &data).await;
+    a.engine.flush().await.unwrap();
+
+    let copied = copy(&a.engine, "src", "dst", None).await.unwrap();
+    put(&a.engine, "src", b"newer").await;
+    a.engine.flush().await.unwrap();
+    a.engine.delete(BUCKET, "src").await.unwrap();
+    a.engine.flush().await.unwrap();
+    past_retention().await;
+    a.engine.gc().await.unwrap();
+    past_horizon().await;
+    a.engine.gc().await.unwrap();
+    let reader = proxy(&remote, 2).await;
+    reader.engine.sync().await.unwrap();
+
+    assert_eq!(copied.path, engine::CopyPath::Reference);
+    assert_eq!(keys(&reader.engine).await, ["dst"]);
+    assert_eq!(get(&reader.engine, "dst").await.unwrap(), data);
+}
+
+/// Rule 1: a chunk whose pack this proxy saw condemned has no location. A copy of an object
+/// that names it reads the data again.
+#[tokio::test]
+async fn test_copy_of_an_object_with_condemned_chunks_takes_the_spool() {
+    let remote = Arc::new(TestRemote::new());
+    let a = proxy(&remote, 1).await;
+    let b = proxy_with(&remote, 2, copy_config()).await;
+    let data = random_bytes(1, 100_000);
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "x", &data).await;
+    a.engine.flush().await.unwrap();
+    a.engine.delete(BUCKET, "x").await.unwrap();
+    a.engine.flush().await.unwrap();
+    past_retention().await;
+    b.engine.sync().await.unwrap();
+    assert_eq!(a.engine.gc().await.unwrap().condemned_packs, 1);
+    // A sync before the condemn: b dedups against the condemned pack, then learns the condemn.
+    put(&b.engine, "y", &data).await;
+    b.engine.flush().await.unwrap();
+    b.engine.sync().await.unwrap();
+
+    let copied = copy(&b.engine, "y", "z", None).await.unwrap();
+
+    assert_eq!(
+        copied.path,
+        engine::CopyPath::Spool(engine::SpoolReason::MissingChunk)
+    );
+    assert_eq!(get(&b.engine, "z").await.unwrap(), data);
+}
+
+/// A copy that stops after its manifest PUT leaves a manifest that no entry names.
+#[tokio::test]
+async fn test_manifest_of_a_copy_that_stopped_is_deleted_after_h() {
+    let remote = Arc::new(TestRemote::new());
+    let a = proxy_with(&remote, 1, copy_config()).await;
+    let metadata = BTreeMap::from([("x-amz-meta-note".to_string(), "n".repeat(5000))]);
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "src", &random_bytes(1, 100_000)).await;
+    a.engine.flush().await.unwrap();
+
+    engine::sim::arm_crash(Some(engine::sim::Point::CopyRefManifest));
+    let crashed = copy(&a.engine, "src", "dst", Some(metadata)).await;
+    engine::sim::arm_crash(None);
+    assert!(
+        matches!(crashed, Err(EngineError::SimCrash(_))),
+        "{crashed:?}"
+    );
+    assert_eq!(count(&remote, "manifests/").await, 1);
+    past_retention().await;
+
+    assert_eq!(a.engine.gc().await.unwrap().condemned_manifests, 1);
+    past_horizon().await;
+
+    assert_eq!(a.engine.gc().await.unwrap().deleted_manifests, 1);
+    assert_eq!(count(&remote, "manifests/").await, 0);
+    assert_eq!(keys(&a.engine).await, ["src"]);
+}
+
+/// One intent file: a copy finishes the commit of an interrupted flush before its own.
+#[tokio::test]
+async fn test_reference_copy_finishes_an_interrupted_flush_first() {
+    let remote = Arc::new(TestRemote::new());
+    let a = proxy_with(&remote, 1, copy_config()).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "src", &random_bytes(1, 100_000)).await;
+    a.engine.flush().await.unwrap();
+    put(&a.engine, "pending", b"pending").await;
+    remote.next_create.store(CREATE_AMBIGUOUS, Ordering::SeqCst);
+    assert!(a.engine.flush().await.is_err());
+
+    let copied = copy(&a.engine, "src", "dst", None).await.unwrap();
+
+    assert_eq!(copied.path, engine::CopyPath::Reference);
+    assert_eq!(a.engine.buffered_bytes().await, 0);
+    assert_eq!(keys(&a.engine).await, ["dst", "pending", "src"]);
+}

@@ -667,8 +667,13 @@ impl<R: Remote + 'static> Engine<R> {
     /// Takes room for one piece of READ_STEP bytes. With `wait`, fails with ReadBudget after it.
     /// With none, waits until a GET gives room back.
     pub async fn read_room(&self, wait: Option<Duration>) -> Result<ReadRoom> {
-        let piece = READ_STEP as u32;
-        let take = self.read_budget.clone().acquire_many_owned(piece);
+        self.room_for(READ_STEP as u64, wait).await
+    }
+
+    /// [`Engine::read_room`] for `bytes`, at most the whole read budget.
+    pub(crate) async fn room_for(&self, bytes: u64, wait: Option<Duration>) -> Result<ReadRoom> {
+        let bytes = bytes.min(self.config.read_budget).min(u64::from(u32::MAX)) as u32;
+        let take = self.read_budget.clone().acquire_many_owned(bytes);
         let permit = match wait {
             None => take.await,
             Some(wait) => match tokio::time::timeout(wait, take).await {

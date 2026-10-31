@@ -89,6 +89,9 @@ pub struct Config {
     /// The GC retires each chain with no entry for the quiet time, so writers can leave it out
     /// of their seen. Off until the model check of the rules passes at its final bounds.
     pub retire_chains: bool,
+    /// A copy of an object of at least this size writes a new manifest of the stored chunks and
+    /// moves no data. 0 turns it off: it stays off until the model check of the copy passes.
+    pub copy_ref_min: u64,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -113,6 +116,7 @@ impl Default for Config {
             read_budget: 1024 * 1024 * 1024,
             read_ahead: 3,
             retire_chains: false,
+            copy_ref_min: 0,
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

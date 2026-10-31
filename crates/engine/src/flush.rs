@@ -171,7 +171,7 @@ impl<R: Remote + 'static> Engine<R> {
 
     /// The commit refuses a header over MAX_HEADER after the uploads: check it before them. One
     /// ERROR per streak.
-    async fn check_header(&self) -> Result<()> {
+    pub(crate) async fn check_header(&self) -> Result<()> {
         let seen = self.index().seen(self.node)?;
         let bound = journal::header_bound(self.node, &seen);
         match bound > journal::MAX_HEADER / 4 * 3 {

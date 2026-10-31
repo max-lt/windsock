@@ -25,7 +25,7 @@ impl Nonces {
         Self { seed, next: 0 }
     }
 
-    fn next(&mut self) -> Nonce {
+    pub(crate) fn next(&mut self) -> Nonce {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.seed).update(&self.next.to_le_bytes());
         self.next += 1;

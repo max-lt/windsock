@@ -363,7 +363,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   (the first piece waits 5 s, then `503 SlowDown`), and writes it to a spool file in pieces of at
   most 1 MiB. It takes the buffer room of the whole object first (`503 SlowDown` with no room).
   The reader fixes the source version at the start: a delete or an overwrite of the source during
-  the copy does not change what it copies. A source that is still only in the buffer works. A
+  the copy does not change what it copies. A source that is still only in the buffer works.
+  `If-Match`, `If-None-Match: *` and a create-only prefix apply to the destination, as for a PUT. A
   copy onto itself (metadata `REPLACE`) works. A client that goes away drops the spool file. The
   read pieces are up to 4 MiB, as for a GET, and count in the read budget; the 1 MiB bound is for
   the write pieces. Measured on macOS, release build, a flushed source of 1 GiB: one copy took

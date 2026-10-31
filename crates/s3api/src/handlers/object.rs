@@ -46,11 +46,10 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         return Err(S3Error::not_implemented("UploadPartCopy is not supported"));
     }
 
-    if let Some(source) = header(&headers, "x-amz-copy-source") {
-        return copy_object(&state, source, &bucket, &key, &headers).await;
-    }
-
     let mode = write_mode(&headers)?;
+    if let Some(source) = header(&headers, "x-amz-copy-source") {
+        return copy_object(&state, source, (&bucket, &key), &headers, mode).await;
+    }
 
     let info = state
         .engine
@@ -66,9 +65,9 @@ pub(crate) async fn object_put<R: Remote + 'static>(
 async fn copy_object<R: Remote + 'static>(
     state: &AppState<R>,
     source: &str,
-    bucket: &str,
-    key: &str,
+    (bucket, key): (&str, &str),
     headers: &HeaderMap,
+    mode: WriteMode,
 ) -> Reply {
     if headers
         .keys()
@@ -124,13 +123,7 @@ async fn copy_object<R: Remote + 'static>(
     };
     let mut spool = state
         .engine
-        .begin_put_sized(
-            bucket,
-            key,
-            metadata,
-            WriteMode::Overwrite,
-            reader.info.size,
-        )
+        .begin_put_sized(bucket, key, metadata, mode, reader.info.size)
         .await?;
     loop {
         let held = match room.take() {

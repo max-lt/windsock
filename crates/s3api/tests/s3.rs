@@ -653,6 +653,87 @@ async fn test_delete_objects_in_one_request() {
     assert_eq!(listed.xml_all("Key"), ["c"]);
 }
 
+/// A copy of `bkt/src` onto `bkt/{key}` with one more header.
+async fn copy_with(server: &Server, key: &str, name: &'static str, value: &str) -> Reply {
+    let uri = format!("/bkt/{key}");
+    let call = call("PUT", &uri)
+        .header("x-amz-copy-source", "/bkt/src")
+        .header(name, value);
+    run(server, call).await
+}
+
+#[tokio::test]
+async fn test_copy_with_if_none_match_keeps_an_existing_destination() {
+    let server = with_bucket().await;
+    put(&server, "src", "new").await;
+    put(&server, "dst", "old").await;
+
+    let onto_existing = copy_with(&server, "dst", "if-none-match", "*").await;
+    let onto_missing = copy_with(&server, "fresh", "if-none-match", "*").await;
+
+    assert_eq!(onto_existing.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(run(&server, call("GET", "/bkt/dst")).await.text(), "old");
+    assert_eq!(
+        onto_missing.status,
+        StatusCode::OK,
+        "{}",
+        onto_missing.text()
+    );
+}
+
+#[tokio::test]
+async fn test_copy_with_if_match_needs_the_etag_of_the_destination() {
+    let server = with_bucket().await;
+    put(&server, "src", "new").await;
+    let etag = put(&server, "dst", "old").await;
+    let etag = etag.header("etag").unwrap().to_string();
+
+    let wrong = copy_with(
+        &server,
+        "dst",
+        "if-match",
+        &format!("\"{}\"", "0".repeat(64)),
+    )
+    .await;
+    let kept = run(&server, call("GET", "/bkt/dst")).await.text();
+    let right = copy_with(&server, "dst", "if-match", &etag).await;
+
+    assert_eq!(wrong.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(kept, "old");
+    assert_eq!(right.status, StatusCode::OK, "{}", right.text());
+    assert_eq!(run(&server, call("GET", "/bkt/dst")).await.text(), "new");
+}
+
+#[tokio::test]
+async fn test_copy_onto_a_create_only_prefix_keeps_an_existing_destination() {
+    let config = engine::Config {
+        policies: vec![engine::PrefixPolicy {
+            bucket: "bkt".into(),
+            prefix: "wal/".into(),
+            policy: engine::Policy {
+                create_only: true,
+                ..engine::Policy::default()
+            },
+        }],
+        ..engine::Config::default()
+    };
+    let server = bucket_on(server_with(config).await).await;
+    put(&server, "src", "new").await;
+    put(&server, "wal/dst", "old").await;
+
+    let reply = run(
+        &server,
+        call("PUT", "/bkt/wal/dst").header("x-amz-copy-source", "/bkt/src"),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        run(&server, call("GET", "/bkt/wal/dst")).await.text(),
+        "old"
+    );
+}
+
 #[tokio::test]
 async fn test_copy_object() {
     let server = with_bucket().await;

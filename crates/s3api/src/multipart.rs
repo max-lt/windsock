@@ -119,12 +119,18 @@ impl Uploads {
         };
         while let Some(entry) = entries.next_entry().await.map_err(io)? {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().await.map_err(io)?.is_dir() {
+                continue;
+            }
+            // No initiate runs at start: a directory with no meta is what a killed removal left.
+            if !entry.path().join(META).exists() {
+                remove_dir(&entry.path()).await?;
+                continue;
+            }
             // A part that a crash stopped never got its name: the part before it stays. A part
             // that got its name before the removal of the part it replaced wins over it.
-            if entry.file_type().await.map_err(io)?.is_dir() {
-                remove_part_temps(&entry.path()).await?;
-                keep_newest_parts(&entry.path()).await?;
-            }
+            remove_part_temps(&entry.path()).await?;
+            keep_newest_parts(&entry.path()).await?;
             // A marked complete may have committed: [`Uploads::settle`] decides with the engine.
             if let Some(id) = name.strip_suffix(Claim::Complete.suffix())
                 && !entry.path().join(MARKER).exists()
@@ -896,6 +902,32 @@ mod tests {
         assert_eq!(replaces, StatusCode::OK);
         assert_eq!(busy, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(grown, Some(StatusCode::BAD_REQUEST));
+    }
+
+    /// A kill in the middle of a removal can leave parts with no meta: the start removes them,
+    /// whatever the name of the directory, so they neither stay for ever nor count.
+    #[tokio::test]
+    async fn test_start_removes_an_upload_dir_with_no_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = ["a".repeat(32), "b".repeat(32)];
+        let names = [
+            ids[0].clone(),
+            format!("{}{}", ids[1], Claim::Complete.suffix()),
+        ];
+        for name in &names {
+            let upload = dir.path().join(name);
+            std::fs::create_dir_all(&upload).unwrap();
+            std::fs::write(upload.join(part_name(1, &"c".repeat(64))), b"12345").unwrap();
+        }
+        std::fs::write(dir.path().join(&names[1]).join(MARKER), "d".repeat(64)).unwrap();
+        let uploads = Uploads::new(dir.path(), 100);
+
+        let held = uploads.start().await.unwrap();
+
+        assert_eq!(held, 0);
+        for name in names.iter().chain(&ids) {
+            assert!(!dir.path().join(name).exists(), "{name} stays");
+        }
     }
 
     #[tokio::test]

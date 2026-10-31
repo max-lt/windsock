@@ -360,7 +360,9 @@ fn object_body<R: Remote + 'static>(
         futures_util::stream::try_unfold(state, move |(engine, mut reader, first, held)| {
             let (bucket, key) = (bucket.clone(), key.clone());
             async move {
-                // This poll comes once the last piece is in the socket: its room comes back first.
+                // hyper polls again once less than 417,792 bytes (8 KiB + 400 KiB) of the last piece
+                // wait in its queue: the room of that piece comes back while those bytes stay in
+                // memory, so a reader can hold 2 pieces against the room of 1.
                 drop::<Option<ReadRoom>>(held);
                 let room = match first {
                     Some(room) => room,

@@ -86,6 +86,12 @@ condemned or first saw it. A GC runner that restarts every day, or more often, n
 give it an uptime of H between restarts. `docs/storage.md` (GC deletes and the clock of the GC
 host) gives the reason.
 
+`data_dir` must persist across restarts: it holds the buffer of acked writes and `node.key`. A
+restart with the same `data_dir` keeps its node identity and makes no new chain. A start with no
+`node.key` makes a new identity, and its first write makes a new chain for ever; on a remote that
+has chains, that start logs `a new node identity on a remote with N chains`. A container with no
+persistent volume for `data_dir` loses acked writes and adds one chain at each start.
+
 A start that fails, for example on a quarantine or a remote with other rules, fails again at
 each restart: read the error, act, then start again.
 

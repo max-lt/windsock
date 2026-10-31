@@ -623,3 +623,30 @@ async fn test_second_gc_runner_warns_at_start() {
     assert!(b.logged("WARN windsockd: another node ran the GC"));
     assert!(b.stop());
 }
+
+/// A new node.key on a remote with chains is a new chain for ever: the start says so, once. A
+/// restart with the same data_dir reads its key and says nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_new_node_identity_on_a_remote_with_chains_warns_at_start() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    let warning = "WARN windsockd: a new node identity on a remote with";
+    let first = start(&cluster.config("a", 100, false), "info");
+    assert_eq!(put(&first, "/shared", b"").await.status, StatusCode::OK);
+    assert!(!first.logged(warning), "the first node of a remote warns");
+    assert!(first.stop());
+
+    let new = start(&cluster.config("b", 100, false), "info");
+    assert!(
+        new.logged(warning),
+        "a new node on a remote with chains does not warn"
+    );
+    assert!(new.stop());
+
+    let restarted = start(&cluster.config("b", 100, false), "info");
+    assert!(
+        !restarted.logged(warning),
+        "a restart with the same node.key warns"
+    );
+    assert!(restarted.stop());
+}

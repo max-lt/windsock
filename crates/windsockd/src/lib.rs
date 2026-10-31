@@ -155,16 +155,25 @@ fn refuse_if_others_can_read(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where the node key of this start comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyOrigin {
+    Made,
+    Read,
+}
+
 /// The node identity, made on the first start.
-fn node_key(data_dir: &Path) -> Result<SigningKey> {
+fn node_key(data_dir: &Path) -> Result<(SigningKey, KeyOrigin)> {
     let path = data_dir.join(NODE_KEY_FILE);
 
+    let mut origin = KeyOrigin::Read;
     if !path.exists() {
         write_secret(
             &path,
             Zeroizing::new(hex::encode(config::random_bytes::<32>()?)).as_bytes(),
         )?;
         info!(path = %path.display(), "made a new node key");
+        origin = KeyOrigin::Made;
     }
 
     refuse_if_others_can_read(&path)?;
@@ -175,7 +184,22 @@ fn node_key(data_dir: &Path) -> Result<SigningKey> {
     let mut bytes = Zeroizing::new([0u8; 32]);
     hex::decode_to_slice(text.trim(), bytes.as_mut())
         .with_context(|| format!("{} is not a hex key", path.display()))?;
-    Ok(SigningKey::from_bytes(&bytes))
+    Ok((SigningKey::from_bytes(&bytes), origin))
+}
+
+/// A new node key on a remote with chains makes one more chain for ever: a data_dir that does not
+/// persist makes one at each start. A new proxy of a cluster gets one by design, so only a WARN.
+async fn warn_new_identity<R: remote::Remote + ?Sized>(remote: &R) {
+    match remote.list(engine::NODES_PREFIX).await {
+        Ok(nodes) if !nodes.is_empty() => warn!(
+            chains = nodes.len(),
+            "a new node identity on a remote with {} chains; data_dir must persist across \
+             restarts",
+            nodes.len()
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(%e, "cannot list the node markers of the remote"),
+    }
 }
 
 /// Below this, a slow flush can take longer than half the horizon and never commit.
@@ -328,7 +352,7 @@ async fn serve<R: Sweep + 'static>(
     }
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot make {}", config.data_dir.display()))?;
-    let key = node_key(&config.data_dir)?;
+    let (key, origin) = node_key(&config.data_dir)?;
 
     match remote::check_before_serving(&*remote).await {
         Startup::Conformant => info!(store, "the remote keeps the storage contract"),
@@ -342,6 +366,9 @@ async fn serve<R: Sweep + 'static>(
             "the {store} does not keep the storage contract, so Windsock cannot run on it \
              safely: {reason}"
         ),
+    }
+    if origin == KeyOrigin::Made {
+        warn_new_identity(&*remote).await;
     }
 
     let engine_dir = config.data_dir.join("engine");

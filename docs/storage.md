@@ -317,7 +317,10 @@ broken (Malformed).
 
 The header holds the `seen` map, 74 bytes for each other node at most. A writer refuses to sign
 an entry with a header over 64 KiB (`HeaderTooLarge`), so a repository has at most about 880
-nodes. The `seen` map names every chain that the proxy ever read, retired nodes too. A flush
+nodes. The `seen` map names every chain that the proxy ever read, retired nodes too. A node identity
+is the public key of `data_dir/node.key`, which the first start makes: a restart or a crash keeps
+it, and only a start with no `node.key` makes a new one. At one new identity per month for each of
+10 proxies, a repository reaches the limit in about 7 years. A flush
 checks the largest header that its entry can have before its plan: over 64 KiB, it uploads
 nothing, logs one ERROR, and the flusher tries again every 60 s. The buffered writes stay, and go
 to the quarantine at the late limit.

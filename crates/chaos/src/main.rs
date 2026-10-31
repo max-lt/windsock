@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 
 use model::{Model, Rng, Value, digest};
 use proxy::{BUCKET, HORIZON, Proxy};
-use s3::Outcome;
+use s3::{Cut, Outcome};
 
 const WORKERS: u64 = 6;
 /// The keys of each worker that get large objects: several read pieces, so GETs read ahead.
@@ -110,7 +110,7 @@ async fn worker(
         let level = pressure.level();
         let big = format!("w{w}/b{}", rng.below(BIG_KEYS));
         let big_path = format!("/{BUCKET}/{big}");
-        let write = match rng.weighted(&[40, 20, 10, 10, 5, 15, 3, 5, 4, 2]) {
+        let write = match rng.weighted(&[40, 20, 10, 10, 5, 15, 3, 5, 4, 2, 4]) {
             0 => {
                 let size = *rng.pick(&[0, 1, 100, 4096, 65536, 300_000, 2_000_000]);
                 let data = rng.bytes(size);
@@ -140,7 +140,7 @@ async fn worker(
                     })
                     .collect();
                 let whole: Vec<u8> = parts.iter().flat_map(|part| part.to_vec()).collect();
-                let outcome = p.s3.multipart(&path, &parts).await;
+                let outcome = p.s3.multipart(&path, &parts, Cut::None).await;
                 if let Some(outcome) = outcome {
                     model.record(&key, digest(&whole), outcome);
                 }
@@ -167,6 +167,7 @@ async fn worker(
                 model.record_copy(&key, &source, value, outcome);
                 Some(outcome)
             }
+            10 => cut_write(p, &model, &mut rng, (&key, &path), &big).await,
             // A cold read with read-ahead, by a client that goes away at a random point.
             8 => {
                 let _ =
@@ -185,6 +186,58 @@ async fn worker(
             tokio::time::sleep(REFUSED_PAUSE).await;
         }
         tokio::time::sleep(LEVELS[level].1).await;
+    }
+}
+
+/// A write whose client goes away: in the body of a PUT or of a part, which the proxy must never
+/// take, or while the proxy runs a copy or a complete, which can take effect or not.
+async fn cut_write(
+    p: &Proxy,
+    model: &Model,
+    rng: &mut Rng,
+    (key, path): (&str, &str),
+    big: &str,
+) -> Option<Outcome> {
+    let wait = Duration::from_millis(rng.below(50));
+    match rng.below(4) {
+        0 => {
+            let size = *rng.pick(&[65_536, 300_000, 2_000_000, 6_000_000]);
+            let data = Bytes::from(rng.bytes(size));
+            let keep = rng.below(size as u64) as usize;
+            p.s3.upload_cut(path, "", data.clone(), keep).await;
+            // Refused: the value must never show, so it stays out of the history.
+            model.record(key, digest(&data), Outcome::Refused);
+            None
+        }
+        1 | 3 => {
+            let parts: Vec<Bytes> = (0..2)
+                .map(|_| {
+                    let size = *rng.pick(&[70_000, 1_100_000]);
+                    Bytes::from(rng.bytes(size))
+                })
+                .collect();
+            let whole: Vec<u8> = parts.iter().flat_map(|part| part.to_vec()).collect();
+            let cut = match rng.below(2) {
+                0 => Cut::Part {
+                    index: rng.below(2) as usize,
+                    keep: rng.below(70_000) as usize,
+                },
+                _ => Cut::Complete(wait),
+            };
+            let outcome = p.s3.multipart(path, &parts, cut).await;
+            if let Some(outcome) = outcome {
+                model.record(key, digest(&whole), outcome);
+            }
+            outcome
+        }
+        _ => {
+            let source = format!("/{BUCKET}/{big}");
+            let extra = [("x-amz-copy-source", source)];
+            p.s3.send_cut(("PUT", path, ""), &extra, Bytes::new(), wait)
+                .await;
+            model.record_copy(key, big, None, Outcome::Unknown);
+            Some(Outcome::Unknown)
+        }
     }
 }
 

@@ -41,9 +41,41 @@ impl Reply {
     }
 }
 
+/// Where a multipart upload of the soak goes away, if it does.
+#[derive(Clone, Copy)]
+pub enum Cut {
+    None,
+    /// The upload of part `index` sends `keep` bytes and goes away, then the part goes again whole.
+    Part {
+        index: usize,
+        keep: usize,
+    },
+    /// The complete goes away after this wait.
+    Complete(Duration),
+}
+
+/// A body that sends its first bytes, then fails: a client that goes away in an upload.
+struct CutBody(Option<Bytes>);
+
+impl hyper::body::Body for CutBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(Some(match self.0.take() {
+            Some(data) => Ok(hyper::body::Frame::data(data)),
+            None => Err(std::io::Error::other("the client went away")),
+        }))
+    }
+}
+
 #[derive(Clone)]
 pub struct S3 {
     client: Client<HttpConnector, Full<Bytes>>,
+    cut_client: Client<HttpConnector, CutBody>,
     address: String,
     access: String,
     secret: String,
@@ -57,7 +89,8 @@ impl S3 {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(Duration::from_secs(3)));
         Self {
-            client: Client::builder(TokioExecutor::new()).build(connector),
+            client: Client::builder(TokioExecutor::new()).build(connector.clone()),
+            cut_client: Client::builder(TokioExecutor::new()).build(connector),
             address: address.to_string(),
             access: access.to_string(),
             secret: secret.to_string(),
@@ -194,6 +227,33 @@ impl S3 {
             .map_err(|_| "no answer in 30 s".to_string())?
     }
 
+    /// A signed upload of `body` that sends `keep` bytes and goes away. The proxy must never take
+    /// it: its body did not arrive whole.
+    pub async fn upload_cut(&self, path: &str, query: &str, body: Bytes, keep: usize) {
+        let Ok(request) = self.request("PUT", path, query, &[], body.clone()) else {
+            return;
+        };
+        let (mut parts, _) = request.into_parts();
+        parts
+            .headers
+            .insert(hyper::header::CONTENT_LENGTH, body.len().into());
+        let cut = Request::from_parts(parts, CutBody(Some(body.slice(..keep.min(body.len())))));
+        let call = self.cut_client.request(cut);
+        let _ = tokio::time::timeout(Duration::from_secs(30), call).await;
+    }
+
+    /// A signed request that the client drops after `wait`, as a client that goes away while the
+    /// proxy works: the request can have its effect or not.
+    pub async fn send_cut(
+        &self,
+        (method, path, query): (&str, &str, &str),
+        extra: &[(&str, String)],
+        body: Bytes,
+        wait: Duration,
+    ) {
+        let _ = tokio::time::timeout(wait, self.send(method, path, query, extra, body)).await;
+    }
+
     /// A CopyObject of `source` (`/bucket/key`) to `path`, and the blake3 that its ETag names.
     pub async fn copy(&self, path: &str, source: &str) -> (Outcome, Option<[u8; 16]>) {
         let extra = [("x-amz-copy-source", source.to_string())];
@@ -212,9 +272,9 @@ impl S3 {
             .await
     }
 
-    /// A multipart upload of `parts`. `None` when a step before the complete fails: the object
-    /// does not change then.
-    pub async fn multipart(&self, path: &str, parts: &[Bytes]) -> Option<Outcome> {
+    /// A multipart upload of `parts`, with the cut of `cut`. `None` when a step before the complete
+    /// fails: the object does not change then.
+    pub async fn multipart(&self, path: &str, parts: &[Bytes], cut: Cut) -> Option<Outcome> {
         let created = self
             .send("POST", path, "uploads=", &[], Bytes::new())
             .await
@@ -227,6 +287,12 @@ impl S3 {
         for (n, part) in parts.iter().enumerate() {
             let number = n + 1;
             let query = format!("partNumber={number}&uploadId={}", encode(&upload));
+            // A cut part leaves no part: the full one that follows takes its number.
+            if let Cut::Part { index, keep } = cut
+                && index == n
+            {
+                self.upload_cut(path, &query, part.clone(), keep).await;
+            }
             let reply = self
                 .send("PUT", path, &query, &[], part.clone())
                 .await
@@ -241,6 +307,11 @@ impl S3 {
         }
         done.push_str("</CompleteMultipartUpload>");
         let query = format!("uploadId={}", encode(&upload));
+        if let Cut::Complete(wait) = cut {
+            let request = ("POST", path, query.as_str());
+            self.send_cut(request, &[], Bytes::from(done), wait).await;
+            return Some(Outcome::Unknown);
+        }
         let completed = self
             .send("POST", path, &query, &[], Bytes::from(done))
             .await;

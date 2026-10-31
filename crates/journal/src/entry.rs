@@ -90,6 +90,8 @@ pub struct Entry {
     /// `prev` and `seen` together form a causal DAG across chains.
     pub seen: Seen,
     pub actions_hash: [u8; 32],
+    /// Length of the sealed actions. Signed, so a reader knows it before it reads them.
+    pub actions_len: u64,
     /// The mutations of this entry, in order. `None` once a purge removed them.
     pub actions: Option<Vec<Action>>,
     /// The actions as the remote holds them. `None` once a purge removed them.
@@ -109,6 +111,7 @@ struct Content<'a> {
     hlc: u64,
     seen: &'a Seen,
     actions_hash: &'a [u8; 32],
+    actions_len: u64,
 }
 
 /// The wire bytes after the sealed actions: the signature, then the MAC.
@@ -123,6 +126,7 @@ struct Fields {
     hlc: u64,
     seen: Seen,
     actions_hash: [u8; 32],
+    actions_len: u64,
 }
 
 impl Fields {
@@ -134,6 +138,7 @@ impl Fields {
             self.hlc,
             &self.seen,
             &self.actions_hash,
+            self.actions_len,
         )
     }
 }
@@ -188,11 +193,25 @@ impl EntryHead {
             }
             _ => return Err(WireError::Malformed),
         };
+        // A length that the signed one does not give: no read of the rest, whatever the MAC.
+        if sealed_len.is_some_and(|len| len != fields.actions_len) {
+            return Err(WireError::ActionsMismatch);
+        }
         Ok(Self {
             fields,
             header_len: (bytes.len() - rest.len()) as u64,
             sealed_len,
         })
+    }
+
+    /// The node that the header names.
+    pub fn node(&self) -> NodeId {
+        self.fields.node
+    }
+
+    /// The seq that the header names.
+    pub fn seq(&self) -> u64 {
+        self.fields.seq
     }
 
     /// The wire bytes before the sealed actions.
@@ -247,6 +266,7 @@ fn content_hash(
     hlc: u64,
     seen: &Seen,
     actions_hash: &[u8; 32],
+    actions_len: u64,
 ) -> EntryHash {
     let content = Content {
         node,
@@ -255,6 +275,7 @@ fn content_hash(
         hlc,
         seen,
         actions_hash,
+        actions_len,
     };
     let bytes = postcard::to_allocvec(&content).expect("an entry always serializes");
     *blake3::hash(&bytes).as_bytes()
@@ -275,7 +296,8 @@ impl Entry {
         let plain = postcard::to_allocvec(&actions).expect("actions always serialize");
         let sealed = sealer.seal(Kind::Actions, &seal_context(node, seq), &plain);
         let actions_hash = actions_hash(&sealed);
-        let hash = content_hash(node, seq, &prev, hlc, &seen, &actions_hash);
+        let actions_len = sealed.len() as u64;
+        let hash = content_hash(node, seq, &prev, hlc, &seen, &actions_hash, actions_len);
         let signature = key.sign(&hash).to_bytes();
         let mac = sealer.entry_mac(&hash);
         let mut r = [0u8; 32];
@@ -290,6 +312,7 @@ impl Entry {
             hlc,
             seen,
             actions_hash,
+            actions_len,
             actions: Some(actions),
             sealed: Some(sealed),
             signature: (r, s),
@@ -306,6 +329,7 @@ impl Entry {
             self.hlc,
             &self.seen,
             &self.actions_hash,
+            self.actions_len,
         )
     }
 
@@ -328,7 +352,9 @@ impl Entry {
     pub fn actions_are_intact(&self) -> bool {
         match (&self.actions, &self.sealed) {
             (None, None) => true,
-            (Some(_), Some(sealed)) => actions_hash(sealed) == self.actions_hash,
+            (Some(_), Some(sealed)) => {
+                sealed.len() as u64 == self.actions_len && actions_hash(sealed) == self.actions_hash
+            }
             _ => false,
         }
     }
@@ -350,6 +376,7 @@ impl Entry {
             hlc: self.hlc,
             seen: self.seen.clone(),
             actions_hash: self.actions_hash,
+            actions_len: self.actions_len,
         }
     }
 
@@ -374,6 +401,7 @@ impl Entry {
             let context = seal_context(wire.fields.node, wire.fields.seq);
             let sealed = sealer.seal(Kind::Actions, &context, plain);
             wire.fields.actions_hash = actions_hash(&sealed);
+            wire.fields.actions_len = sealed.len() as u64;
             wire.sealed = Some(sealed);
         }
         wire.mac = sealer.entry_mac(&wire.fields.content_hash());
@@ -400,6 +428,8 @@ impl Entry {
 
     /// Reads an entry from the remote and opens its actions.
     pub fn from_wire(bytes: &[u8], sealer: &Sealer) -> Result<Self, WireError> {
+        // The checks of a ranged read come first, so both reads give the same error.
+        EntryHead::parse(bytes)?;
         let wire: Wire = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
         Self::checked(wire, sealer)
     }
@@ -425,6 +455,11 @@ impl Entry {
     }
 
     fn checked(wire: Wire, sealer: &Sealer) -> Result<Self, WireError> {
+        // The same order as EntryHead::parse: the signed length comes before the MAC.
+        let len = wire.sealed.as_ref().map(|sealed| sealed.len() as u64);
+        if len.is_some_and(|len| len != wire.fields.actions_len) {
+            return Err(WireError::ActionsMismatch);
+        }
         // Before any use of the header: a writer with no repository key stops here.
         check_mac(&wire.fields, &wire.mac, sealer)?;
         let fields = wire.fields;
@@ -449,6 +484,7 @@ impl Entry {
             hlc: fields.hlc,
             seen: fields.seen,
             actions_hash: fields.actions_hash,
+            actions_len: fields.actions_len,
             actions,
             sealed: wire.sealed,
             signature: wire.signature,
@@ -521,10 +557,25 @@ pub(crate) fn with_bad_mac(mut entry: Entry) -> Entry {
     entry
 }
 
-/// The header of `entry` with a sealed length of `len`: the start of an entry of any size.
+/// The header of `entry` with a signed and a wire length of `len`, as a writer with no repository
+/// key makes it: the start of an entry of any size.
 #[cfg(test)]
 pub(crate) fn header_with_sealed_len(entry: &Entry, len: u64) -> Vec<u8> {
-    let mut bytes = postcard::to_allocvec(&entry.fields()).expect("an entry always serializes");
+    let mut fields = entry.fields();
+    fields.actions_len = len;
+    header_with_wire_len(&fields, len)
+}
+
+/// The real header of `entry` with a wire length of `len` and its signed length, as a replay of a
+/// real header and tail makes it.
+#[cfg(test)]
+pub(crate) fn header_with_replayed_len(entry: &Entry, len: u64) -> Vec<u8> {
+    header_with_wire_len(&entry.fields(), len)
+}
+
+#[cfg(test)]
+fn header_with_wire_len(fields: &Fields, len: u64) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(fields).expect("an entry always serializes");
     bytes.push(1);
     bytes.extend(postcard::to_allocvec(&len).expect("a length always serializes"));
     bytes
@@ -589,17 +640,18 @@ mod tests {
             42,
             &seen,
             &[3; 32],
+            8,
         );
         let mac = test_sealer().entry_mac(&content);
 
         let hex = |bytes: [u8; 32]| blake3::Hash::from_bytes(bytes).to_hex().to_string();
         assert_eq!(
             hex(content),
-            "dddd3575e1aeba5c1d8307f10483012a8235cff5f882f11b88a0a0f2432131f0"
+            "cfde6288a061158e09a1047a65eacb6bf6ec3c1f7699780467d29a433592bad0"
         );
         assert_eq!(
             hex(mac),
-            "75e81c9aae019447f50483f19a192f7b8e4107cb235787d38a1ab2ccb027f26a"
+            "f6b1687b5bc050c9cda2a06784764957594ef11b641c106f81bc48376043b40e"
         );
     }
 
@@ -799,6 +851,7 @@ mod tests {
                 hlc: 7,
                 seen: seen(),
                 actions_hash: [6u8; 32],
+                actions_len: 2,
             },
             sealed: Some(vec![9, 9]),
             signature: ([7u8; 32], [8u8; 32]),
@@ -809,7 +862,7 @@ mod tests {
 
         assert_eq!(
             blake3::hash(&bytes).to_string(),
-            "48c370a3aaabc21d82f1561ce2fba6c915b7a1bff6570bd6850f0a2942b18255"
+            "7dcd0c5e966ba66f06ece9494ae0d790792c0ed9a2d42919c50e5afe08fd2727"
         );
     }
 

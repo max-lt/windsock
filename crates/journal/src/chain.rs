@@ -31,6 +31,7 @@ impl Frontier {
     pub fn extend(&self, node: NodeId, entry: &Entry) -> Result<Frontier, ChainError> {
         if entry.node != node {
             return Err(ChainError::WrongNode {
+                seq: self.next_seq,
                 expected: node,
                 actual: entry.node,
             });
@@ -87,8 +88,12 @@ impl Frontier {
 pub enum ChainError {
     #[error("entry {seq} is not a valid entry")]
     Malformed { seq: u64 },
-    #[error("entry is from node {actual}, expected {expected}")]
-    WrongNode { expected: NodeId, actual: NodeId },
+    #[error("entry {seq} is from node {actual}, expected {expected}")]
+    WrongNode {
+        seq: u64,
+        expected: NodeId,
+        actual: NodeId,
+    },
     #[error("entry has seq {actual}, expected {expected}")]
     WrongSeq { expected: u64, actual: u64 },
     #[error("entry {seq} does not link to the previous entry")]

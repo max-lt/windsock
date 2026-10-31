@@ -6,6 +6,8 @@ use bytes::Bytes;
 use remote::{Remote, RemoteError};
 use seal::Sealer;
 
+use model::NodeId;
+
 use crate::{ChainError, Entry, EntryHead, MAX_ENTRY, MAX_HEADER, TAIL_LEN, WireError};
 
 /// Reads of one entry. A prune replaces an entry once, so a second change means a fault.
@@ -14,12 +16,31 @@ const ATTEMPTS: u32 = 3;
 /// Why a reader refuses the object at an entry key.
 pub(crate) enum Refused {
     Wire(WireError),
-    TooLarge { len: u64 },
+    TooLarge {
+        len: u64,
+    },
+    /// The header names another node than the key.
+    WrongNode {
+        actual: NodeId,
+    },
+    /// The header names another seq than the key.
+    WrongSeq {
+        actual: u64,
+    },
 }
 
 impl Refused {
-    pub(crate) fn at(self, seq: u64) -> ChainError {
+    pub(crate) fn at(self, node: NodeId, seq: u64) -> ChainError {
         match self {
+            Refused::WrongNode { actual } => ChainError::WrongNode {
+                seq,
+                expected: node,
+                actual,
+            },
+            Refused::WrongSeq { actual } => ChainError::WrongSeq {
+                expected: seq,
+                actual,
+            },
             Refused::Wire(WireError::Malformed) => ChainError::Malformed { seq },
             Refused::Wire(WireError::ActionsMismatch) => ChainError::ActionsMismatch { seq },
             Refused::Wire(WireError::Sealed) => ChainError::Sealed { seq },
@@ -40,15 +61,17 @@ fn refused(refused: Refused) -> Option<Read> {
     Some(Some(Err(refused)))
 }
 
-/// Reads the entry at `key`. An entry of at most MAX_HEADER bytes costs one request. A larger one
-/// costs four, and a reader takes its actions only after its MAC passes.
+/// Reads entry `seq` of `node`. An entry of at most MAX_HEADER bytes costs one request. A larger
+/// one costs four, and a reader takes its tail only for the node and seq of the key, and its
+/// actions only after its MAC passes.
 pub(crate) async fn read_entry<R: Remote>(
     remote: &R,
-    key: &str,
+    (node, seq): (NodeId, u64),
     sealer: &Sealer,
 ) -> Result<Read, RemoteError> {
+    let key = crate::entry_key(node, seq);
     for _ in 0..ATTEMPTS {
-        if let Some(read) = attempt(remote, key, sealer).await? {
+        if let Some(read) = attempt(remote, (&key, node, seq), sealer).await? {
             return Ok(read);
         }
     }
@@ -59,7 +82,7 @@ pub(crate) async fn read_entry<R: Remote>(
 /// between two reads.
 async fn attempt<R: Remote>(
     remote: &R,
-    key: &str,
+    (key, node, seq): (&str, NodeId, u64),
     sealer: &Sealer,
 ) -> Result<Option<Read>, RemoteError> {
     let len = match remote.get(key, MAX_HEADER).await {
@@ -79,6 +102,15 @@ async fn attempt<R: Remote>(
         Ok(head) => head,
         Err(e) => return Ok(done(Err(e))),
     };
+    // A copy of a real header under another key: refused before its tail and its actions.
+    if head.node() != node {
+        return Ok(refused(Refused::WrongNode {
+            actual: head.node(),
+        }));
+    }
+    if head.seq() != seq {
+        return Ok(refused(Refused::WrongSeq { actual: head.seq() }));
+    }
     let end = match head.wire_len() {
         Some(end) if end <= MAX_ENTRY => end,
         end => {
@@ -140,7 +172,7 @@ mod tests {
     use remote::MemoryRemote;
 
     use super::*;
-    use crate::entry::{header_with_sealed_len, test_sealer};
+    use crate::entry::{header_with_replayed_len, header_with_sealed_len, test_sealer};
     use crate::{Action, Frontiers, Journal, JournalError, LOG_PREFIX, Link, Seen, entry_key};
 
     /// A remote that logs the bytes of each answer for an entry key. It serves objects of any
@@ -411,6 +443,65 @@ mod tests {
             read <= ATTEMPTS as u64 * (MAX_HEADER + TAIL_LEN),
             "{read} bytes read"
         );
+    }
+
+    /// Two normal syncs of a chain whose first object is `start` then zeros up to `len`: the
+    /// error of the chain, the bytes that the first sync read, and the bytes of the second.
+    async fn fake_first(start: Vec<u8>, len: u64) -> (Option<ChainError>, u64, u64) {
+        let remote = Arc::new(Served::default());
+        marker(&remote).await;
+        let key = entry_key(node(), 0);
+        remote
+            .huge
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (start, len));
+        let mut reader = reader(&remote);
+
+        reader.sync_all().await.unwrap();
+        let first: u64 = remote.reads_of(&key).iter().sum();
+        reader.sync_all().await.unwrap();
+        let second = remote.reads_of(&key).iter().sum::<u64>() - first;
+
+        (reader.broken().get(&node()).cloned(), first, second)
+    }
+
+    /// A real header and tail with a larger length and junk between them: the signed length
+    /// refuses it before the tail, and normal syncs do not read it again.
+    #[tokio::test]
+    async fn test_replayed_header_with_another_length_reads_one_header() {
+        let real = first(100_000, 2, &test_sealer());
+        let mut start = header_with_replayed_len(&real, MAX_ENTRY / 2);
+        start.resize(MAX_HEADER as usize, 0);
+
+        let (broken, first, second) = fake_first(start, MAX_ENTRY / 2 + 1024).await;
+
+        assert_eq!(broken, Some(ChainError::ActionsMismatch { seq: 0 }));
+        assert!(first <= MAX_HEADER + TAIL_LEN, "{first} bytes read");
+        assert_eq!(second, 0, "a normal sync read the fake chain again");
+    }
+
+    /// A whole real entry of another node under the first key of this node: the node in the
+    /// header refuses it before the tail, and normal syncs do not read it again.
+    #[tokio::test]
+    async fn test_real_entry_of_another_node_reads_one_header() {
+        let other = SigningKey::from_bytes(&[5; 32]);
+        let actions = (0..100)
+            .map(|i| put(format!("{i:04}{}", "k".repeat(996))))
+            .collect();
+        let real = Entry::sign(&other, 0, [0; 32], 2, Seen::new(), actions, &test_sealer());
+        let wire = real.to_wire();
+        assert!(wire.len() as u64 > MAX_HEADER);
+        let len = wire.len() as u64;
+
+        let (broken, first, second) = fake_first(wire, len).await;
+
+        assert!(
+            matches!(broken, Some(ChainError::WrongNode { seq: 0, .. })),
+            "{broken:?}"
+        );
+        assert!(first <= MAX_HEADER + TAIL_LEN, "{first} bytes read");
+        assert_eq!(second, 0, "a normal sync read the fake chain again");
     }
 
     #[tokio::test]

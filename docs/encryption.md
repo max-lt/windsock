@@ -21,10 +21,10 @@ Each proxy also has its own signing key, `node.key`. The signing key proves whic
 journal entry. It does not give access to the data.
 
 Each journal entry also carries a MAC under a subkey of `repo.key`, over the same fields as the
-signature. A writer that can put objects in the bucket but has no `repo.key` can make a node key,
+signature. These fields include the length of the sealed actions. A writer that can put objects in the bucket but has no `repo.key` can make a node key,
 but not a valid entry: a reader checks the MAC before it uses the entry, so that chain is broken
 and named, the other chains read, and the clock of the reader does not move. A redaction by the
-GC keeps the MAC, because the MAC does not cover the sealed actions.
+GC keeps the MAC, because the MAC covers the length of the sealed actions, not their bytes.
 
 ## For the operator
 
@@ -62,16 +62,16 @@ longer than its content.
 
 ## What the remote holds
 
-| Object                      | Sealed                                                    | In clear                                                          |
-| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------- |
-| `packs/<id>`                | Each chunk, and the footer with the chunk IDs and offsets | The header (format and nonce), the total size and the footer size |
-| `manifests/<id>`            | All the content                                           | The key name                                                      |
-| `log/<node>/<seq>`          | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, the signature and the MAC             |
-| `snapshots/<time>-<h>/<n>`  | Part n of the sealed snapshot                             | The write time in the key name, the part number and size          |
-| `snapshots/<time>-<h>/head` | The size and hash of each part, the frontiers             | The write time in the key name                                    |
-| `snapshots/<time>-<h>`      | All the content (one object, read only)                   | The write time in the key name                                    |
-| `repo/key-check`            | A known value                                             | Nothing else                                                      |
-| `nodes/<node>`              | Empty marker                                              | The node ID                                                       |
+| Object                      | Sealed                                                    | In clear                                                                  |
+| --------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `packs/<id>`                | Each chunk, and the footer with the chunk IDs and offsets | The header (format and nonce), the total size and the footer size         |
+| `manifests/<id>`            | All the content                                           | The key name                                                              |
+| `log/<node>/<seq>`          | The actions: bucket names, object keys, inline manifests  | node, seq, prev, hlc, seen, the actions length, the signature and the MAC |
+| `snapshots/<time>-<h>/<n>`  | Part n of the sealed snapshot                             | The write time in the key name, the part number and size                  |
+| `snapshots/<time>-<h>/head` | The size and hash of each part, the frontiers             | The write time in the key name                                            |
+| `snapshots/<time>-<h>`      | All the content (one object, read only)                   | The write time in the key name                                            |
+| `repo/key-check`            | A known value                                             | Nothing else                                                              |
+| `nodes/<node>`              | Empty marker                                              | The node ID                                                               |
 
 A pack upload whose answer is lost is sent again with a new nonce. The first pack then has no
 manifest, and the GC condemns it.

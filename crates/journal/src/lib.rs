@@ -290,7 +290,8 @@ impl<R: Remote> Journal<R> {
         let read = self.sync_node(self.node).await?;
         self.stashed.extend(read);
 
-        let stored = fetch::read_entry(&*self.remote, &entry.remote_key(), &self.sealer).await?;
+        let stored =
+            fetch::read_entry(&*self.remote, (entry.node, entry.seq), &self.sealer).await?;
         Ok(matches!(stored, Some(Ok(stored)) if stored.hash() == entry.hash()))
     }
 
@@ -313,8 +314,8 @@ impl<R: Remote> Journal<R> {
         let mut entries = Vec::new();
 
         loop {
-            let key = entry_key(node, frontier.next_seq);
-            let read = fetch::read_entry(&*self.remote, &key, &self.sealer).await?;
+            let read =
+                fetch::read_entry(&*self.remote, (node, frontier.next_seq), &self.sealer).await?;
             let Some(read) = read else {
                 // A writer creates seq n before n + 1: a later entry with no entry here is a gap,
                 // and the chain would end here for this reader only.
@@ -340,7 +341,7 @@ impl<R: Remote> Journal<R> {
             let seq = frontier.next_seq;
             let entry = read.map_err(|refused| JournalError::Chain {
                 node,
-                source: refused.at(seq),
+                source: refused.at(node, seq),
             })?;
             frontier = frontier
                 .extend(node, &entry)
@@ -397,7 +398,7 @@ impl<R: Remote> Journal<R> {
         let Some(last) = frontier.next_seq.checked_sub(1) else {
             return Ok(highest);
         };
-        let stored = fetch::read_entry(&*self.remote, &entry_key(node, last), &self.sealer).await?;
+        let stored = fetch::read_entry(&*self.remote, (node, last), &self.sealer).await?;
         let same = matches!(stored, Some(Ok(entry)) if entry.hash() == frontier.last_hash);
         if !same {
             return Err(JournalError::Chain {
@@ -550,6 +551,9 @@ impl<R: Remote> Journal<R> {
                 | ChainError::Malformed { seq: 0 }
                 | ChainError::TooLarge { seq: 0, .. }
                 | ChainError::Gap { seq: 0, .. }
+                | ChainError::WrongNode { seq: 0, .. }
+                | ChainError::WrongSeq { expected: 0, .. }
+                | ChainError::ActionsMismatch { seq: 0 }
         );
         if first && self.frontier(node) == Frontier::GENESIS && self.fake.insert(node) {
             warn!(
@@ -1469,6 +1473,8 @@ mod tests {
         assert!(reader.broken().contains_key(&c.node()));
 
         overwrite(&remote, &good).await;
+        // A chain with no valid first entry reads again at an audit only.
+        reader.audit_next_sync();
         let entries = reader.sync_all().await.unwrap();
         // The marked chain is audited at this sync: the mark goes once the chain reads.
         assert_eq!(entries, vec![good]);

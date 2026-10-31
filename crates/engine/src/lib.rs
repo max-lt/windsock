@@ -80,8 +80,9 @@ pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
 pub const MAX_PACK_TARGET: u64 = 128 * 1024 * 1024;
 /// The smallest read budget: 16 pieces of READ_STEP.
 pub const MIN_READ_BUDGET: u64 = 64 * 1024 * 1024;
-/// The remote format of this build: each journal entry carries a MAC under the repository key.
-const REMOTE_FORMAT: u32 = 3;
+/// The remote format of this build: each journal entry carries a MAC under the repository key, and
+/// signs the length of its sealed actions.
+const REMOTE_FORMAT: u32 = 4;
 
 pub fn pack_key(id: PackId) -> String {
     format!("{PACKS_PREFIX}{id}")

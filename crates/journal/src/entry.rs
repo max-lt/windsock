@@ -50,6 +50,9 @@ pub enum Action {
         packs: Vec<PackId>,
         manifests: Vec<ObjectId>,
     },
+    /// The entries of `node` below seq `upto` are retired: a writer that applied this entry may
+    /// leave `node` out of its seen, and a reader takes that writer as one that knew them.
+    Retire { node: NodeId, upto: u64 },
 }
 
 impl Action {
@@ -786,6 +789,29 @@ mod tests {
 
         assert_eq!(decoded, entry);
         assert!(decoded.signature_is_valid());
+    }
+
+    /// A Retire is one more sealed action: it reads back through the wire with its MAC.
+    #[test]
+    fn test_entry_with_a_retire_reads_back_from_the_wire() {
+        let retire = Action::Retire {
+            node: NodeId::from_bytes([4; 32]),
+            upto: 6,
+        };
+        let entry = Entry::sign(
+            &key(),
+            0,
+            [0u8; 32],
+            9,
+            seen(),
+            vec![retire],
+            &test_sealer(),
+        );
+
+        let read = Entry::from_wire(&entry.to_wire(), &test_sealer()).unwrap();
+
+        assert_eq!(read, entry);
+        assert!(read.signature_is_valid());
     }
 
     #[test]

@@ -474,7 +474,7 @@ impl<R: Remote + 'static> Engine<R> {
                 Action::CreateBucket { bucket, .. } | Action::DeleteBucket { bucket, .. } => {
                     bucket.clone()
                 }
-                Action::Condemn { .. } => String::new(),
+                Action::Condemn { .. } | Action::Retire { .. } => String::new(),
             })
             .collect();
         if late.is_empty() {

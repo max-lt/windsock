@@ -74,6 +74,8 @@ pub struct Index {
     condemned: Keyspace,
     /// Node to the first seq not yet checked by the journal prune. Local progress only.
     redacted: Keyspace,
+    /// `retired node | writer | seq` of each valid Retire action, to its point and entry HLC.
+    retired: Keyspace,
     pending: Vec<Entry>,
     _temp: Option<tempfile::TempDir>,
 }
@@ -97,6 +99,48 @@ fn condemn_key(tag: u8, id: &[u8; 32]) -> [u8; 33] {
     key[0] = tag;
     key[1..].copy_from_slice(id);
     key
+}
+
+/// The entries of `node` below `upto` are retired by the entry `seq` of `by`, at `hlc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireMark {
+    pub node: NodeId,
+    pub by: NodeId,
+    pub seq: u64,
+    pub upto: u64,
+    pub hlc: u64,
+}
+
+impl RetireMark {
+    fn key(&self) -> [u8; 72] {
+        let mut key = [0u8; 72];
+        key[..32].copy_from_slice(self.node.as_bytes());
+        key[32..64].copy_from_slice(self.by.as_bytes());
+        key[64..].copy_from_slice(&self.seq.to_be_bytes());
+        key
+    }
+
+    fn decode(key: &[u8], value: &[u8]) -> Result<Self> {
+        let id = |range: std::ops::Range<usize>| -> Result<NodeId> {
+            let bytes: [u8; 32] = key
+                .get(range)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(corrupt)?;
+            Ok(NodeId::from_bytes(bytes))
+        };
+        let seq: [u8; 8] = key
+            .get(64..72)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(corrupt)?;
+        let (upto, hlc) = postcard::from_bytes(value)?;
+        Ok(Self {
+            node: id(0..32)?,
+            by: id(32..64)?,
+            seq: u64::from_be_bytes(seq),
+            upto,
+            hlc,
+        })
+    }
 }
 
 fn pack_chunk_key(pack: PackId, chunk: ChunkId) -> [u8; 64] {
@@ -168,6 +212,7 @@ impl Index {
             manifests: db.keyspace("manifests", KeyspaceCreateOptions::default)?,
             condemned: db.keyspace("condemned", KeyspaceCreateOptions::default)?,
             redacted: db.keyspace("redacted", KeyspaceCreateOptions::default)?,
+            retired: db.keyspace("retired", KeyspaceCreateOptions::default)?,
             db,
             pending: Vec::new(),
             _temp: temp,
@@ -342,6 +387,20 @@ impl Index {
                         self.record_condemn(&mut batch, entry, MANIFEST_TAG, manifest.as_bytes())?;
                     }
                 }
+                Action::Retire { node, upto } => {
+                    // A writer retires only entries that it applied, never its own chain.
+                    let applied = entry.seen.get(node).map_or(0, |link| link.seq + 1);
+                    if *node != entry.node && *upto > 0 && *upto <= applied {
+                        let mark = RetireMark {
+                            node: *node,
+                            by: entry.node,
+                            seq: entry.seq,
+                            upto: *upto,
+                            hlc: entry.hlc,
+                        };
+                        batch.insert(&self.retired, mark.key(), encode(&(mark.upto, mark.hlc)));
+                    }
+                }
             }
         }
 
@@ -359,6 +418,45 @@ impl Index {
         Ok(())
     }
 
+    /// Every valid Retire action that the index applied.
+    pub fn retire_marks(&self) -> Result<Vec<RetireMark>> {
+        let mut marks = Vec::new();
+        for guard in self.retired.iter() {
+            let (key, value) = guard.into_inner()?;
+            marks.push(RetireMark::decode(&key, &value)?);
+        }
+        Ok(marks)
+    }
+
+    /// The seen of `entry`, with a link for each chain that a Retire reached by its links covers.
+    /// Its writer applied that Retire, so it knew the retired entries: the state stays the one of
+    /// a full seen, whatever chain the writer left out.
+    fn reached_seen(&self, entry: &Entry) -> Result<Seen> {
+        let marks = self.retire_marks()?;
+        let mut seen = entry.seen.clone();
+        // A Retire entry can itself be in a retired chain: go on until no link changes.
+        loop {
+            let mut changed = false;
+            for mark in &marks {
+                let reached = (mark.by == entry.node && mark.seq < entry.seq)
+                    || seen.get(&mark.by).is_some_and(|link| link.seq >= mark.seq);
+                let known = seen.get(&mark.node).map_or(0, |link| link.seq + 1);
+                if mark.node == entry.node || !reached || known >= mark.upto {
+                    continue;
+                }
+                let link = journal::Link {
+                    seq: mark.upto - 1,
+                    hash: [0; 32],
+                };
+                seen.insert(mark.node, link);
+                changed = true;
+            }
+            if !changed {
+                return Ok(seen);
+            }
+        }
+    }
+
     fn record_version(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -371,7 +469,8 @@ impl Index {
         let storage_key = object_key(bucket, key);
         let mut state = self.object(bucket, key)?.unwrap_or_default();
 
-        if state.record(entry, hlc, manifest_id) {
+        let seen = self.reached_seen(entry)?;
+        if state.record_seen(entry, hlc, manifest_id, seen) {
             batch.insert(&self.objects, storage_key, encode(&state));
         }
 
@@ -601,6 +700,7 @@ impl Index {
             buckets,
             condemned,
             manifests: manifests.into_iter().collect(),
+            retired: self.retire_marks()?,
         })
     }
 
@@ -616,6 +716,7 @@ impl Index {
             &self.chunks,
             &self.pack_chunks,
             &self.condemned,
+            &self.retired,
         ] {
             for guard in keyspace.iter() {
                 let (key, _) = guard.into_inner()?;
@@ -639,6 +740,9 @@ impl Index {
         }
         for (id, bytes) in &snapshot.manifests {
             fill.insert(&self.manifests, id.as_bytes(), bytes.as_slice());
+        }
+        for mark in &snapshot.retired {
+            fill.insert(&self.retired, mark.key(), encode(&(mark.upto, mark.hlc)));
         }
         fill.commit()?;
 
@@ -726,7 +830,7 @@ mod tests {
     use std::sync::Arc;
 
     use ed25519_dalek::SigningKey;
-    use journal::Journal;
+    use journal::{Journal, Link};
     use remote::MemoryRemote;
 
     use super::*;
@@ -1329,6 +1433,7 @@ mod tests {
             buckets: Vec::new(),
             condemned: Vec::new(),
             manifests: Vec::new(),
+            retired: Vec::new(),
         }
         .encode();
         bytes[0] = 1;
@@ -1337,7 +1442,7 @@ mod tests {
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("snapshot has format 1"), "{error}");
-        assert!(error.contains("reads format 2"), "{error}");
+        assert!(error.contains("reads format 3"), "{error}");
     }
 
     /// A redacted entry has no actions: applying it as empty would lose them silently.
@@ -1396,11 +1501,18 @@ mod tests {
             buckets: vec![],
             condemned: vec![(vec![b'p'; 33], 5)],
             manifests: vec![(manifest(6), b"m".to_vec())],
+            retired: vec![RetireMark {
+                node: NodeId::from_bytes([7u8; 32]),
+                by: NodeId::from_bytes([8u8; 32]),
+                seq: 9,
+                upto: 10,
+                hlc: 11,
+            }],
         };
 
         assert_eq!(
             blake3::hash(&snapshot.encode()).to_string(),
-            "e977526ccc015083bdce4f0e7b7101a7b68e38f3f83f681251e6945eb4824f85"
+            "c7b3b5387e9032b92d264418c6ab3e86232520255890783a40e43fe0f95728dc"
         );
     }
 
@@ -1537,5 +1649,88 @@ mod tests {
 
         assert_eq!(index.chunk(id).unwrap(), Some(location));
         assert_eq!(index.chunk(ChunkId::from_bytes([3u8; 32])).unwrap(), None);
+    }
+
+    /// A put of k by node 1, a Retire of it by node 3 that applied it, and a later put of k by
+    /// node 2 that links node 3 only: the entries in write order.
+    async fn retired_history(upto: u64) -> Vec<Entry> {
+        retired_history_with(upto, true).await
+    }
+
+    /// [`retired_history`], where the second put links the Retire entry only with `link`.
+    async fn retired_history_with(upto: u64, link_retire: bool) -> Vec<Entry> {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let mut gc = journal(&remote, 3);
+        let mut b = journal(&remote, 2);
+        let first = a.append(put("k", 1), Seen::new()).await.unwrap();
+        let link = |e: &Entry| Link {
+            seq: e.seq,
+            hash: e.hash(),
+        };
+        let retire = vec![Action::Retire {
+            node: first.node,
+            upto,
+        }];
+        let seen = Seen::from([(first.node, link(&first))]);
+        let retired = gc.append(retire, seen).await.unwrap();
+        let seen = match link_retire {
+            true => Seen::from([(retired.node, link(&retired))]),
+            false => Seen::new(),
+        };
+        let second = b.append(put("k", 2), seen).await.unwrap();
+        vec![first, retired, second]
+    }
+
+    fn conflicted(index: &Index) -> bool {
+        index.object("b", "k").unwrap().unwrap().is_conflicted()
+    }
+
+    #[tokio::test]
+    async fn test_writer_that_reached_a_retire_knew_the_retired_entries() {
+        let entries = retired_history(1).await;
+        let mut index = Index::open_temporary().unwrap();
+        let mut reversed = Index::open_temporary().unwrap();
+
+        index.apply(entries.clone()).unwrap();
+        reversed.apply(entries.into_iter().rev().collect()).unwrap();
+
+        assert!(!conflicted(&index));
+        assert_eq!(index.resolve("b", "k").unwrap(), Some(manifest(2)));
+        assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
+    }
+
+    /// A Retire of an entry that its writer did not apply moves nothing.
+    #[tokio::test]
+    async fn test_retire_past_what_its_writer_applied_is_ignored() {
+        let mut index = Index::open_temporary().unwrap();
+
+        index.apply(retired_history(2).await).unwrap();
+
+        assert!(conflicted(&index));
+    }
+
+    /// Only a writer whose links reach the Retire entry knew the retired entries.
+    #[tokio::test]
+    async fn test_writer_that_did_not_reach_a_retire_keeps_the_conflict() {
+        let mut index = Index::open_temporary().unwrap();
+
+        index.apply(retired_history_with(1, false).await).unwrap();
+
+        assert!(conflicted(&index));
+    }
+
+    #[tokio::test]
+    async fn test_loaded_snapshot_keeps_the_retired_entries() {
+        let entries = retired_history(1).await;
+        let mut source = Index::open_temporary().unwrap();
+        source.apply(entries[..2].to_vec()).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let mut target = Index::open_temporary().unwrap();
+
+        target.load(&snapshot).unwrap();
+        target.apply(entries[2..].to_vec()).unwrap();
+
+        assert!(!conflicted(&target));
     }
 }

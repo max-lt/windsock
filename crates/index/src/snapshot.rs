@@ -7,10 +7,10 @@ use journal::Frontiers;
 use model::ObjectId;
 use serde::{Deserialize, Serialize};
 
-use crate::{BucketState, IndexError, ObjectState};
+use crate::{BucketState, IndexError, ObjectState, RetireMark};
 
-/// Format 2 orders the versions of a key by their ack HLC.
-const VERSION: u8 = 2;
+/// Format 3 adds the retired chains.
+const VERSION: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -23,6 +23,8 @@ pub struct Snapshot {
     /// Manifests that the versions name, when this index holds them. Inline
     /// manifests exist nowhere else once their entries are redacted.
     pub manifests: Vec<(ObjectId, Vec<u8>)>,
+    /// Each valid Retire action: a writer that reached it knew the retired entries.
+    pub retired: Vec<RetireMark>,
 }
 
 impl Snapshot {

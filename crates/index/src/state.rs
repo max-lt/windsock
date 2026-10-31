@@ -82,12 +82,23 @@ impl ObjectState {
     /// Records the version that `entry` writes, acked at `hlc`. Returns `false` when it was
     /// already recorded. One entry can hold several writes to one key.
     pub fn record(&mut self, entry: &Entry, hlc: u64, manifest_id: Option<ObjectId>) -> bool {
+        self.record_seen(entry, hlc, manifest_id, entry.seen.clone())
+    }
+
+    /// [`ObjectState::record`] with the seen that knew uses for this version.
+    pub fn record_seen(
+        &mut self,
+        entry: &Entry,
+        hlc: u64,
+        manifest_id: Option<ObjectId>,
+        seen: Seen,
+    ) -> bool {
         let version = Version {
             hlc,
             node: entry.node,
             seq: entry.seq,
             manifest_id,
-            seen: entry.seen.clone(),
+            seen,
         };
 
         if self.versions.iter().any(|v| v.rank() == version.rank()) {

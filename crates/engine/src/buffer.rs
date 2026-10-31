@@ -486,9 +486,6 @@ impl Buffer {
     pub async fn open(dir: impl Into<PathBuf>, segment_target: u64) -> Result<Self, EngineError> {
         let dir = dir.into();
         tokio::fs::create_dir_all(&dir).await?;
-
-        let existing = list_segments(&dir).await?;
-        check_format(&dir, !existing.is_empty()).await?;
         // A spool file of a put that a crash stopped was never acknowledged.
         let spool = dir.join(SPOOL_DIR);
         match tokio::fs::remove_dir_all(&spool).await {
@@ -496,6 +493,13 @@ impl Buffer {
             _ => {}
         }
         tokio::fs::create_dir_all(&spool).await?;
+        Self::read(dir, segment_target).await
+    }
+
+    /// Replays the segments in `dir`. The spool stays: the puts in flight write to it.
+    async fn read(dir: PathBuf, segment_target: u64) -> Result<Self, EngineError> {
+        let existing = list_segments(&dir).await?;
+        check_format(&dir, !existing.is_empty()).await?;
         let mut buffer = Self {
             active: create_segment(&dir, existing.last().map_or(0, |last| last + 1)).await?,
             dir,
@@ -742,7 +746,7 @@ impl Buffer {
         self.active.file.set_len(self.active.durable_len).await?;
         self.active.file.sync_all().await?;
 
-        let mut fresh = Self::open(self.dir.clone(), self.segment_target).await?;
+        let mut fresh = Self::read(self.dir.clone(), self.segment_target).await?;
         fresh.written = self.written;
         fresh.durable = self.written;
         fresh.lost = std::mem::take(&mut self.lost);

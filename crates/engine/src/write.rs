@@ -500,6 +500,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_failed_fsync_keeps_a_spooled_put_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open(dir.path()).await;
+        engine.create_bucket("demo", None).await.unwrap();
+        let mut spool = engine
+            .begin_put_sized("demo", "big", BTreeMap::new(), WriteMode::Overwrite, 8)
+            .await
+            .unwrap();
+        engine.spool_write(&mut spool, b"half").await.unwrap();
+
+        engine.buffer.lock().await.fail_next_sync = true;
+        let lost = put(&engine, "small", b"x").await;
+        engine.spool_write(&mut spool, b"more").await.unwrap();
+        let finished = engine.finish_put(spool).await;
+
+        assert!(matches!(lost, Err(EngineError::WriteLost)), "{lost:?}");
+        assert!(finished.is_ok(), "{finished:?}");
+        assert_eq!(
+            get(&engine, "big").await.unwrap(),
+            Bytes::from_static(b"halfmore")
+        );
+        put(&engine, "later", b"y").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_failed_fsync_loses_only_the_writes_it_covers() {
         let dir = tempfile::tempdir().unwrap();
         let engine = open(dir.path()).await;

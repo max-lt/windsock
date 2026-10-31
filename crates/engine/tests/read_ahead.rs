@@ -154,6 +154,21 @@ async fn piece_time(remote: &Arc<SlowRemote>, key: &str) -> Duration {
     started.elapsed()
 }
 
+/// The chunk bytes and the temporary files in a cache directory.
+fn cache_files(dir: &std::path::Path) -> (u64, usize) {
+    let (mut bytes, mut temps) = (0, 0);
+    for sub in std::fs::read_dir(dir).unwrap() {
+        for file in std::fs::read_dir(sub.unwrap().path()).unwrap() {
+            let file = file.unwrap();
+            match file.file_name().to_string_lossy().starts_with(".tmp.") {
+                true => temps += 1,
+                false => bytes += file.metadata().unwrap().len(),
+            }
+        }
+    }
+    (bytes, temps)
+}
+
 /// Waits until no read-ahead task runs, then checks that every room and slot came back.
 async fn assert_all_given_back(proxy: &Proxy, budget: u64) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -284,8 +299,9 @@ async fn test_reader_dropped_at_any_time_with_cache_writes_gives_back_all_room()
         .map(|(key, data)| (key.as_str(), data.as_slice()))
         .collect();
     let remote = remote_with(&refs).await;
+    // A cache smaller than the objects: the writes evict as they go.
     let config = Config {
-        cache_bytes: 1 << 30,
+        cache_bytes: 16 * MIB as u64,
         read_ahead: 3,
         ..Config::default()
     };
@@ -305,6 +321,11 @@ async fn test_reader_dropped_at_any_time_with_cache_writes_gives_back_all_room()
         assert_all_given_back(&reader_proxy, budget).await;
     }
     assert!(reader_proxy.engine.read_state().tasks_started > 0);
+    // A cut cache write still ends whole: no temporary file, and the LRU counts every file.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (bytes, temps) = cache_files(&reader_proxy._dir.path().join("cache"));
+    assert_eq!(temps, 0);
+    assert_eq!(reader_proxy.engine.cache_state().bytes, bytes);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

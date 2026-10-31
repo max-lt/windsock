@@ -190,7 +190,16 @@ impl ChunkCache {
 
     /// Writes a chunk, and logs once when writes start to fail and once when they work again.
     /// A read never waits on the cache: a failed write only means a later read goes to the remote.
-    pub async fn keep(&self, id: ChunkId, raw: &[u8]) {
+    /// The write runs in its own task: a caller that is dropped at an await point, as a cut read
+    /// is, would leave a temporary file, a file that the LRU does not count, or evicted files.
+    pub async fn keep(self: &Arc<Self>, id: ChunkId, raw: &[u8]) {
+        let cache = Arc::clone(self);
+        let raw = raw.to_vec();
+        // A dropped JoinHandle does not stop its task.
+        let _ = tokio::spawn(async move { cache.keep_now(id, &raw).await }).await;
+    }
+
+    async fn keep_now(&self, id: ChunkId, raw: &[u8]) {
         use std::sync::atomic::Ordering;
 
         match self.insert(id, raw).await {
@@ -356,6 +365,54 @@ mod tests {
         assert!(lru.touch(ids[0]) && lru.touch(ids[2]) && !lru.touch(ids[1]));
     }
 
+    /// Files under the cache dir: the chunk bytes on disk, and the temporary files.
+    fn on_disk(dir: &Path) -> (u64, usize) {
+        let (mut bytes, mut temps) = (0, 0);
+        for sub in std::fs::read_dir(dir).unwrap() {
+            for file in std::fs::read_dir(sub.unwrap().path()).unwrap() {
+                let file = file.unwrap();
+                match file.file_name().to_string_lossy().starts_with(".tmp.") {
+                    true => temps += 1,
+                    false => bytes += file.metadata().unwrap().len(),
+                }
+            }
+        }
+        (bytes, temps)
+    }
+
+    /// A read that its client cuts drops its cache write at any await point: the write still
+    /// ends whole, so no temporary file stays and the LRU counts every file on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cut_writes_leave_the_cache_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            ChunkCache::open(dir.path(), 64 * 1024, keys())
+                .await
+                .unwrap(),
+        );
+
+        for n in 0..120u8 {
+            let (id, data) = chunk(n, 16 * 1024);
+            let mut write = std::pin::pin!(cache.keep(id, &data));
+            for _ in 0..n % 9 {
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(write.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (bytes, temps) = on_disk(dir.path());
+        assert_eq!(temps, 0);
+        assert_eq!(cache.bytes(), bytes);
+        assert!(bytes <= 64 * 1024, "{bytes}");
+    }
+
     /// Log output, kept in memory.
     #[derive(Clone, Default)]
     struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -376,7 +433,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let cache = Arc::new(ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap());
         let capture = Capture::default();
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()

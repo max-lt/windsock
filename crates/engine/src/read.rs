@@ -580,7 +580,7 @@ pub(crate) async fn cached(cache: &ChunkCache, id: ChunkId) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) async fn keep(cache: &ChunkCache, id: ChunkId, raw: &[u8]) {
+pub(crate) async fn keep(cache: &Arc<ChunkCache>, id: ChunkId, raw: &[u8]) {
     cache.keep(id, raw).await;
 }
 

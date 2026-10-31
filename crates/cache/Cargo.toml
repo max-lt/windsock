@@ -9,7 +9,7 @@ model.workspace = true
 seal.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]

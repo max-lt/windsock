@@ -224,6 +224,24 @@ impl Uploads {
         self.limit
     }
 
+    /// Refuses a part that the parts limit cannot hold even with no other upload: a 503 would
+    /// make the client retry for ever.
+    fn fits_alone(&self, own: u64, part: u64) -> Result<(), S3Error> {
+        let total = own.saturating_add(part);
+        if total <= self.limit {
+            return Ok(());
+        }
+        Err(S3Error::new(
+            "EntityTooLarge",
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the parts of this upload need {total} bytes, over the parts limit of {} bytes \
+                 (parts_limit_bytes)",
+                self.limit
+            ),
+        ))
+    }
+
     fn reserve(&self, bytes: u64) -> Result<(), S3Error> {
         let limit = self.limit;
         self.held
@@ -324,6 +342,9 @@ impl Uploads {
             .ok_or_else(|| S3Error::invalid_argument("partNumber must be between 1 and 10000"))?;
         self.meta(upload_id, bucket, key).await?;
         let dir = self.upload_dir(upload_id)?;
+        // A part that it replaces stays on disk until this one gets its name: it counts too.
+        let own = part_files(&dir).await?.values().map(|(size, _)| size).sum();
+        self.fits_alone(own, declared)?;
         self.reserve(declared)?;
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("{TEMP_PREFIX}{}.{seq}", std::process::id()));
@@ -348,6 +369,7 @@ impl Uploads {
             hasher: blake3::Hasher::new(),
             len: 0,
             reserved: declared,
+            own,
             named: false,
         })
     }
@@ -735,6 +757,8 @@ pub(crate) struct PartWriter<'a> {
     len: u64,
     /// Room of the parts limit taken at the start, for the declared body.
     reserved: u64,
+    /// Bytes of the other parts of this upload.
+    own: u64,
     named: bool,
 }
 
@@ -748,6 +772,7 @@ impl PartWriter<'_> {
     pub(crate) async fn write(&mut self, piece: &[u8]) -> Result<(), S3Error> {
         let size = self.len + piece.len() as u64;
         let extra = size.saturating_sub(self.counted());
+        self.uploads.fits_alone(self.own, size)?;
         self.uploads.reserve(extra)?;
         if let Err(e) = self.file.write_all(piece).await {
             self.uploads.release(extra);
@@ -842,6 +867,34 @@ mod tests {
         });
         uploads.unclaim(id, &claimed).await.unwrap();
         joined
+    }
+
+    /// A part that cannot fit even with no other upload gets 400: a 503 would make the client
+    /// retry for ever. A part that fits alone gets 503 while other uploads hold the room.
+    #[tokio::test]
+    async fn test_part_that_can_never_fit_gets_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::new(dir.path(), 10);
+        let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
+        uploads.put_part(&id, "b", "k", "1", b"1234").await.unwrap();
+        let status = |result: Result<PartWriter<'_>, S3Error>| match result {
+            Ok(_) => StatusCode::OK,
+            Err(e) => e.status,
+        };
+
+        let over_limit = status(uploads.begin_part(&id, ("b", "k"), "3", 11).await);
+        let over_upload = status(uploads.begin_part(&id, ("b", "k"), "2", 7).await);
+        let replaces = status(uploads.begin_part(&id, ("b", "k"), "1", 6).await);
+        let other = uploads.initiate("b", "o", BTreeMap::new()).await.unwrap();
+        let busy = status(uploads.begin_part(&other, ("b", "o"), "1", 7).await);
+        let mut growing = uploads.begin_part(&id, ("b", "k"), "2", 0).await.unwrap();
+        let grown = growing.write(b"1234567").await.err().map(|e| e.status);
+
+        assert_eq!(over_limit, StatusCode::BAD_REQUEST);
+        assert_eq!(over_upload, StatusCode::BAD_REQUEST);
+        assert_eq!(replaces, StatusCode::OK);
+        assert_eq!(busy, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(grown, Some(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]

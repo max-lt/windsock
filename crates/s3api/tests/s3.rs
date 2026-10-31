@@ -1479,8 +1479,9 @@ async fn test_parts_have_their_own_limit_and_plain_puts_keep_room() {
     let server = small_parts().await;
     let id = initiate(&server).await;
 
+    let other = initiate(&server).await;
     let first = upload_part(&server, &id, 1, &"x".repeat(600)).await;
-    let second = upload_part(&server, &id, 2, &"x".repeat(600)).await;
+    let second = upload_part(&server, &other, 1, &"x".repeat(600)).await;
     let plain = put(&server, "other", &"x".repeat(600)).await;
 
     assert_eq!(first.status, StatusCode::OK);

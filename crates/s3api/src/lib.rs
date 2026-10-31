@@ -32,9 +32,9 @@ pub use multipart::Uploads;
 /// S3 single PUT limit.
 const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 
-/// The parts of all multipart uploads together: half of the default buffer limit, so plain
-/// writes keep room when clients leave uploads open.
-pub const DEFAULT_PARTS_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// The parts of all multipart uploads together: the largest object, so one upload of any legal
+/// size can complete. The parts are outside the buffer limit, so plain writes keep their room.
+pub const DEFAULT_PARTS_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
 
 pub struct S3Config {
     /// The secret keys, asked on every request.

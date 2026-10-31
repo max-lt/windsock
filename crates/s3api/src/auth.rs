@@ -212,10 +212,34 @@ fn streamed(parts: &Parts, signer: Option<&ChunkSigner>) -> Result<Option<Stream
             streamed(None, Some(ChunkDecoder::new(Some(signer))))
         }
         sigv4::STREAMING_UNSIGNED_TRAILER => streamed(None, Some(ChunkDecoder::new(None))),
-        // An unknown STREAMING- value fails in the buffered check of the hash.
-        hash if hash.starts_with("STREAMING-") => None,
         hash => streamed(Some(hash.to_ascii_lowercase()), None),
     })
+}
+
+/// Refuses, before any read, a body that no check can take: an unknown payload hash, or a
+/// Content-Length next to a Transfer-Encoding, which two parsers can read in two ways.
+fn check_framing(parts: &Parts) -> Result<(), S3Error> {
+    let hash = header(&parts.headers, "x-amz-content-sha256").unwrap_or(sigv4::UNSIGNED_PAYLOAD);
+    let known = matches!(
+        hash,
+        sigv4::UNSIGNED_PAYLOAD
+            | sigv4::STREAMING_SIGNED
+            | sigv4::STREAMING_SIGNED_TRAILER
+            | sigv4::STREAMING_UNSIGNED_TRAILER
+    ) || (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !known {
+        return Err(S3Error::invalid_argument(
+            "x-amz-content-sha256 must be a SHA-256 hex digest, UNSIGNED-PAYLOAD or a known \
+             STREAMING- value",
+        ));
+    }
+    let framed = ["content-length", "transfer-encoding"];
+    if framed.iter().all(|name| parts.headers.contains_key(*name)) {
+        return Err(S3Error::invalid_argument(
+            "a request with Transfer-Encoding must have no Content-Length",
+        ));
+    }
+    Ok(())
 }
 
 /// The S3 error of an aws-chunked body that fails to decode.
@@ -280,6 +304,7 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
         }
     };
     parts.extensions.insert(Caller(access_key));
+    check_framing(&parts)?;
     if let Some(stream) = streamed(&parts, signer.as_ref())? {
         if stream
             .length

@@ -2341,6 +2341,56 @@ async fn test_request_with_no_streamed_body_is_refused_before_its_body_is_read()
     }
 }
 
+#[tokio::test]
+async fn test_unknown_payload_hash_is_refused_before_its_body_is_read() {
+    let server = with_bucket().await;
+    let body = 4u64 * 1024 * 1024;
+    for value in ["STREAMING-SOMETHING-NEW", "not-a-hash"] {
+        for (method, uri) in [("PUT", "/bkt/k"), ("POST", "/bkt?delete")] {
+            let mut call = call(method, uri).header("content-length", body.to_string());
+            call.payload_hash = Some(value.to_string());
+            let (parts, _) = call.request().into_parts();
+            let (counted, taken) = counted_body(body);
+
+            let reply = send(&server, Request::from_parts(parts, counted)).await;
+
+            let taken = taken.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{value} {method}");
+            assert_eq!(taken, 0, "{value} {method}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_content_length_with_a_chunked_body_is_refused() {
+    let server = with_bucket().await;
+    let call = call("PUT", "/bkt/k")
+        .header("content-length", "10")
+        .header("transfer-encoding", "chunked");
+
+    let (reply, taken) = send_counted(&server, call, 4 * 1024 * 1024).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert_eq!(taken, 0);
+}
+
+#[tokio::test]
+async fn test_chunked_put_in_another_case_streams() {
+    let server = with_bucket().await;
+    let data = vec![7u8; 3 * 1024 * 1024];
+
+    let reply = run(
+        &server,
+        call("PUT", "/bkt/k")
+            .header("transfer-encoding", "Chunked")
+            .body(data.clone()),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(run(&server, call("GET", "/bkt/k")).await.body, data);
+}
+
 /// The signature check uses the headers only: a client with no valid key makes no read.
 #[tokio::test]
 async fn test_request_with_a_wrong_signature_reads_no_body() {

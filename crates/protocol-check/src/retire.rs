@@ -26,7 +26,7 @@ type Put = (usize, usize);
 /// The head of the key and the puts that it did not know.
 type View = (Put, Vec<Put>);
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     Put,
     /// The entries of `node` below `upto` are retired.
@@ -36,7 +36,7 @@ pub enum Kind {
     },
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Entry {
     pub kind: Kind,
     pub hlc: u8,
@@ -46,7 +46,7 @@ pub struct Entry {
     pub listed: [Option<u8>; NODES],
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct State {
     pub chains: [Vec<Entry>; NODES],
     /// Entries of each chain that each reader applied, in chain order.
@@ -99,6 +99,43 @@ pub struct RetireModel {
 /// Name of the property that a missing rule breaks.
 pub const SAME_KNEW: &str = "knew with retired chains equals knew with the full seen";
 pub const CAUSAL: &str = "a reader applies an entry after all that its writer applied";
+
+/// The writers 1 and 2 swap places: no rule names a writer.
+fn swap_writers(s: &State) -> State {
+    let node = |n: usize| match n {
+        1 => 2,
+        2 => 1,
+        n => n,
+    };
+    let entry = |e: &Entry| Entry {
+        kind: match e.kind {
+            Kind::Retire { node: n, upto } => Kind::Retire {
+                node: node(usize::from(n)) as u8,
+                upto,
+            },
+            Kind::Put => Kind::Put,
+        },
+        hlc: e.hlc,
+        full: std::array::from_fn(|m| e.full[node(m)]),
+        listed: std::array::from_fn(|m| e.listed[node(m)]),
+    };
+    State {
+        chains: std::array::from_fn(|n| s.chains[node(n)].iter().map(entry).collect()),
+        applied: std::array::from_fn(|r| {
+            let row = s.applied[if r < NODES { node(r) } else { r }];
+            std::array::from_fn(|m| row[node(m)])
+        }),
+    }
+}
+
+/// One state for a state and its swap of the writers.
+pub fn representative(s: &State) -> State {
+    let swapped = swap_writers(s);
+    match swapped < *s {
+        true => swapped,
+        false => s.clone(),
+    }
+}
 
 impl State {
     fn entries(&self) -> usize {
@@ -362,15 +399,53 @@ mod tests {
         std::thread::available_parallelism().map_or(1, |n| n.get())
     }
 
-    /// Breadth first: the shortest break is a few steps deep.
+    /// Breadth first: the shortest break is a few steps deep. Depth first with the writer
+    /// symmetry: the reduction must keep the break.
     fn assert_breaks(rules: Rules, property: &'static str) {
+        let found = || HasDiscoveries::AnyOf(BTreeSet::from([property]));
         model(rules)
             .checker()
             .threads(threads())
-            .finish_when(HasDiscoveries::AnyOf(BTreeSet::from([property])))
+            .finish_when(found())
             .spawn_bfs()
             .join()
             .assert_any_discovery(property);
+        model(rules)
+            .checker()
+            .threads(threads())
+            .symmetry_fn(representative)
+            .finish_when(found())
+            .spawn_dfs()
+            .join()
+            .assert_any_discovery(property);
+    }
+
+    /// The swap of the writers is a symmetry: at 3 entries the reduced space has about half the
+    /// states of the full one, and the full one has every state of the reduced one.
+    #[test]
+    fn test_writer_symmetry_halves_the_states() {
+        let small = RetireModel {
+            max_entries: 3,
+            ..model(SAFE)
+        };
+        let full = small
+            .clone()
+            .checker()
+            .spawn_dfs()
+            .join()
+            .unique_state_count();
+        let reduced = small
+            .checker()
+            .symmetry_fn(representative)
+            .spawn_dfs()
+            .join()
+            .unique_state_count();
+
+        eprintln!("states at 3 entries: {full} full, {reduced} with the writer symmetry");
+        assert!(
+            reduced * 2 >= full && reduced * 10 <= full * 6,
+            "{full} {reduced}"
+        );
     }
 
     #[test]
@@ -379,6 +454,7 @@ mod tests {
         model(SAFE)
             .checker()
             .threads(threads())
+            .symmetry_fn(representative)
             .finish_when(HasDiscoveries::AnyFailures)
             .spawn_dfs()
             .join()

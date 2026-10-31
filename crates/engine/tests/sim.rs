@@ -1539,25 +1539,55 @@ fn test_simulation_of_three_proxies_20000_seeds() {
     run_seeds(1000..21_000).assert_every_branch_ran();
 }
 
-/// Seeds that found a fault, run in every test run.
-/// - 522: an intent entry reached the remote with a lost answer, the clock stepped back, and after
-///   a reopen the next own entry had a lower HLC.
-/// - 50: a proxy lost its index; the snapshot did not hold its newest own entry, and the next ack
-///   went under an earlier one.
-/// - 10: the commit found a write late by the clock, the open did not, and the proxy refused the
-///   commit at every start.
-/// - 32, 35, 40: an empty segment stopped the quarantine move; a late intent stayed in the buffer.
-/// - 61: a remote error at open, with the supervisor starting the proxy again.
-/// - 598: a first entry reached the remote with a lost answer and no node marker; the GC did not
-///   see the chain and deleted its pack.
-const REGRESSION_SEEDS: &[u64] = &[
-    615, 919, 522, 50, 10, 32, 35, 40, 61, 598, 382, 454, 506, 638, 869, 926, 999,
+/// The scenario that a pinned seed must still reach, as a count of its totals.
+type Reached = fn(&Totals) -> u64;
+
+/// Seeds that found a fault, run in every test run, each with the scenario that it reached then.
+/// A change of the random draws can move a seed off its scenario: the test then fails, and the
+/// scenario needs a new seed.
+const REGRESSION_SEEDS: &[(u64, &str, Reached)] = &[
+    // A proxy lost its index; the snapshot did not hold its newest own entry, and the next ack
+    // went under an earlier one.
+    (50, "lost_index", |t| t.lost_index),
+    // The commit found a write late by the clock, the open did not, and the proxy refused the
+    // commit at every start.
+    (10, "held_restart", |t| t.held_restart),
+    // An empty segment stopped the quarantine move; a late intent stayed in the buffer.
+    (32, "intent_quarantined", |t| t.intent_quarantined),
+    (40, "quarantine", |t| t.quarantine),
+    // A remote error at open, with the supervisor starting the proxy again.
+    (61, "refused_starts", |t| t.refused_starts),
+    // A first entry reached the remote with a lost answer and no node marker; the GC did not see
+    // the chain and deleted its pack.
+    (598, "marker_fault", |t| t.marker_fault),
+    // A clock more than R ahead caps the acks.
+    (615, "far_ahead", |t| t.far_ahead),
+    (919, "far_ahead", |t| t.far_ahead),
+    // The version list oracle.
+    (382, "corrupt_quarantined", |t| t.corrupt_quarantined),
+    (454, "held_restart", |t| t.held_restart),
+    (506, "step_back", |t| t.step_back),
+    (638, "power_loss_cut", |t| t.power_loss_cut),
+    (869, "keyless", |t| t.keyless),
+    (926, "tombstone_prune", |t| t.tombstone_prune),
+    (999, "keyless", |t| t.keyless),
+    // A late write in the quarantine after a step back of the shared wall clock.
+    (482, "step_back and quarantine", |t| {
+        t.step_back.min(t.quarantine)
+    }),
+    (687, "step_back and quarantine", |t| {
+        t.step_back.min(t.quarantine)
+    }),
 ];
 
 #[test]
 fn test_simulation_regression_seeds() {
-    for &seed in REGRESSION_SEEDS {
-        run_seeds(seed..seed + 1);
+    for &(seed, scenario, reached) in REGRESSION_SEEDS {
+        let totals = run_seeds(seed..seed + 1);
+        assert!(
+            reached(&totals) > 0,
+            "seed {seed} no longer reaches {scenario}"
+        );
     }
 }
 

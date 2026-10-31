@@ -8,6 +8,7 @@
 mod buckets;
 mod buffer;
 mod config;
+mod copy;
 mod flush;
 mod gc;
 mod list;

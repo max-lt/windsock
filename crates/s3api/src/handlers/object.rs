@@ -61,7 +61,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         .expect("a hex ETag is a valid header value"))
 }
 
-/// CopyObject reads the source and writes it again: the engine has no reference copy.
+/// CopyObject: the engine reads the source and writes it again.
 async fn copy_object<R: Remote + 'static>(
     state: &AppState<R>,
     source: &str,
@@ -116,42 +116,21 @@ async fn copy_object<R: Remote + 'static>(
             format!("{} copies run at once: try again", crate::MAX_COPIES),
         )
     })?;
-    // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
-    let mut room = Some(state.engine.read_room(Some(FIRST_PIECE_WAIT)).await?);
-    // The reader fixes the source version now: a later delete or overwrite of the source does
-    // not change what the copy reads.
-    let mut reader = state
-        .engine
-        .get_reader(source_bucket, source_key, None)
-        .await?;
     let metadata = match replace {
-        true => metadata(headers)?,
-        false => reader.info.metadata.clone(),
+        true => Some(metadata(headers)?),
+        false => None,
     };
-    let mut spool = state
+    // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
+    let info = state
         .engine
-        .begin_put_sized(bucket, key, metadata, mode, reader.info.size)
+        .copy(
+            (source_bucket, source_key),
+            (bucket, key),
+            metadata,
+            mode,
+            FIRST_PIECE_WAIT,
+        )
         .await?;
-    loop {
-        let held = match room.take() {
-            Some(room) => room,
-            None => state.engine.piece_room(&mut reader).await?,
-        };
-        let Some(piece) = state.engine.next_piece(&mut reader).await? else {
-            break;
-        };
-        for part in piece.chunks(PUT_PIECE) {
-            state.engine.spool_write(&mut spool, part).await?;
-        }
-        engine::sim::crash_point(Point::CopyPiece)?;
-        drop(held);
-    }
-    if spool.content_hash() != reader.info.content_hash {
-        return Err(S3Error::internal(
-            "the copied data does not match the hash of its source",
-        ));
-    }
-    let info = state.engine.finish_put(spool).await?;
 
     xml_reply(xml::copy_result(&etag(&info), info.last_modified))
 }

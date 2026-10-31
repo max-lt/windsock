@@ -103,6 +103,8 @@ fn configure(text: &str, n: usize, port: u16, remote: &Path, repo_key: &Path) ->
         ("retention_secs", "40".to_string()),
         ("late_margin_secs", "10".to_string()),
         ("snapshot_interval_secs", "15".to_string()),
+        // The GC of proxy 0 retires quiet chains, as the final runs of the retire rules need.
+        ("retire_chains", "true".to_string()),
     ];
     let mut out = String::new();
     let mut in_remote = false;

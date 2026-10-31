@@ -208,7 +208,8 @@ impl Uploads {
         })
     }
 
-    /// Sets the held bytes to the parts on disk, and returns them.
+    /// Sets the held bytes to the parts on disk, and returns them. Only at start: it does not
+    /// know the room of the parts in flight.
     async fn rescan(&self) -> Result<u64, S3Error> {
         let bytes = self.all_bytes().await?;
         self.held.store(bytes, Ordering::SeqCst);
@@ -470,7 +471,7 @@ impl Uploads {
             }
         }
         self.seen().retain(|id, _| ids.contains(id));
-        self.rescan().await?;
+        // Each removal gave its bytes back; a rescan would drop the room of the parts in flight.
         Ok((count, bytes))
     }
 
@@ -895,6 +896,27 @@ mod tests {
         assert_eq!(replaces, StatusCode::OK);
         assert_eq!(busy, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(grown, Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn test_expire_keeps_the_room_of_a_part_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::new(dir.path(), 10);
+        let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
+        let mut in_flight = uploads.begin_part(&id, ("b", "k"), "1", 8).await.unwrap();
+        in_flight.write(b"1234").await.unwrap();
+
+        uploads.expire(Duration::from_secs(3600)).await.unwrap();
+
+        assert_eq!(uploads.held(), 8);
+        let other = uploads.initiate("b", "o", BTreeMap::new()).await.unwrap();
+        let second = uploads.begin_part(&other, ("b", "o"), "1", 5).await;
+        assert_eq!(
+            second.err().map(|e| e.status),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        drop(in_flight);
+        assert_eq!(uploads.held(), 0);
     }
 
     #[tokio::test]

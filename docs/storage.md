@@ -448,7 +448,8 @@ The load:
   load. For each entry, it reads the header and the tail only (one GET, or 3 requests for an
   entry over 64 KiB), checks the node, the seq and the MAC, and writes the header and the tail with
   no actions. An entry that does not read back is skipped: its chain is broken and named, as at a
-  sync, and the prune goes on.
+  sync, and the prune goes on. It saves its progress every 1000 entries of a chain, so an error
+  does not make the next run read the chain from its start.
 
 The GC:
 

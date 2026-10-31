@@ -112,6 +112,9 @@ pub const MAX_SNAPSHOT: u64 = 16 * 1024 * 1024 * 1024;
 /// and each one costs a read: the load fails closed after this many.
 const MAX_CANDIDATES: usize = 3;
 
+/// The journal prune saves its progress in a chain after this many entries.
+const PRUNE_PROGRESS: u64 = 1000;
+
 /// The largest head that a load reads: 4096 parts and the frontiers of many nodes fit.
 const MAX_HEAD: u64 = 16 * 1024 * 1024;
 
@@ -479,6 +482,10 @@ impl<R: Remote + 'static> Engine<R> {
             let from = self.index().redacted_below(*node)?;
 
             for seq in from..frontier.next_seq {
+                // An error later in a long chain must not lose the work below seq.
+                if seq > from && (seq - from) % PRUNE_PROGRESS == 0 {
+                    self.index().set_redacted_below(*node, seq)?;
+                }
                 let key = entry_key(*node, seq);
                 // The header and the tail only, after the MAC: no actions are read.
                 let found = journal::redaction(&*self.remote, (*node, seq), self.keys.sealer());

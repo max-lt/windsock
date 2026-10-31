@@ -22,6 +22,8 @@ struct TestRemote {
     log_gets: AtomicUsize,
     /// Bytes of the entry reads.
     log_bytes: std::sync::atomic::AtomicU64,
+    /// A put of this key fails once, as a remote outage in the middle of a prune does.
+    fail_put: std::sync::Mutex<Option<String>>,
     ambiguous_create: AtomicBool,
     /// Ranged reads of snapshots.
     snapshot_ranges: AtomicUsize,
@@ -54,6 +56,17 @@ enum Tamper {
 #[async_trait::async_trait]
 impl Remote for TestRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        let failed = {
+            let mut fail = self.fail_put.lock().unwrap();
+            let hit = fail.as_deref() == Some(key);
+            if hit {
+                *fail = None;
+            }
+            hit
+        };
+        if failed {
+            return Err(RemoteError::Io(std::io::Error::other("the remote is down")));
+        }
         if key.ends_with("/head") && self.drop_part_at_head.swap(false, Ordering::SeqCst) {
             let base = key.trim_end_matches("head");
             let parts = self.inner.list(base).await?;
@@ -1528,4 +1541,28 @@ async fn test_prune_skips_an_entry_that_does_not_read_back() {
             .actions
             .is_none()
     );
+}
+
+/// A prune saves its progress as it goes: after an error at entry 1050 of a chain, the next run
+/// starts at the last saved point, not at entry 0.
+#[tokio::test]
+async fn test_prune_after_an_error_starts_at_its_saved_progress() {
+    let remote = Arc::new(TestRemote::default());
+    let a = snapshot_proxy(&remote).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    for i in 0..1100 {
+        put(&a.engine, &format!("k{i}"), "v").await;
+        a.engine.flush().await.unwrap();
+    }
+    let node = a.engine.node();
+    *remote.fail_put.lock().unwrap() = Some(journal::entry_key(node, 1050));
+    assert!(a.engine.gc().await.is_err());
+    remote.log_gets.store(0, Ordering::SeqCst);
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(report.redacted_entries >= 50, "{report:?}");
+    let reads = remote.log_gets.load(Ordering::SeqCst);
+    assert!(reads < 500, "{reads} entry reads after the error");
+    assert!(entries(&remote).await.iter().all(|e| e.actions.is_none()));
 }

@@ -262,6 +262,8 @@ struct Proxy {
     stale_index: Option<TempDir>,
     /// How far the wall clock of this proxy is ahead of the shared time.
     offset: u64,
+    /// The highest wall clock of this proxy in the run: its HLC is at most R above it.
+    highest_wall: u64,
     /// Time that passed while this host was suspended: its monotonic clock did not count it.
     suspended: u64,
 }
@@ -331,8 +333,9 @@ impl Sim {
     /// Keeps the highest wall clock of the proxies, and the latest far HLC.
     fn note_clocks(&mut self) {
         let r = config().retention.as_nanos() as u64;
-        for proxy in &self.proxies {
+        for proxy in &mut self.proxies {
             let clock = self.now + proxy.offset;
+            proxy.highest_wall = proxy.highest_wall.max(clock);
             self.highest_clock = self.highest_clock.max(clock);
             if proxy.offset > r {
                 self.far_until = self.far_until.max(clock);
@@ -471,13 +474,15 @@ impl Sim {
         }
         self.stats.corrupt_quarantined += corrupt.len() as u64;
         self.stats.quarantine |= !writes.is_empty();
-        // A write is late when its HLC is under the clock less (R - M), and the clock of the
-        // open is at most R ahead of its wall clock.
-        let wall = self.now + self.proxies[i].offset;
+        // A write is late when its HLC is under the clock less (R - M). The clock is at most R above
+        // the highest wall clock of the proxy: after a step back, the wall clock is lower.
+        let wall = (self.now + self.proxies[i].offset).max(self.proxies[i].highest_wall);
         let bound = wall + config().late_margin.as_nanos() as u64;
         if let Some(young) = writes.iter().find(|w| w.hlc >= bound) {
+            let tail: Vec<_> = self.log.iter().rev().take(40).rev().cloned().collect();
             return Err(format!(
-                "p{i}: a young write is in the quarantine: {young:?}"
+                "p{i}: a young write is in the quarantine: {young:?}, bound {bound}\n{}",
+                tail.join("\n")
             ));
         }
         let intent = std::fs::read_dir(dir.join("quarantine")).unwrap().any(|e| {
@@ -1335,6 +1340,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
             outage: Arc::new(AtomicBool::new(false)),
             stale_index: None,
             offset: 0,
+            highest_wall: 0,
             suspended: 0,
         });
     }

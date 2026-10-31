@@ -390,6 +390,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 Measured with 200,000 small objects in one bucket:
 
 - The index takes about 510 bytes of memory (RSS) per key.
+- A sync holds a journal entry about 3 times in memory at its peak: the sealed bytes, the plain
+  actions and the decoded actions. That is about 1.5 GiB for an entry at the writer bound of 512 MiB
+  (`max_entry_actions`).
 - A snapshot takes about 231 bytes per key. The GC writes it in parts of at most 1 GiB. A new
   proxy loads at most 16 GiB: about 74,000,000 keys. A load needs memory of 2 times the snapshot at its peak. Above that, a new proxy replays the journal,
   or fails with an error that names the snapshot and the cap. `docs/storage.md` gives the format.

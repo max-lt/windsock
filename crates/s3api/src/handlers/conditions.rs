@@ -130,7 +130,8 @@ pub(super) fn byte_range(headers: &HeaderMap, size: u64) -> Result<Option<Range<
         (None, Some(0)) => return Err(unsatisfiable()),
         (None, Some(suffix)) => size.saturating_sub(suffix)..size,
         (Some(first), None) if end.trim().is_empty() => first..size,
-        (Some(first), Some(last)) if first <= last => first..size.min(last + 1),
+        // The last byte is at most size - 1: no sum, so no overflow at u64::MAX.
+        (Some(first), Some(last)) if first <= last => first..size.min(last.saturating_add(1)),
         _ => return Ok(None),
     };
 
@@ -180,6 +181,20 @@ mod tests {
         assert_eq!(range("bytes=9-1").unwrap(), None);
         assert_eq!(range("items=0-1").unwrap(), None);
         assert_eq!(byte_range(&HeaderMap::new(), 100).unwrap(), None);
+    }
+
+    /// The largest numbers clamp to the object, never wrap: a debug build would panic, and a
+    /// release build would give an empty range.
+    #[test]
+    fn test_ranges_at_the_largest_number() {
+        let range = |spec: &str| byte_range(&headers(&[("range", spec)]), 100);
+        let max = u64::MAX;
+
+        assert_eq!(range(&format!("bytes=0-{max}")).unwrap(), Some(0..100));
+        assert_eq!(range(&format!("bytes=90-{max}")).unwrap(), Some(90..100));
+        assert_eq!(range(&format!("bytes=-{max}")).unwrap(), Some(0..100));
+        assert!(range(&format!("bytes={max}-")).is_err());
+        assert!(range(&format!("bytes={max}-{max}")).is_err());
     }
 
     #[test]

@@ -102,11 +102,12 @@ refusal, its cause and the action.
 
 ## Time rules
 
-| Name | Setting               | Default | What it does                                                            |
-| ---- | --------------------- | ------- | ----------------------------------------------------------------------- |
-| H    | `gc.horizon_secs`     | 24 h    | The GC deletes a dead object H after its condemn                        |
-| R    | `gc.retention_secs`   | 24 h    | Old versions stay readable for R; the bound for an HLC ahead of a clock |
-| M    | `gc.late_margin_secs` | 1 h     | The clock skew that the late write rule allows                          |
+| Name | Setting               | Default | What it does                                                                                                                                      |
+| ---- | --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H    | `gc.horizon_secs`     | 24 h    | The GC deletes a dead object H after its condemn                                                                                                  |
+| R    | `gc.retention_secs`   | 24 h    | Old versions stay readable for R; the bound for an HLC ahead of a clock                                                                           |
+| M    | `gc.late_margin_secs` | 1 h     | The clock skew that the late write rule allows                                                                                                    |
+| Q    | max(R, H) + M         | 25 h    | With `gc.retire_chains`, a chain with no entry for Q can be retired. The quiet check relies on the clock skew bound M, as the other time rules do |
 
 H, R and M are rules of the remote: the first proxy fixes them, and every other proxy must use the
 same values. When the remote is down for longer than R - M (23 h by default), the acked writes

@@ -20,6 +20,8 @@ const BUCKET: &str = "bkt";
 struct TestRemote {
     inner: MemoryRemote,
     log_gets: AtomicUsize,
+    /// Bytes of the entry reads.
+    log_bytes: std::sync::atomic::AtomicU64,
     ambiguous_create: AtomicBool,
     /// Ranged reads of snapshots.
     snapshot_ranges: AtomicUsize,
@@ -82,6 +84,12 @@ impl Remote for TestRemote {
         }
         if key.starts_with(journal::LOG_PREFIX) {
             self.log_gets.fetch_add(1, Ordering::SeqCst);
+            let got = self.inner.get(key, max_len).await;
+            if let Ok(Some(bytes)) = &got {
+                self.log_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+            return got;
         }
         self.inner.get(key, max_len).await
     }
@@ -111,6 +119,14 @@ impl Remote for TestRemote {
             {
                 return self.tampered(key, range, tamper).await;
             }
+        }
+        if key.starts_with(journal::LOG_PREFIX) {
+            let got = self.inner.get_range(key, range).await;
+            if let Ok(Some(bytes)) = &got {
+                self.log_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+            return got;
         }
         self.inner.get_range(key, range).await
     }
@@ -1430,4 +1446,86 @@ async fn test_snapshot_in_one_object_over_one_part_is_not_read() {
         let cause = format!("{key}: it is larger than 100 bytes");
         assert!(error.contains(&cause), "{error}");
     }
+}
+
+/// A proxy with a snapshot at each GC run.
+async fn snapshot_proxy(remote: &Arc<TestRemote>) -> Proxy {
+    let config = Config {
+        snapshot_interval: Duration::ZERO,
+        ..Config::default()
+    };
+    open_and_sync_with(remote, 1, config).await.unwrap()
+}
+
+/// The prune reads the header and the tail of an entry, not its actions: an entry of about
+/// 1 MiB costs the GC run one read of it, for the audit, and not a second one.
+#[tokio::test]
+async fn test_prune_reads_no_actions_of_a_large_entry() {
+    let remote = Arc::new(TestRemote::default());
+    let a = snapshot_proxy(&remote).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    for i in 0..1000 {
+        put(&a.engine, &format!("{i:04}{}", "k".repeat(990)), "v").await;
+    }
+    a.engine.flush().await.unwrap();
+    let mut size = 0;
+    for key in remote.inner.list(journal::LOG_PREFIX).await.unwrap() {
+        let bytes = remote.inner.get(&key, u64::MAX).await.unwrap().unwrap();
+        size = size.max(bytes.len() as u64);
+    }
+    assert!(size > 1024 * 1024, "{size}");
+    remote.log_bytes.store(0, Ordering::SeqCst);
+
+    let report = a.engine.gc().await.unwrap();
+
+    assert!(report.redacted_entries >= 1);
+    assert!(entries(&remote).await.iter().all(|e| e.actions.is_none()));
+    let read = remote.log_bytes.load(Ordering::SeqCst);
+    assert!(
+        read < size + size / 2,
+        "{read} bytes read for an entry of {size}"
+    );
+}
+
+/// An entry under the snapshot frontier that does not read back does not stop the prune: the
+/// chain is broken and named, the prune goes on, and the bad object stays as it is.
+#[tokio::test]
+async fn test_prune_skips_an_entry_that_does_not_read_back() {
+    let remote = Arc::new(TestRemote::default());
+    let a = snapshot_proxy(&remote).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    a.engine.gc().await.unwrap();
+    for key in ["x", "y"] {
+        put(&a.engine, key, "v").await;
+        a.engine.flush().await.unwrap();
+    }
+    let mut keys = remote.inner.list(journal::LOG_PREFIX).await.unwrap();
+    keys.sort();
+    let bad = keys[keys.len() - 2].clone();
+    remote
+        .inner
+        .put(&bad, Bytes::from_static(b"junk"))
+        .await
+        .unwrap();
+
+    let report = a.engine.gc().await;
+
+    let report = report.unwrap();
+    assert!(report.redacted_entries >= 1, "{report:?}");
+    let stored = remote.inner.get(&bad, u64::MAX).await.unwrap().unwrap();
+    assert_eq!(&stored[..], b"junk");
+    let last = remote
+        .inner
+        .get(keys.last().unwrap(), u64::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+    let keys_of = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    assert!(
+        Entry::from_wire(&last, keys_of.sealer())
+            .unwrap()
+            .actions
+            .is_none()
+    );
 }

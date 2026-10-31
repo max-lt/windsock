@@ -148,8 +148,118 @@ async fn attempt<R: Remote>(
     Ok(done(Entry::from_parts(head, sealed, &tail, sealer)))
 }
 
+/// What a prune finds at an entry key.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Redaction {
+    /// No object at the key.
+    Missing,
+    /// The entry has no actions already.
+    Done,
+    /// The wire bytes of the entry without its actions.
+    Bytes(Vec<u8>),
+}
+
+/// The redacted form of entry `seq` of `node`, read from its header and its tail only, after the
+/// node, the seq and the MAC pass. A refused object gives the chain error that a sync gives.
+pub async fn redaction<R: Remote + ?Sized>(
+    remote: &R,
+    (node, seq): (NodeId, u64),
+    sealer: &Sealer,
+) -> Result<Result<Redaction, ChainError>, RemoteError> {
+    let key = crate::entry_key(node, seq);
+    for _ in 0..ATTEMPTS {
+        if let Some(found) = redaction_attempt(remote, (&key, node, seq), sealer).await? {
+            return Ok(found.map_err(|refused| refused.at(node, seq)));
+        }
+    }
+    Ok(Err(ChainError::Malformed { seq }))
+}
+
+/// One read for [`redaction`], or `None` when the parts of the object do not fit together.
+async fn redaction_attempt<R: Remote + ?Sized>(
+    remote: &R,
+    (key, node, seq): (&str, NodeId, u64),
+    sealer: &Sealer,
+) -> Result<Option<Result<Redaction, Refused>>, RemoteError> {
+    let len = match remote.get(key, MAX_HEADER).await {
+        Ok(None) => return Ok(Some(Ok(Redaction::Missing))),
+        Ok(Some(bytes)) => return Ok(Some(small_redaction(&bytes, node, seq, sealer))),
+        Err(RemoteError::TooLarge { len, .. }) => len,
+        Err(e) => return Err(e),
+    };
+    if len > MAX_ENTRY {
+        return Ok(Some(Err(Refused::TooLarge { len })));
+    }
+    let Some(prefix) = part(remote, key, 0..MAX_HEADER).await? else {
+        return Ok(None);
+    };
+    let head = match EntryHead::parse(&prefix) {
+        Ok(head) => head,
+        Err(e) => return Ok(Some(Err(Refused::Wire(e)))),
+    };
+    if let Err(refused) = check_key(&head, node, seq) {
+        return Ok(Some(Err(refused)));
+    }
+    let end = match head.wire_len() {
+        Some(end) if end <= MAX_ENTRY => end,
+        end => {
+            return Ok(Some(Err(Refused::TooLarge {
+                len: end.unwrap_or(u64::MAX),
+            })));
+        }
+    };
+    let tail_start = end - TAIL_LEN;
+    let tail = match end <= MAX_HEADER {
+        true => prefix.slice(tail_start as usize..end as usize),
+        false => match part(remote, key, tail_start..end).await? {
+            Some(tail) => tail,
+            None => return Ok(None),
+        },
+    };
+    if let Err(e) = head.check_tail(&tail, sealer) {
+        return Ok(Some(Err(Refused::Wire(e))));
+    }
+    Ok(Some(Ok(match head.sealed_len() {
+        None => Redaction::Done,
+        Some(_) => Redaction::Bytes(head.redacted_wire(&tail)),
+    })))
+}
+
+/// An entry that fits in one read: the whole checks of a sync, then its redacted form.
+fn small_redaction(
+    bytes: &[u8],
+    node: NodeId,
+    seq: u64,
+    sealer: &Sealer,
+) -> Result<Redaction, Refused> {
+    let entry = Entry::from_wire(bytes, sealer).map_err(Refused::Wire)?;
+    if entry.node != node {
+        return Err(Refused::WrongNode { actual: entry.node });
+    }
+    if entry.seq != seq {
+        return Err(Refused::WrongSeq { actual: entry.seq });
+    }
+    match crate::redact_wire(bytes).map_err(Refused::Wire)? {
+        None => Ok(Redaction::Done),
+        Some(bytes) => Ok(Redaction::Bytes(bytes)),
+    }
+}
+
+/// A header that names another node or seq than its key.
+fn check_key(head: &EntryHead, node: NodeId, seq: u64) -> Result<(), Refused> {
+    if head.node() != node {
+        return Err(Refused::WrongNode {
+            actual: head.node(),
+        });
+    }
+    if head.seq() != seq {
+        return Err(Refused::WrongSeq { actual: head.seq() });
+    }
+    Ok(())
+}
+
 /// Reads `range` of `key`, or `None` when the object does not give exactly that range.
-async fn part<R: Remote>(
+async fn part<R: Remote + ?Sized>(
     remote: &R,
     key: &str,
     range: Range<u64>,
@@ -502,6 +612,35 @@ mod tests {
         );
         assert!(first <= MAX_HEADER + TAIL_LEN, "{first} bytes read");
         assert_eq!(second, 0, "a normal sync read the fake chain again");
+    }
+
+    /// A prune builds the redacted form from the header and the tail: the same bytes as the
+    /// redaction of the whole entry, read with no actions.
+    #[tokio::test]
+    async fn test_redaction_of_a_large_entry_reads_no_actions() {
+        let remote = Arc::new(Served::default());
+        let entry = first(200_000, 2, &test_sealer());
+        let wire = entry.to_wire();
+        let key = entry_key(node(), 0);
+        remote
+            .inner
+            .put(&key, Bytes::from(wire.clone()))
+            .await
+            .unwrap();
+
+        let found = redaction(&*remote, (node(), 0), &test_sealer())
+            .await
+            .unwrap();
+
+        let expected = crate::redact_wire(&wire).unwrap().unwrap();
+        assert_eq!(found, Ok(Redaction::Bytes(expected)));
+        let read: u64 = remote.reads_of(&key).iter().sum();
+        assert!(read <= MAX_HEADER + TAIL_LEN, "{read} bytes read");
+        let other = seal::RepoKey::from_hex(&"05".repeat(32)).unwrap().keys();
+        let refused = redaction(&*remote, (node(), 0), other.sealer())
+            .await
+            .unwrap();
+        assert_eq!(refused, Err(ChainError::BadMac { seq: 0 }));
     }
 
     #[tokio::test]

@@ -231,6 +231,15 @@ impl EntryHead {
             .checked_add(TAIL_LEN)
     }
 
+    /// The wire bytes of the entry with no actions, from this header and its tail: a prune reads
+    /// no actions. Postcard writes the same fields to the same bytes.
+    pub fn redacted_wire(&self, tail: &[u8]) -> Vec<u8> {
+        let mut bytes = postcard::to_allocvec(&self.fields).expect("an entry always serializes");
+        bytes.push(0);
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
     /// Checks the MAC in `tail`. A writer with no repository key stops here, before its actions.
     pub fn check_tail(&self, tail: &[u8], sealer: &Sealer) -> Result<(), WireError> {
         check_mac(&self.fields, &parse_tail(tail)?.mac, sealer)

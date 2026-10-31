@@ -30,6 +30,7 @@ pub use entry::{
     Action, Entry, EntryHash, EntryHead, LOG_PREFIX, Link, NODES_PREFIX, Seen, TAIL_LEN, WireError,
     entry_key, node_key, redact_wire, seq_of,
 };
+pub use fetch::{Redaction, redaction};
 
 pub use clock::{HybridClock, monotonic_nanos, wall_clock_nanos};
 #[cfg(any(test, feature = "sim"))]
@@ -554,6 +555,11 @@ impl<R: Remote> Journal<R> {
         self.audit = false;
         self.own_read = true;
         Ok(entries)
+    }
+
+    /// Marks a chain as broken for a cause that a reader outside a sync found, as a prune does.
+    pub fn report_broken(&mut self, node: NodeId, source: ChainError) {
+        self.mark_broken(node, source);
     }
 
     /// Marks a chain as broken, and logs it once per chain. A chain with no valid first entry

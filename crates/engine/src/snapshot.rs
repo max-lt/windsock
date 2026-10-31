@@ -475,13 +475,17 @@ impl<R: Remote + 'static> Engine<R> {
 
             for seq in from..frontier.next_seq {
                 let key = entry_key(*node, seq);
-                let Some(bytes) = self.remote.get(&key, journal::MAX_ENTRY).await? else {
-                    continue;
-                };
-                let without_actions = journal::redact_wire(&bytes)
-                    .map_err(|e| EngineError::Corrupt(format!("{key}: {e:?}")))?;
-                let Some(bytes) = without_actions else {
-                    continue;
+                // The header and the tail only, after the MAC: no actions are read.
+                let found = journal::redaction(&*self.remote, (*node, seq), self.keys.sealer());
+                let bytes = match found.await? {
+                    Ok(journal::Redaction::Bytes(bytes)) => bytes,
+                    Ok(journal::Redaction::Missing | journal::Redaction::Done) => continue,
+                    // As a sync does: the chain is broken and named, and the rest goes on.
+                    Err(source) => {
+                        warn!(key, %source, "the prune skipped an entry that does not read back");
+                        self.journal.lock().await.report_broken(*node, source);
+                        continue;
+                    }
                 };
 
                 self.remote.put(&key, Bytes::from(bytes)).await?;

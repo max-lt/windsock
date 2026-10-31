@@ -62,3 +62,10 @@ path = "fuzz_targets/chunk_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "entry_parts"
+path = "fuzz_targets/entry_parts.rs"
+test = false
+doc = false
+bench = false

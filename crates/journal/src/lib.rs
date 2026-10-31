@@ -13,6 +13,7 @@
 mod chain;
 mod clock;
 mod entry;
+mod fetch;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -26,8 +27,8 @@ use tracing::{debug, error, warn};
 
 pub use chain::{ChainError, Frontier};
 pub use entry::{
-    Action, Entry, EntryHash, LOG_PREFIX, Link, NODES_PREFIX, Seen, WireError, entry_key, node_key,
-    redact_wire, seq_of,
+    Action, Entry, EntryHash, EntryHead, LOG_PREFIX, Link, NODES_PREFIX, Seen, TAIL_LEN, WireError,
+    entry_key, node_key, redact_wire, seq_of,
 };
 
 pub use clock::{HybridClock, monotonic_nanos, wall_clock_nanos};
@@ -38,6 +39,9 @@ pub use clock::{set_manual_monotonic, set_manual_wall, suspend_manual};
 const MAX_ATTEMPTS: u32 = 8;
 /// The largest journal entry that a reader takes. A writer keeps its actions under half of it.
 pub const MAX_ENTRY: u64 = 1 << 30;
+/// The largest entry header: the bytes before the sealed actions. A reader decodes it from one
+/// ranged read of this size, and checks the MAC before it reads the actions.
+pub const MAX_HEADER: u64 = 64 * 1024;
 
 /// R by default: 24 h in nanoseconds.
 const DEFAULT_MAX_AHEAD: u64 = 24 * 3600 * 1_000_000_000;
@@ -82,6 +86,10 @@ pub enum JournalError {
     MarkerMissing(String),
     #[error("entry {seq} would have {len} bytes, over the {max} bytes that a reader takes")]
     EntryTooLarge { seq: u64, len: u64, max: u64 },
+    #[error(
+        "entry {seq} would have a header of {len} bytes, over the {max} bytes that a reader takes"
+    )]
+    HeaderTooLarge { seq: u64, len: u64, max: u64 },
 }
 
 /// Reads all chains of a remote and appends to the chain of one node.
@@ -228,6 +236,14 @@ impl<R: Remote> Journal<R> {
                 max: self.max_entry,
             });
         }
+        let len = entry.header_len();
+        if len > MAX_HEADER {
+            return Err(JournalError::HeaderTooLarge {
+                seq: entry.seq,
+                len,
+                max: MAX_HEADER,
+            });
+        }
         Ok(entry)
     }
 
@@ -274,10 +290,8 @@ impl<R: Remote> Journal<R> {
         let read = self.sync_node(self.node).await?;
         self.stashed.extend(read);
 
-        let stored = self.remote.get(&entry.remote_key(), MAX_ENTRY).await?;
-        Ok(stored
-            .and_then(|bytes| Entry::from_wire(&bytes, &self.sealer).ok())
-            .is_some_and(|stored| stored.hash() == entry.hash()))
+        let stored = fetch::read_entry(&*self.remote, &entry.remote_key(), &self.sealer).await?;
+        Ok(matches!(stored, Some(Ok(stored)) if stored.hash() == entry.hash()))
     }
 
     async fn resolve_taken_seq(&mut self, entry: &Entry) -> Result<Commit, JournalError> {
@@ -300,19 +314,8 @@ impl<R: Remote> Journal<R> {
 
         loop {
             let key = entry_key(node, frontier.next_seq);
-            let read = match self.remote.get(&key, MAX_ENTRY).await {
-                Err(RemoteError::TooLarge { len, .. }) => {
-                    return Err(JournalError::Chain {
-                        node,
-                        source: ChainError::TooLarge {
-                            seq: frontier.next_seq,
-                            len,
-                        },
-                    });
-                }
-                read => read?,
-            };
-            let Some(bytes) = read else {
+            let read = fetch::read_entry(&*self.remote, &key, &self.sealer).await?;
+            let Some(read) = read else {
                 // A writer creates seq n before n + 1: a later entry with no entry here is a gap,
                 // and the chain would end here for this reader only.
                 let next = frontier
@@ -335,16 +338,10 @@ impl<R: Remote> Journal<R> {
             };
 
             let seq = frontier.next_seq;
-            let entry =
-                Entry::from_wire(&bytes, &self.sealer).map_err(|e| JournalError::Chain {
-                    node,
-                    source: match e {
-                        WireError::Malformed => ChainError::Malformed { seq },
-                        WireError::ActionsMismatch => ChainError::ActionsMismatch { seq },
-                        WireError::Sealed => ChainError::Sealed { seq },
-                        WireError::BadMac => ChainError::BadMac { seq },
-                    },
-                })?;
+            let entry = read.map_err(|refused| JournalError::Chain {
+                node,
+                source: refused.at(seq),
+            })?;
             frontier = frontier
                 .extend(node, &entry)
                 .map_err(|source| JournalError::Chain { node, source })?;
@@ -400,11 +397,8 @@ impl<R: Remote> Journal<R> {
         let Some(last) = frontier.next_seq.checked_sub(1) else {
             return Ok(highest);
         };
-        let same = match self.remote.get(&entry_key(node, last), MAX_ENTRY).await? {
-            Some(bytes) => Entry::from_wire(&bytes, &self.sealer)
-                .is_ok_and(|entry| entry.hash() == frontier.last_hash),
-            None => false,
-        };
+        let stored = fetch::read_entry(&*self.remote, &entry_key(node, last), &self.sealer).await?;
+        let same = matches!(stored, Some(Ok(entry)) if entry.hash() == frontier.last_hash);
         if !same {
             return Err(JournalError::Chain {
                 node,

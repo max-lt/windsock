@@ -111,18 +111,111 @@ struct Content<'a> {
     actions_hash: &'a [u8; 32],
 }
 
-/// The form of an entry on the remote: the sealed actions, never the clear ones.
-#[derive(Serialize, Deserialize)]
-struct Wire {
+/// The wire bytes after the sealed actions: the signature, then the MAC.
+pub const TAIL_LEN: u64 = 96;
+
+/// The signed fields of an entry, in wire order. Postcard writes a nested struct as its fields.
+#[derive(Clone, Serialize, Deserialize)]
+struct Fields {
     node: NodeId,
     seq: u64,
     prev: EntryHash,
     hlc: u64,
     seen: Seen,
     actions_hash: [u8; 32],
+}
+
+impl Fields {
+    fn content_hash(&self) -> EntryHash {
+        content_hash(
+            self.node,
+            self.seq,
+            &self.prev,
+            self.hlc,
+            &self.seen,
+            &self.actions_hash,
+        )
+    }
+}
+
+/// The form of an entry on the remote: the sealed actions, never the clear ones.
+#[derive(Serialize, Deserialize)]
+struct Wire {
+    fields: Fields,
     sealed: Option<Vec<u8>>,
     signature: ([u8; 32], [u8; 32]),
     mac: [u8; 32],
+}
+
+#[derive(Deserialize)]
+struct Tail {
+    signature: ([u8; 32], [u8; 32]),
+    mac: [u8; 32],
+}
+
+fn parse_tail(bytes: &[u8]) -> Result<Tail, WireError> {
+    if bytes.len() as u64 != TAIL_LEN {
+        return Err(WireError::Malformed);
+    }
+    postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)
+}
+
+fn check_mac(fields: &Fields, mac: &[u8; 32], sealer: &Sealer) -> Result<(), WireError> {
+    match sealer.entry_mac_is_valid(&fields.content_hash(), mac) {
+        true => Ok(()),
+        false => Err(WireError::BadMac),
+    }
+}
+
+/// The wire bytes of an entry up to its sealed actions, and where the rest of the entry lies.
+pub struct EntryHead {
+    fields: Fields,
+    header_len: u64,
+    sealed_len: Option<u64>,
+}
+
+impl EntryHead {
+    /// Decodes the start of wire bytes, up to the length of the sealed actions.
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let (fields, rest) =
+            postcard::take_from_bytes::<Fields>(bytes).map_err(|_| WireError::Malformed)?;
+        let (sealed_len, rest) = match rest.split_first() {
+            Some((0, rest)) => (None, rest),
+            Some((1, rest)) => {
+                let (len, rest) =
+                    postcard::take_from_bytes::<u64>(rest).map_err(|_| WireError::Malformed)?;
+                (Some(len), rest)
+            }
+            _ => return Err(WireError::Malformed),
+        };
+        Ok(Self {
+            fields,
+            header_len: (bytes.len() - rest.len()) as u64,
+            sealed_len,
+        })
+    }
+
+    /// The wire bytes before the sealed actions.
+    pub fn header_len(&self) -> u64 {
+        self.header_len
+    }
+
+    /// The length of the sealed actions, or `None` once a purge removed them.
+    pub fn sealed_len(&self) -> Option<u64> {
+        self.sealed_len
+    }
+
+    /// The length of the whole entry, or `None` when it overflows.
+    pub fn wire_len(&self) -> Option<u64> {
+        self.header_len
+            .checked_add(self.sealed_len.unwrap_or(0))?
+            .checked_add(TAIL_LEN)
+    }
+
+    /// Checks the MAC in `tail`. A writer with no repository key stops here, before its actions.
+    pub fn check_tail(&self, tail: &[u8], sealer: &Sealer) -> Result<(), WireError> {
+        check_mac(&self.fields, &parse_tail(tail)?.mac, sealer)
+    }
 }
 
 /// An entry from the remote does not read back.
@@ -249,15 +342,21 @@ impl Entry {
         }
     }
 
-    /// The bytes that the remote holds for this entry.
-    pub fn to_wire(&self) -> Vec<u8> {
-        let wire = Wire {
+    fn fields(&self) -> Fields {
+        Fields {
             node: self.node,
             seq: self.seq,
             prev: self.prev,
             hlc: self.hlc,
             seen: self.seen.clone(),
             actions_hash: self.actions_hash,
+        }
+    }
+
+    /// The bytes that the remote holds for this entry.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let wire = Wire {
+            fields: self.fields(),
             sealed: self.sealed.clone(),
             signature: self.signature,
             mac: self.mac,
@@ -272,67 +371,70 @@ impl Entry {
     pub fn fuzz_wire(bytes: &[u8], sealer: &Sealer) -> Option<Vec<u8>> {
         let mut wire: Wire = postcard::from_bytes(bytes).ok()?;
         if let Some(plain) = &wire.sealed {
-            let sealed = sealer.seal(Kind::Actions, &seal_context(wire.node, wire.seq), plain);
-            wire.actions_hash = actions_hash(&sealed);
+            let context = seal_context(wire.fields.node, wire.fields.seq);
+            let sealed = sealer.seal(Kind::Actions, &context, plain);
+            wire.fields.actions_hash = actions_hash(&sealed);
             wire.sealed = Some(sealed);
         }
-        let content = content_hash(
-            wire.node,
-            wire.seq,
-            &wire.prev,
-            wire.hlc,
-            &wire.seen,
-            &wire.actions_hash,
-        );
-        wire.mac = sealer.entry_mac(&content);
+        wire.mac = sealer.entry_mac(&wire.fields.content_hash());
         Some(postcard::to_allocvec(&wire).expect("an entry always serializes"))
+    }
+
+    /// The wire bytes before the sealed actions: the part that a reader decodes first.
+    pub fn header_len(&self) -> u64 {
+        let fields = postcard::to_allocvec(&self.fields()).expect("an entry always serializes");
+        let Some(sealed) = &self.sealed else {
+            return fields.len() as u64 + 1;
+        };
+        // Some writes its tag, then the length of the bytes as a varint.
+        let len = sealed.len() as u64;
+        let varint = (u64::BITS - len.leading_zeros()).div_ceil(7).max(1) as u64;
+        fields.len() as u64 + 1 + varint
     }
 
     /// The length of [`Entry::to_wire`], with no copy of the sealed actions.
     pub fn wire_len(&self) -> u64 {
-        let header = Wire {
-            node: self.node,
-            seq: self.seq,
-            prev: self.prev,
-            hlc: self.hlc,
-            seen: self.seen.clone(),
-            actions_hash: self.actions_hash,
-            sealed: None,
-            signature: self.signature,
-            mac: self.mac,
-        };
-        let header = postcard::to_allocvec(&header).expect("an entry always serializes");
-        let Some(sealed) = &self.sealed else {
-            return header.len() as u64;
-        };
-        // Some writes a length after its tag, then the bytes.
-        let len = sealed.len() as u64;
-        let varint = (u64::BITS - len.leading_zeros()).div_ceil(7).max(1) as u64;
-        header.len() as u64 + varint + len
+        let sealed = self.sealed.as_ref().map_or(0, |sealed| sealed.len() as u64);
+        self.header_len() + sealed + TAIL_LEN
     }
 
     /// Reads an entry from the remote and opens its actions.
     pub fn from_wire(bytes: &[u8], sealer: &Sealer) -> Result<Self, WireError> {
         let wire: Wire = postcard::from_bytes(bytes).map_err(|_| WireError::Malformed)?;
-        // Before any use of the header: a writer with no repository key stops here.
-        let content = content_hash(
-            wire.node,
-            wire.seq,
-            &wire.prev,
-            wire.hlc,
-            &wire.seen,
-            &wire.actions_hash,
-        );
-        if !sealer.entry_mac_is_valid(&content, &wire.mac) {
-            return Err(WireError::BadMac);
+        Self::checked(wire, sealer)
+    }
+
+    /// Reads an entry from the parts of its wire bytes, with the checks of [`Entry::from_wire`].
+    pub fn from_parts(
+        head: EntryHead,
+        sealed: Option<Vec<u8>>,
+        tail: &[u8],
+        sealer: &Sealer,
+    ) -> Result<Self, WireError> {
+        if sealed.as_ref().map(|sealed| sealed.len() as u64) != head.sealed_len {
+            return Err(WireError::Malformed);
         }
+        let tail = parse_tail(tail)?;
+        let wire = Wire {
+            fields: head.fields,
+            sealed,
+            signature: tail.signature,
+            mac: tail.mac,
+        };
+        Self::checked(wire, sealer)
+    }
+
+    fn checked(wire: Wire, sealer: &Sealer) -> Result<Self, WireError> {
+        // Before any use of the header: a writer with no repository key stops here.
+        check_mac(&wire.fields, &wire.mac, sealer)?;
+        let fields = wire.fields;
         let actions = match &wire.sealed {
             None => None,
-            Some(sealed) if actions_hash(sealed) != wire.actions_hash => {
+            Some(sealed) if actions_hash(sealed) != fields.actions_hash => {
                 return Err(WireError::ActionsMismatch);
             }
             Some(sealed) => {
-                let context = seal_context(wire.node, wire.seq);
+                let context = seal_context(fields.node, fields.seq);
                 let plain = sealer
                     .open(Kind::Actions, &context, sealed)
                     .map_err(|_| WireError::Sealed)?;
@@ -341,12 +443,12 @@ impl Entry {
         };
 
         Ok(Self {
-            node: wire.node,
-            seq: wire.seq,
-            prev: wire.prev,
-            hlc: wire.hlc,
-            seen: wire.seen,
-            actions_hash: wire.actions_hash,
+            node: fields.node,
+            seq: fields.seq,
+            prev: fields.prev,
+            hlc: fields.hlc,
+            seen: fields.seen,
+            actions_hash: fields.actions_hash,
             actions,
             sealed: wire.sealed,
             signature: wire.signature,
@@ -417,6 +519,15 @@ pub(crate) fn with_bad_signature(mut entry: Entry) -> Entry {
 pub(crate) fn with_bad_mac(mut entry: Entry) -> Entry {
     entry.mac[0] ^= 1;
     entry
+}
+
+/// The header of `entry` with a sealed length of `len`: the start of an entry of any size.
+#[cfg(test)]
+pub(crate) fn header_with_sealed_len(entry: &Entry, len: u64) -> Vec<u8> {
+    let mut bytes = postcard::to_allocvec(&entry.fields()).expect("an entry always serializes");
+    bytes.push(1);
+    bytes.extend(postcard::to_allocvec(&len).expect("a length always serializes"));
+    bytes
 }
 
 /// A fixed repository key for tests.
@@ -681,12 +792,14 @@ mod tests {
     #[test]
     fn test_entry_wire_form_is_stable() {
         let wire = Wire {
-            node: NodeId::from_bytes([1u8; 32]),
-            seq: 3,
-            prev: [5u8; 32],
-            hlc: 7,
-            seen: seen(),
-            actions_hash: [6u8; 32],
+            fields: Fields {
+                node: NodeId::from_bytes([1u8; 32]),
+                seq: 3,
+                prev: [5u8; 32],
+                hlc: 7,
+                seen: seen(),
+                actions_hash: [6u8; 32],
+            },
             sealed: Some(vec![9, 9]),
             signature: ([7u8; 32], [8u8; 32]),
             mac: [4u8; 32],
@@ -697,6 +810,97 @@ mod tests {
         assert_eq!(
             blake3::hash(&bytes).to_string(),
             "48c370a3aaabc21d82f1561ce2fba6c915b7a1bff6570bd6850f0a2942b18255"
+        );
+    }
+
+    fn sized(size: usize) -> Entry {
+        let action = Action::Put {
+            bucket: "b".into(),
+            key: "k".repeat(size.max(1)),
+            manifest_id: ObjectId::from_bytes([1; 32]),
+            inline_manifest: None,
+            hlc: 1,
+        };
+        Entry::sign(&key(), 0, [0; 32], 9, seen(), vec![action], &test_sealer())
+    }
+
+    /// The header, the sealed actions and the tail of wire bytes, as a ranged reader cuts them.
+    fn cut(wire: &[u8]) -> (EntryHead, Option<Vec<u8>>, Vec<u8>) {
+        let head = EntryHead::parse(wire).unwrap();
+        let start = head.header_len() as usize;
+        let tail = wire.len() - TAIL_LEN as usize;
+        let sealed = head.sealed_len().map(|_| wire[start..tail].to_vec());
+        (head, sealed, wire[tail..].to_vec())
+    }
+
+    #[test]
+    fn test_entry_head_finds_the_parts_of_the_wire_bytes() {
+        for entry in [sized(1), sized(70_000), sized(1).redacted()] {
+            let wire = entry.to_wire();
+
+            let head = EntryHead::parse(&wire).unwrap();
+
+            assert_eq!(head.header_len(), entry.header_len());
+            assert_eq!(head.wire_len(), Some(wire.len() as u64));
+            let header = &wire[..entry.header_len() as usize];
+            assert!(EntryHead::parse(header).is_ok());
+            assert_eq!(
+                EntryHead::parse(&header[..header.len() - 1]).err(),
+                Some(WireError::Malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_parts_reads_as_from_wire() {
+        for entry in [sized(1), sized(70_000), sized(1).redacted()] {
+            let wire = entry.to_wire();
+            let (head, sealed, tail) = cut(&wire);
+
+            head.check_tail(&tail, &test_sealer()).unwrap();
+            let read = Entry::from_parts(head, sealed, &tail, &test_sealer()).unwrap();
+
+            assert_eq!(read, Entry::from_wire(&wire, &test_sealer()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_from_parts_refuses_parts_of_two_entries() {
+        let a = sized(100).to_wire();
+        let action = sized(100).actions.unwrap();
+        let b = Entry::sign(&key(), 0, [0; 32], 10, seen(), action, &test_sealer()).to_wire();
+        assert_eq!(a.len(), b.len());
+        let (_, b_sealed, b_tail) = cut(&b);
+        let sealer = test_sealer();
+
+        let (head, _, _) = cut(&a);
+        assert_eq!(
+            head.check_tail(&b_tail, &sealer).err(),
+            Some(WireError::BadMac)
+        );
+        let (head, _, tail) = cut(&a);
+        let read = Entry::from_parts(head, b_sealed, &tail, &sealer);
+        assert_eq!(read.err(), Some(WireError::ActionsMismatch));
+        let (head, sealed, tail) = cut(&a);
+        let mut short = sealed.unwrap();
+        short.pop();
+        let read = Entry::from_parts(head, Some(short), &tail, &sealer);
+        assert_eq!(read.err(), Some(WireError::Malformed));
+        let (head, sealed, tail) = cut(&a);
+        let read = Entry::from_parts(head, sealed, &tail[1..], &sealer);
+        assert_eq!(read.err(), Some(WireError::Malformed));
+    }
+
+    /// The MAC needs only the header and the tail: a writer with no repository key stops there.
+    #[test]
+    fn test_check_tail_refuses_a_writer_with_no_repo_key() {
+        let other = seal::RepoKey::from_hex(&"09".repeat(32)).unwrap().keys();
+        let entry = Entry::sign(&key(), 0, [0; 32], 1, seen(), vec![put()], other.sealer());
+        let (head, _, tail) = cut(&entry.to_wire());
+
+        assert_eq!(
+            head.check_tail(&tail, &test_sealer()).err(),
+            Some(WireError::BadMac)
         );
     }
 }

@@ -1022,11 +1022,27 @@ async fn list_segments(dir: &Path) -> Result<Vec<u64>, EngineError> {
 
 async fn create_segment(dir: &Path, seq: u64) -> Result<Active, EngineError> {
     let path = segment_path(dir, seq);
-    let file = tokio::fs::OpenOptions::new()
+    let created = tokio::fs::OpenOptions::new()
         .create_new(true)
         .append(true)
         .open(&path)
-        .await?;
+        .await;
+    let file = match created {
+        Ok(file) => file,
+        // A create that failed after the file existed, as on a full disk, left it empty: take it,
+        // or every later rotation fails. A segment with data is never taken.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .await?;
+            if file.metadata().await?.len() > 0 {
+                return Err(e.into());
+            }
+            file
+        }
+        Err(e) => return Err(e.into()),
+    };
     let sync = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -1696,6 +1712,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, b"two");
+    }
+
+    /// A create of the next segment that failed after the file exists, as on a full disk, leaves an
+    /// empty file: the next rotation takes it, or every rotation and flush fails from then on.
+    #[tokio::test]
+    async fn test_rotation_takes_an_empty_next_segment_that_a_failed_create_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+        buffer.append(put("a", b"one"), b"one").await.unwrap();
+        std::fs::File::create(segment_path(dir.path(), buffer.active.seq + 1)).unwrap();
+
+        let sealed = buffer.seal().await;
+        buffer.append(put("b", b"two"), b"two").await.unwrap();
+
+        assert!(sealed.is_ok(), "{sealed:?}");
+        drop(buffer);
+        let reopened = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+        assert_eq!(reopened.objects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_refuses_a_next_segment_with_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buffer = Buffer::open(dir.path(), 1 << 20).await.unwrap();
+        buffer.append(put("a", b"one"), b"one").await.unwrap();
+        let next = segment_path(dir.path(), buffer.active.seq + 1);
+        std::fs::write(&next, b"data").unwrap();
+
+        let sealed = buffer.seal().await;
+
+        assert!(sealed.is_err(), "{sealed:?}");
+        assert_eq!(std::fs::read(&next).unwrap(), b"data");
     }
 
     #[tokio::test]

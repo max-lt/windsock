@@ -217,3 +217,114 @@ async fn test_list_page_is_capped_whatever_max_the_caller_asks() {
     // A page of 0 objects with no next key would look like the end of the listing.
     assert!(empty.is_err(), "{empty:?}");
 }
+
+/// A start that fails after the engine opened stops its background tasks: a second start in the
+/// same process opens the same data_dir.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_failed_start_frees_the_engine_for_a_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config = config_without_keys(dir.path(), port);
+    let taken = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
+
+    let failed = windsockd::serve_with(
+        &config,
+        Arc::new(Keys::default()),
+        std::future::pending(),
+        drop,
+    )
+    .await;
+    drop(taken);
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let retry = tokio::spawn(async move {
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(
+            &config,
+            Arc::new(Keys::default()),
+            std::future::pending(),
+            on_open,
+        )
+        .await
+    });
+    let opened = tokio::time::timeout(Duration::from_secs(30), node_rx).await;
+    retry.abort();
+
+    let error = failed.unwrap_err().to_string();
+    assert!(error.contains("cannot listen"), "{error}");
+    assert!(matches!(opened, Ok(Ok(_))), "the retry did not open");
+}
+
+/// Starts `config` until its engine opens: the tasks of an aborted serve stop at their next await.
+/// Ok once a serve opens within 10 s.
+async fn serve_again(config: &windsockd::Config) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let config = config.clone();
+        let serve = tokio::spawn(async move {
+            let on_open = move |node| {
+                let _ = tx.send(node);
+            };
+            windsockd::serve_with(
+                &config,
+                Arc::new(Keys::default()),
+                std::future::pending(),
+                on_open,
+            )
+            .await
+        });
+        if rx.await.is_ok() {
+            serve.abort();
+            return Ok(());
+        }
+        let error = serve
+            .await
+            .unwrap()
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        if tokio::time::Instant::now() > deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// An aborted serve frees its engine once the host drops its Node, and a Node kept past the
+/// stop gets a named error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_aborted_serve_frees_the_engine_and_stops_its_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config = config_without_keys(dir.path(), port);
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let first_config = config.clone();
+    let daemon = tokio::spawn(async move {
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(
+            &first_config,
+            Arc::new(Keys::default()),
+            std::future::pending(),
+            on_open,
+        )
+        .await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&format!("127.0.0.1:{port}")).await;
+
+    daemon.abort();
+    let _ = daemon.await;
+    let after_stop = node.buckets().await;
+    drop(node);
+    let opened = serve_again(&config).await;
+
+    assert!(
+        matches!(after_stop, Err(engine::EngineError::Stopped)),
+        "{after_stop:?}"
+    );
+    assert!(opened.is_ok(), "the second serve did not open: {opened:?}");
+}

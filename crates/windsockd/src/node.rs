@@ -2,6 +2,7 @@
 //! sets the cache limit. It writes no object, bucket or configuration.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use engine::{
     BucketInfo, CacheState, Engine, EngineError, ListAfter, ListEntry, ListQuery, ObjectInfo,
@@ -29,6 +30,8 @@ pub struct NodeStatus {
     pub admin_socket: bool,
     /// Another node that ran the GC in the last horizon.
     pub other_gc_node: Option<NodeId>,
+    /// The serve of this node ended: drop the Node, which frees the engine.
+    pub stopped: bool,
 }
 
 /// The most objects in one page of [`Node::list`], as for S3 ListObjects: a larger `max` gets this.
@@ -66,12 +69,14 @@ impl Node {
         uploads: Arc<s3api::Uploads>,
         limits: Limits,
         admin_socket: bool,
+        stopped: Arc<AtomicBool>,
     ) -> Self {
         Self(Arc::new(EngineNode {
             engine,
             uploads,
             limits,
             admin_socket,
+            stopped,
         }))
     }
 
@@ -114,6 +119,17 @@ struct EngineNode<R> {
     uploads: Arc<s3api::Uploads>,
     limits: Limits,
     admin_socket: bool,
+    /// Set when the serve ends: the calls that act on the engine stop.
+    stopped: Arc<AtomicBool>,
+}
+
+impl<R> EngineNode<R> {
+    fn running(&self) -> Result<(), EngineError> {
+        match self.stopped.load(Ordering::SeqCst) {
+            true => Err(EngineError::Stopped),
+            false => Ok(()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -132,10 +148,12 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
             gc_enabled: self.limits.gc_enabled,
             admin_socket: self.admin_socket,
             other_gc_node: self.engine.other_gc_node(),
+            stopped: self.stopped.load(Ordering::SeqCst),
         }
     }
 
     async fn buckets(&self) -> Result<Vec<BucketInfo>, EngineError> {
+        self.running()?;
         self.engine.list_buckets().await
     }
 
@@ -146,6 +164,7 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
         after: Option<&str>,
         max: usize,
     ) -> Result<Page, EngineError> {
+        self.running()?;
         if max == 0 {
             return Err(EngineError::InvalidArgument(
                 "max must be at least 1: a page of 0 objects has no next key".into(),
@@ -174,6 +193,7 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
     }
 
     async fn set_cache_limit(&self, bytes: u64) -> Result<CacheState, EngineError> {
+        self.running()?;
         self.engine.set_cache_limit(bytes).await
     }
 }

@@ -11,9 +11,10 @@ pub mod quarantine;
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -63,7 +64,9 @@ pub async fn run(config: &Config) -> Result<()> {
 
 /// Serves with the keys of `keys` until `shutdown` returns, then flushes the buffer. A SIGINT or
 /// SIGTERM after `shutdown` stops at once. `config` must have no [[keys]] entry. `on_open` gets
-/// the [`Node`] once the engine is open, before the S3 port listens.
+/// the [`Node`] once the engine is open, before the S3 port listens. When the serve returns, or its future
+/// is dropped, its tasks stop and each Node call gets `EngineError::Stopped`: drop the Node too,
+/// as it holds the engine, and a new serve of the same `data_dir` opens once both are gone.
 pub async fn serve_with(
     config: &Config,
     keys: Arc<dyn KeyStore>,
@@ -384,9 +387,15 @@ async fn serve<R: Sweep + 'static>(
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");
 
-    let mut background = vec![engine.spawn_flusher()];
+    let (serving, ended) = tokio::sync::oneshot::channel::<()>();
+    let mut running = Running {
+        tasks: vec![engine.spawn_flusher()],
+        socket: None,
+        stopped: Arc::new(AtomicBool::new(false)),
+        _serving: serving,
+    };
     let syncer = engine.clone();
-    background.push(every(
+    running.tasks.push(every(
         Duration::from_secs(config.sync_interval_secs),
         "sync",
         move || {
@@ -405,7 +414,7 @@ async fn serve<R: Sweep + 'static>(
             warn!(%node, "another node ran the GC in the last horizon: run the GC on one node only");
         }
         let collector = engine.clone();
-        background.push(every(
+        running.tasks.push(every(
             Duration::from_secs(config.gc.interval_secs),
             "gc",
             move || {
@@ -439,9 +448,16 @@ async fn serve<R: Sweep + 'static>(
         gc_enabled: config.gc.enabled,
     };
     let socket = admin::prepare(&config.data_dir)?;
-    let node = Node::new(engine.clone(), s3.uploads.clone(), limits, socket.is_some());
+    running.socket = socket.clone();
+    let node = Node::new(
+        engine.clone(),
+        s3.uploads.clone(),
+        limits,
+        socket.is_some(),
+        running.stopped.clone(),
+    );
     if let Some(socket) = &socket {
-        background.push(tokio::spawn(admin::serve(
+        running.tasks.push(tokio::spawn(admin::serve(
             admin::bind(socket)?,
             node.clone(),
         )));
@@ -449,16 +465,18 @@ async fn serve<R: Sweep + 'static>(
     on_open(node);
     let expirer = s3.uploads.clone();
     let max_age = Duration::from_secs(config.uploads_expire_secs);
-    background.push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {
-        let uploads = expirer.clone();
-        async move {
-            let (count, bytes) = uploads.expire(max_age).await.map_err(|e| e.to_string())?;
-            if count > 0 {
-                info!(count, bytes, "removed expired multipart uploads");
+    running
+        .tasks
+        .push(every(UPLOADS_EXPIRE_EVERY, "uploads expire", move || {
+            let uploads = expirer.clone();
+            async move {
+                let (count, bytes) = uploads.expire(max_age).await.map_err(|e| e.to_string())?;
+                if count > 0 {
+                    info!(count, bytes, "removed expired multipart uploads");
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    }));
+        }));
     let usage = engine
         .local_usage()
         .await
@@ -486,7 +504,11 @@ async fn serve<R: Sweep + 'static>(
         listener,
         router.into_make_service_with_connect_info::<ConnectionActivity>(),
     )
-    .with_graceful_shutdown(drain_then_flush(engine.clone(), draining.clone(), shutdown))
+    // axum runs this future in its own task: it must end with the serve, or it keeps the engine.
+    .with_graceful_shutdown(until_ended(
+        drain_then_flush(engine.clone(), draining.clone(), shutdown),
+        ended,
+    ))
     .into_future();
     let second_signal = async {
         draining.notified().await;
@@ -512,17 +534,34 @@ async fn serve<R: Sweep + 'static>(
         }
     };
 
-    // A flush cut by the abort is safe: its intent file finishes it at the next flush.
-    for task in background {
-        task.abort();
-    }
-    if let Some(socket) = socket
-        && let Err(e) = std::fs::remove_file(&socket)
-    {
-        warn!(%e, socket = %socket.display(), "cannot remove the admin socket");
-    }
-
+    drop(running);
     outcome
+}
+
+/// The background tasks of a serve and its admin socket. Dropped on every return, also an early
+/// error or an abort of the serve future: the tasks stop, so the engine is free, and each Node of
+/// this serve gets EngineError::Stopped.
+struct Running {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    socket: Option<PathBuf>,
+    stopped: Arc<AtomicBool>,
+    /// Its drop ends the shutdown future that axum holds in a task of its own.
+    _serving: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // A flush cut by the abort is safe: its intent file finishes it at the next flush.
+        for task in &self.tasks {
+            task.abort();
+        }
+        if let Some(socket) = &self.socket
+            && let Err(e) = std::fs::remove_file(socket)
+        {
+            warn!(%e, socket = %socket.display(), "cannot remove the admin socket");
+        }
+    }
 }
 
 /// The end of a drain: an error when buffered writes did not reach the remote.
@@ -547,6 +586,14 @@ async fn index_poisoned<R: Sweep + 'static>(engine: &Engine<R>) {
 
 /// At `shutdown`, refuses new writes and flushes the buffer. The server keeps serving reads, and
 /// 503 for writes, until the remote has every buffered write.
+/// Runs `task` until `ended` resolves, which the drop of its sender does.
+async fn until_ended(task: impl Future<Output = ()>, ended: tokio::sync::oneshot::Receiver<()>) {
+    tokio::select! {
+        () = task => {}
+        _ = ended => {}
+    }
+}
+
 async fn drain_then_flush<R: Sweep + 'static>(
     engine: Arc<Engine<R>>,
     draining: Arc<Notify>,

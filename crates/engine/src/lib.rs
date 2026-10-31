@@ -98,6 +98,9 @@ pub enum EngineError {
     InvalidBucketName(String),
     #[error("invalid key: {0:?}")]
     InvalidKey(String),
+    /// The daemon of this handle stopped: the host drops the handle, which frees the engine.
+    #[error("the node stopped: drop this handle")]
+    Stopped,
     /// An argument of a call that the engine or its host API refuses.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),

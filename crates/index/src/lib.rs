@@ -264,7 +264,17 @@ impl Index {
 
     /// What this node has applied from the other chains: the `seen` of its next entry.
     pub fn seen(&self, own: NodeId) -> Result<Seen> {
-        Ok(journal::seen_from(&self.frontiers()?, own))
+        let mut seen = journal::seen_from(&self.frontiers()?, own);
+        // A chain at its highest retired point is known through the Retire entry, which a later
+        // entry reaches by its own links: leave it out, so the header stays small. A chain that
+        // wrote past that point is listed again.
+        let mut retired: BTreeMap<NodeId, u64> = BTreeMap::new();
+        for mark in self.retire_marks()? {
+            let upto = retired.entry(mark.node).or_default();
+            *upto = (*upto).max(mark.upto);
+        }
+        seen.retain(|node, link| retired.get(node) != Some(&(link.seq + 1)));
+        Ok(seen)
     }
 
     /// Applies every entry whose causal dependencies are applied, and keeps the
@@ -1708,6 +1718,40 @@ mod tests {
         index.apply(retired_history(2).await).unwrap();
 
         assert!(conflicted(&index));
+    }
+
+    /// A writer leaves a chain out while its frontier is the retired point, and lists it again
+    /// once the chain wrote past it.
+    #[tokio::test]
+    async fn test_seen_leaves_a_retired_chain_out_until_it_writes_again() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let mut gc = journal(&remote, 3);
+        let first = a.append(put("k", 1), Seen::new()).await.unwrap();
+        let link = Link {
+            seq: first.seq,
+            hash: first.hash(),
+        };
+        let retire = vec![Action::Retire {
+            node: first.node,
+            upto: 1,
+        }];
+        let retired = gc
+            .append(retire, Seen::from([(first.node, link)]))
+            .await
+            .unwrap();
+        let own = NodeId::from_bytes(key(2).verifying_key().to_bytes());
+        let mut index = Index::open_temporary().unwrap();
+        index.apply(vec![first.clone(), retired.clone()]).unwrap();
+
+        let left_out = index.seen(own).unwrap();
+        let again = a.append(put("k", 3), Seen::new()).await.unwrap();
+        index.apply(vec![again]).unwrap();
+        let back = index.seen(own).unwrap();
+
+        assert!(!left_out.contains_key(&first.node), "{left_out:?}");
+        assert!(left_out.contains_key(&retired.node));
+        assert_eq!(back.get(&first.node).map(|l| l.seq), Some(1));
     }
 
     /// Only a writer whose links reach the Retire entry knew the retired entries.

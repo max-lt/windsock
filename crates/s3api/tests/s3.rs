@@ -2200,6 +2200,80 @@ async fn test_buffered_bodies_with_no_length_stop_at_the_body_limit() {
     }
 }
 
+/// A body of `len` bytes made on demand, and the count of bytes that the server took from it.
+fn counted_body(len: u64) -> (Body, Arc<std::sync::atomic::AtomicU64>) {
+    const PIECE: u64 = 1024 * 1024;
+    let taken = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let count = taken.clone();
+    let stream = futures_util::stream::unfold(0u64, move |sent| {
+        let count = count.clone();
+        async move {
+            if sent >= len {
+                return None;
+            }
+            let size = PIECE.min(len - sent);
+            count.fetch_add(size, std::sync::atomic::Ordering::SeqCst);
+            let piece = Bytes::from(vec![7u8; size as usize]);
+            Some((Ok::<_, std::io::Error>(piece), sent + size))
+        }
+    });
+    (Body::from_stream(stream), taken)
+}
+
+/// Sends `call` with a counted body of `len` bytes in place of its own body.
+async fn send_counted(server: &Server, call: Call<'_>, len: u64) -> (Reply, u64) {
+    let mut call = call;
+    call.payload_hash = Some(sigv4::UNSIGNED_PAYLOAD.to_string());
+    let (parts, _) = call.request().into_parts();
+    let (body, taken) = counted_body(len);
+    let reply = send(server, Request::from_parts(parts, body)).await;
+    (reply, taken.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn test_request_with_no_streamed_body_is_refused_before_its_body_is_read() {
+    let server = with_bucket().await;
+    put(&server, "source", "data").await;
+    let huge = 5u64 * 1024 * 1024 * 1024;
+    let length = huge.to_string();
+    let calls = [
+        call("PUT", "/bkt/copy").header("x-amz-copy-source", "/bkt/source"),
+        call("PUT", "/other"),
+        call("DELETE", "/bkt"),
+        call("DELETE", "/bkt/source"),
+        call("GET", "/bkt/source"),
+        call("POST", "/bkt?delete"),
+    ];
+
+    for call in calls {
+        let what = format!("{} {}", call.method, call.uri);
+        let call = call.header("content-length", length.clone());
+        let (reply, taken) = send_counted(&server, call, huge).await;
+
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{what}: {}",
+            reply.text()
+        );
+        assert_eq!(taken, 0, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn test_copy_body_with_no_length_stops_at_a_small_cap() {
+    let server = with_bucket().await;
+    put(&server, "source", "data").await;
+    let call = call("PUT", "/bkt/copy")
+        .header("x-amz-copy-source", "/bkt/source")
+        .header("transfer-encoding", "chunked");
+
+    let (reply, taken) = send_counted(&server, call, 64 * 1024 * 1024).await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+    assert!(taken <= 2 * 1024 * 1024, "{taken} bytes read");
+}
+
 /// Keys that change while the server runs, as in a console. `down` makes every lookup fail.
 #[derive(Default)]
 struct LiveKeys {

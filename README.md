@@ -309,11 +309,16 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - A client that stops reading a GET body holds its stream until `idle_timeout_secs` (60 s by
   default) after the last write that made progress. Stalled readers can hold the whole read budget for that time: the 503 then protects the memory, not the service. Then the daemon closes the connection. A client
   that reads slowly keeps it open: there is no minimum rate.
-- A PUT with a Content-Length over 1 MiB, or a chunked body with no Content-Length, writes its
-  body to a spool file in the buffer as it arrives, in pieces of at most 1 MiB: it holds about
-  1 MiB of memory, and the peak for such PUTs is `max_connections` times 1 MiB. Its spool file
-  counts against the buffer limit as it grows. A smaller PUT goes through the buffer in one
-  record, with the group fsync. An aws-chunked body is decoded as it arrives: a header or trailer
+- A PUT with a Content-Length over 1 MiB, or with no Content-Length (a chunked or HTTP/2 body),
+  writes its body to a spool file in the buffer as it arrives, in pieces of at most 1 MiB: it
+  holds about 1 MiB of memory, and the peak for such PUTs is `max_connections` times 1 MiB. Its
+  spool file counts against the buffer limit as it grows. A smaller PUT goes through the buffer
+  in one record, with the group fsync.
+- Every other request body is read whole into memory, up to a cap: 1 MiB for a PUT of an
+  object, 4 MiB for an XML body (a POST or a bucket PUT), 64 KiB for any other request, a copy
+  included. A Content-Length over the cap gets `400` before the body is read. The peak for these
+  bodies is `max_connections` times 4 MiB.
+- An aws-chunked body is decoded as it arrives: a header or trailer
   line takes at most 4 KiB, all trailers 16 KiB, and a declared chunk size reserves no memory.
   Each chunk signature is checked at the end of its chunk, and nothing is written before the last
   chunk, the trailer signature and `x-amz-decoded-content-length` match.

@@ -188,12 +188,8 @@ fn streamed(parts: &Parts, signer: Option<&ChunkSigner>) -> Result<Option<Stream
         name == "uploadId" || name == "partNumber"
     });
     let length = header(&parts.headers, "content-length").and_then(|v| v.parse::<u64>().ok());
-    let chunked =
-        header(&parts.headers, "transfer-encoding").is_some_and(|v| v.contains("chunked"));
-    let large = match length {
-        Some(length) => length > SMALL_PUT,
-        None => chunked,
-    };
+    // An HTTP/2 body or a chunked body has no length: only a stream bounds its memory.
+    let large = length.is_none_or(|length| length > SMALL_PUT);
     // Every upload part streams to its part file; a small PUT goes through the buffer.
     if !part && !large {
         return Ok(None);
@@ -234,6 +230,22 @@ pub(crate) fn chunk_error(e: sigv4::ChunkError) -> S3Error {
 
 /// The longest XML request body: 10 000 parts or 1 000 keys fit in less.
 const MAX_XML_BODY: usize = 4 * 1024 * 1024;
+
+/// The longest body of a request that carries no data, as a copy: S3 gives it no body.
+const MAX_EMPTY_BODY: usize = 64 * 1024;
+
+/// The cap of a body that is read whole into memory, and the error code above it.
+fn buffered_limit(parts: &Parts) -> (usize, &'static str) {
+    let path = parts.uri.path().trim_start_matches('/');
+    let object = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
+    let copy = parts.headers.contains_key("x-amz-copy-source");
+    match parts.method {
+        Method::POST => (MAX_XML_BODY, "MaxMessageLengthExceeded"),
+        Method::PUT if object && !copy => (SMALL_PUT as usize, "EntityTooLarge"),
+        Method::PUT if !object => (MAX_XML_BODY, "EntityTooLarge"),
+        _ => (MAX_EMPTY_BODY, "EntityTooLarge"),
+    }
+}
 
 /// Middleware for every S3 route. The handlers get the checked, decoded body.
 pub(crate) async fn authenticate<R: Remote + 'static>(
@@ -280,11 +292,16 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
         return Ok(next.run(Request::from_parts(parts, body)).await);
     }
 
-    // A POST carries XML only. Its body must not take the memory of an object upload.
-    let (limit, too_large) = match parts.method {
-        Method::POST => (MAX_XML_BODY.min(state.max_body), "MaxMessageLengthExceeded"),
-        _ => (state.max_body, "EntityTooLarge"),
-    };
+    let (limit, too_large) = buffered_limit(&parts);
+    let limit = limit.min(state.max_body);
+    let length = header(&parts.headers, "content-length").and_then(|v| v.parse::<u64>().ok());
+    if length.is_some_and(|length| length > limit as u64) {
+        return Err(S3Error::new(
+            too_large,
+            StatusCode::BAD_REQUEST,
+            format!("the body is larger than {limit} bytes"),
+        ));
+    }
     let body = axum::body::to_bytes(body, limit).await.map_err(|e| {
         let over_limit = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
             .any(|e| e.is::<http_body_util::LengthLimitError>());

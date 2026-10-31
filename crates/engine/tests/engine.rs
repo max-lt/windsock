@@ -1434,3 +1434,82 @@ async fn test_read_budget_over_its_cap_is_refused_at_open() {
     };
     assert!(reason.contains("read_budget"), "{reason}");
 }
+
+/// A remote that stops for ever at the reads of every chain but the first one it reads, while
+/// `hold` is set: a sync that waits there can be dropped with one chain read.
+#[derive(Default)]
+struct StallRemote {
+    inner: MemoryRemote,
+    hold: AtomicBool,
+    first: std::sync::Mutex<Option<String>>,
+}
+
+impl StallRemote {
+    async fn stall(&self, key: &str) {
+        let Some(chain) = key.strip_prefix(journal::LOG_PREFIX) else {
+            return;
+        };
+        let chain = chain.split('/').next().unwrap_or_default().to_string();
+        if !self.hold.load(Ordering::SeqCst) {
+            return;
+        }
+        let other = {
+            let mut first = self.first.lock().unwrap();
+            first.get_or_insert_with(|| chain.clone()) != &chain
+        };
+        if other {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Remote for StallRemote {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
+        self.inner.create(key, data).await
+    }
+
+    async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
+        self.stall(key).await;
+        self.inner.get(key, max_len).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Bytes>, RemoteError> {
+        self.stall(key).await;
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// A client that goes away drops its request in a sync, after the read of one chain. The
+/// entries of that chain must reach the index at the next sync.
+#[tokio::test]
+async fn test_dropped_sync_loses_no_entry() {
+    let remote = Arc::new(StallRemote::default());
+    let reader = proxy(&remote, 2).await;
+    reader.engine.sync().await.unwrap();
+    let a = proxy(&remote, 1).await;
+    let c = proxy(&remote, 3).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    put(&a.engine, "ka", b"from a").await;
+    a.engine.flush().await.unwrap();
+    c.engine.sync().await.unwrap();
+    put(&c.engine, "kc", b"from c").await;
+    c.engine.flush().await.unwrap();
+
+    remote.hold.store(true, Ordering::SeqCst);
+    let dropped = tokio::time::timeout(Duration::from_millis(200), reader.engine.sync()).await;
+    remote.hold.store(false, Ordering::SeqCst);
+    reader.engine.sync().await.unwrap();
+
+    assert!(dropped.is_err(), "the sync did not stall");
+    assert_eq!(get(&reader.engine, "ka").await.unwrap(), b"from a");
+    assert_eq!(get(&reader.engine, "kc").await.unwrap(), b"from c");
+}

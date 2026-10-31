@@ -5,6 +5,22 @@ use super::*;
 /// A miss does not sync again sooner than this after the last sync.
 const SYNC_DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// A sync that stops before the index applies its entries, on an error or a drop of its future,
+/// moves the journal back to the applied frontiers: the next sync reads those entries again.
+struct Unapplied<'a, R: Remote + 'static> {
+    engine: &'a Engine<R>,
+    journal: &'a mut Journal<R>,
+    applied: bool,
+}
+
+impl<R: Remote + 'static> Drop for Unapplied<'_, R> {
+    fn drop(&mut self) {
+        if !self.applied {
+            self.engine.reset_journal(self.journal);
+        }
+    }
+}
+
 impl<R: Remote + 'static> Engine<R> {
     /// Reads the new entries of every chain and applies them. Returns the number applied.
     pub async fn sync(&self) -> Result<SyncReport> {
@@ -19,14 +35,13 @@ impl<R: Remote + 'static> Engine<R> {
             .lock()
             .expect("no panic while the lock is held") = Some(started.mono());
 
-        let entries = match self.read_entries(journal).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                // The journal is past entries that the index never got: read them again.
-                self.reset_journal(journal);
-                return Err(e);
-            }
+        let mut cut = Unapplied {
+            engine: self,
+            journal,
+            applied: false,
         };
+        let entries = self.read_entries(cut.journal).await?;
+        let journal = &mut *cut.journal;
 
         let mut report = SyncReport {
             broken: journal.broken().keys().copied().collect(),
@@ -44,6 +59,8 @@ impl<R: Remote + 'static> Engine<R> {
             report.applied = self.index().apply(entries)?;
             debug!(applied = report.applied, "synced");
         }
+        cut.applied = true;
+        drop(cut);
 
         // GC rule 1 needs every chain: a broken one can hide a condemn.
         if report.broken.is_empty() {

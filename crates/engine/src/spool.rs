@@ -57,7 +57,7 @@ impl PutSpool {
 
 impl Drop for PutSpool {
     fn drop(&mut self) {
-        // After the commit the file is a segment: the path no longer exists, and len is 0.
+        // Once its commit hands the file to the buffer, the path is empty, and len is 0 after it.
         let _ = std::fs::remove_file(&self.path);
         let len = self.counted();
         let _ = self
@@ -244,7 +244,10 @@ impl<R: Remote + 'static> Engine<R> {
         crate::sim::crash_point(crate::sim::Point::SpoolHead)?;
 
         let len = spool.len;
-        buffer.adopt(&spool.path, &head, len).await?;
+        // From here the file belongs to the buffer: a drop of this commit must not remove it while
+        // its rename runs.
+        let path = std::mem::take(&mut spool.path);
+        buffer.adopt(&path, &head, len).await?;
         // The bytes count in the segments of the buffer.
         let counted = spool.counted();
         spool.len = 0;
@@ -270,6 +273,53 @@ mod tests {
     use remote::MemoryRemote;
 
     use super::*;
+
+    /// A client that goes away drops the commit of its put at any await point. A dropped commit
+    /// either leaves no record or a record that the buffer tracks: after a flush, a reopen finds
+    /// nothing buffered, so no record waits for the late limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dropped_commit_leaves_no_record_that_the_buffer_does_not_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(MemoryRemote::default());
+        let open = || async {
+            Engine::open(
+                dir.path(),
+                remote.clone(),
+                SigningKey::from_bytes(&[3; 32]),
+                crate::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+                Config::default(),
+            )
+            .await
+            .unwrap()
+        };
+        let engine = open().await;
+        engine.create_bucket("demo", None).await.unwrap();
+
+        for n in 0..80u32 {
+            let key = format!("k{n}");
+            let mut spool = engine
+                .begin_put_sized("demo", &key, BTreeMap::new(), WriteMode::Overwrite, 4)
+                .await
+                .unwrap();
+            engine.spool_write(&mut spool, b"data").await.unwrap();
+            let mut commit = std::pin::pin!(engine.finish_put(spool));
+            for _ in 0..n {
+                let done = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(commit.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        engine.flush().await.unwrap();
+        drop(engine);
+
+        let reopened = open().await;
+        assert_eq!(reopened.buffered_bytes().await, 0);
+    }
 
     #[tokio::test]
     async fn test_put_whose_head_write_fails_gets_no_ack() {

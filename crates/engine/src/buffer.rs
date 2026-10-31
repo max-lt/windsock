@@ -878,27 +878,35 @@ impl Buffer {
         // The active segment is empty: the spool takes its seq. The next active segment exists
         // first, so a spooled segment is never the last one, which a replay can cut as torn.
         let seq = self.active.seq;
-        // After a failed create or directory fsync, the state of the directory is unknown: later
-        // acks would depend on it.
-        if let Err(e) = self.adopt_steps(spool, seq).await {
+        // After a failed create, rename or directory fsync, the state of the directory is unknown:
+        // later acks would depend on it.
+        if let Err(e) = self.adopt_steps(spool, seq, head, data_len).await {
             self.broken = true;
             return Err(e);
         }
-        self.written += 1;
-        self.durable = self.written;
-        self.track(seq, head, DATA_LEN_LEN as u64, data_len);
         Ok(self.written)
     }
 
-    async fn adopt_steps(&mut self, spool: &Path, seq: u64) -> Result<(), EngineError> {
+    async fn adopt_steps(
+        &mut self,
+        spool: &Path,
+        seq: u64,
+        head: &Head,
+        data_len: u64,
+    ) -> Result<(), EngineError> {
         self.active = create_segment(&self.dir, seq + 1).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolNext)?;
+        let size = tokio::fs::metadata(spool).await?.len();
+        // A dropped commit stops at an await, and the rename runs to its end on its own thread:
+        // the buffer tracks the segment first, so the flush never misses a record on disk.
+        self.sealed.insert(seq, size);
+        self.written += 1;
+        self.durable = self.written;
+        self.track(seq, head, DATA_LEN_LEN as u64, data_len);
         tokio::fs::rename(spool, self.segment_path(seq)).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;
         sync_dir(&self.dir).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolRename)?;
-        let size = tokio::fs::metadata(self.segment_path(seq)).await?.len();
-        self.sealed.insert(seq, size);
         Ok(())
     }
 

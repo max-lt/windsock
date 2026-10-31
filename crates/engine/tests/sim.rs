@@ -863,7 +863,13 @@ impl Sim {
             Err(EngineError::SimCrash(_)) => {
                 self.stats.spool_crash = true;
                 self.proxies[i].engine = None;
+                // The drop of the spool removes its file: a stray one shows that the open clears it.
+                let spool = self.proxies[i].dir.path().join("buffer/spool");
+                std::fs::write(spool.join("stray"), b"x").unwrap();
                 self.open(i).await?;
+                if std::fs::read_dir(&spool).unwrap().next().is_some() {
+                    return Err(format!("p{i}: the open left a file in the spool"));
+                }
                 let hash = *blake3::hash(&value).as_bytes();
                 match self.engine(i).head(BUCKET, &key).await {
                     Ok(info) if info.content_hash == hash => info.last_modified,

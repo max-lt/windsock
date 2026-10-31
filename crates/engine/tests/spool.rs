@@ -98,6 +98,8 @@ async fn test_crash_at_each_spool_step_acks_nothing_and_keeps_only_durable_puts(
         let result = spooled_put(&a, "k", &body, WriteMode::Overwrite).await;
         engine::sim::arm_crash(None);
         drop(a);
+        // The drop of the spool removes its file: a stray one shows that the open clears the rest.
+        std::fs::write(dir.path().join("buffer/spool/stray"), b"x").unwrap();
         let a = open(dir.path(), &remote, Config::default()).await;
         let read = a.get(BUCKET, "k", None).await;
 

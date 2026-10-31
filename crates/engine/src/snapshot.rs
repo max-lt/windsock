@@ -285,7 +285,9 @@ impl<R: Remote + 'static> Engine<R> {
             Ok(head) => head,
             Err(cause) => return Ok(Err(cause)),
         };
-        let mut sealed = Vec::new();
+        // The head is sealed and its total is under MAX_SNAPSHOT: one allocation, no growth.
+        let total: u64 = head.parts.iter().map(|part| part.len).sum();
+        let mut sealed = Vec::with_capacity(total as usize);
         for (n, part) in head.parts.iter().enumerate() {
             let key = part_key(base, n);
             let bytes = match self.read_snapshot(&key, part.len).await? {
@@ -355,6 +357,8 @@ impl<R: Remote + 'static> Engine<R> {
                         continue;
                     }
                 };
+            // The decode holds the plain blob and the state: the sealed blob goes first.
+            drop(sealed);
 
             match Snapshot::decode(blake3::hash(&plain).as_bytes(), &plain) {
                 Ok(snapshot) => return Ok(Ok((snapshot, time))),
@@ -466,7 +470,8 @@ impl<R: Remote + 'static> Engine<R> {
         let Ok((snapshot, time)) = self.latest_snapshot().await? else {
             return Ok((0, None));
         };
-        let frontiers = snapshot.frontiers;
+        // The loop needs the frontiers only: the rest of the state goes now.
+        let frontiers = { snapshot }.frontiers;
 
         let mut redacted = 0;
 

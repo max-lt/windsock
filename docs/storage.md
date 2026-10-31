@@ -420,7 +420,12 @@ One PUT holds at most 5 GiB on S3, R2 and B2. The GC writes a snapshot in parts.
 | Parts in one snapshot   | 4096 at most                                 |
 | Size of one snapshot    | 16 GiB at most: about 74,000,000 keys        |
 | Ranged read of a part   | 64 MiB                                       |
+| Memory of one load      | 2 times the snapshot at the peak             |
 | Parts with no head stay | for the GC horizon (`gc.horizon_secs`, 24 h) |
+
+A load holds the sealed blob and the plain blob, then the plain blob and the decoded state: 2
+times the snapshot at the peak, 32 GiB for a snapshot of 16 GiB. The journal prune keeps only the
+frontiers of the snapshot that it loaded.
 
 The format:
 

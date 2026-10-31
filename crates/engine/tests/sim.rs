@@ -228,6 +228,12 @@ struct Stats {
     spool_crash: bool,
     /// A flush wrote its entry and lost the answer: the entry is in the remote and in the intent.
     lost_entry_answer: bool,
+    /// The GC wrote a Retire, an entry left a retired chain out, a retired chain wrote again, and
+    /// a stable HLC left a retired chain out.
+    retire_written: bool,
+    link_dropped: bool,
+    retired_again: bool,
+    stable_skip: bool,
     /// A power loss changed the data of an unacked put under a valid head, or cut its record.
     power_loss_data: u64,
     power_loss_cut: u64,
@@ -288,6 +294,8 @@ fn config() -> Config {
         retention: Duration::from_secs(600),
         late_margin: Duration::from_secs(60),
         snapshot_interval: Duration::from_secs(3600),
+        // Half of the seeds run the GC that retires quiet chains.
+        retire_chains: CURRENT_SEED.with(std::cell::Cell::get).is_multiple_of(2),
         ..Config::default()
     }
 }
@@ -316,6 +324,8 @@ struct Sim {
     keyless: Option<(Vec<String>, [u8; 32])>,
     /// The HLC of the latest keyless entry: no clock may reach it.
     keyless_hlc: u64,
+    /// Each Retire action in the remote: the retired node, its point, the node and seq of the entry.
+    retires: Vec<([u8; 32], u64, [u8; 32], u64)>,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
     /// Real time since the start: it never steps back, unlike the wall clocks.
@@ -676,6 +686,8 @@ impl Sim {
                 self.prune_bound = self.prune_bound.max(bound);
                 self.stats.tombstone_prune |= report.pruned_keys > 0;
                 self.stats.deleted_pack |= report.deleted_packs > 0;
+                self.stats.stable_skip |= report.stable_skipped > 0;
+                self.scan_retires().await;
                 Ok(())
             }
             Err(EngineError::Quarantined(_)) => Ok(()),
@@ -689,6 +701,44 @@ impl Sim {
                     .map(|report| report.broken_causes);
                 Err(format!("gc: {e}\ncauses {causes:?}\n{}", tail.join("\n")))
             }
+        }
+    }
+
+    /// Notes each Retire in the remote, and what writers did with it. A GC run reads them before
+    /// the journal prune of a later run redacts their actions.
+    async fn scan_retires(&mut self) {
+        let keys = RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+        let mut entries = Vec::new();
+        for key in self.remote.inner.list(journal::LOG_PREFIX).await.unwrap() {
+            let Some(bytes) = self.remote.inner.get(&key, u64::MAX).await.unwrap() else {
+                continue;
+            };
+            if let Ok(entry) = journal::Entry::from_wire(&bytes, keys.sealer()) {
+                entries.push(entry);
+            }
+        }
+        for entry in &entries {
+            for action in entry.actions.iter().flatten() {
+                if let journal::Action::Retire { node, upto } = action {
+                    let mark = (*node.as_bytes(), *upto, *entry.node.as_bytes(), entry.seq);
+                    if !self.retires.contains(&mark) {
+                        self.retires.push(mark);
+                    }
+                }
+            }
+        }
+        self.stats.retire_written |= !self.retires.is_empty();
+        for &(node, upto, by, seq) in &self.retires {
+            let (node, by) = (
+                model::NodeId::from_bytes(node),
+                model::NodeId::from_bytes(by),
+            );
+            self.stats.retired_again |= entries.iter().any(|e| e.node == node && e.seq >= upto);
+            self.stats.link_dropped |= entries.iter().any(|e| {
+                e.node != node
+                    && !e.seen.contains_key(&node)
+                    && e.seen.get(&by).is_some_and(|link| link.seq >= seq)
+            });
         }
     }
 
@@ -1335,6 +1385,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
         highest_clock: 0,
         keyless: None,
         keyless_hlc: 0,
+        retires: Vec::new(),
         max_offset: 0,
         elapsed: SECOND,
     };
@@ -1394,6 +1445,10 @@ struct Totals {
     step_back: u64,
     spool_crash: u64,
     lost_entry_answer: u64,
+    retire_written: u64,
+    link_dropped: u64,
+    retired_again: u64,
+    stable_skip: u64,
     power_loss_data: u64,
     power_loss_cut: u64,
     refused_starts: u64,
@@ -1422,6 +1477,10 @@ impl Totals {
         self.step_back += u64::from(stats.step_back);
         self.spool_crash += u64::from(stats.spool_crash);
         self.lost_entry_answer += u64::from(stats.lost_entry_answer);
+        self.retire_written += u64::from(stats.retire_written);
+        self.link_dropped += u64::from(stats.link_dropped);
+        self.retired_again += u64::from(stats.retired_again);
+        self.stable_skip += u64::from(stats.stable_skip);
         self.power_loss_data += stats.power_loss_data;
         self.power_loss_cut += stats.power_loss_cut;
         self.refused_starts += stats.refused_starts;

@@ -72,6 +72,8 @@ pub struct GcReport {
     pub deleted_snapshots: usize,
     /// Chains that this run retired.
     pub retired_chains: usize,
+    /// Retired chains that the stable HLC of this run leaves out.
+    pub stable_skipped: usize,
 }
 
 /// Dead objects of one kind, split by what this run does with them.
@@ -146,9 +148,9 @@ impl<R: Sweep + 'static> Engine<R> {
         }
 
         // The prune assumes no proxy clock is more than R behind the others.
-        let stable = self
-            .index()
-            .stable_hlc(self.config.retire_quiet().as_nanos() as u64)?;
+        let quiet = self.config.retire_quiet().as_nanos() as u64;
+        let (stable, left_out) = self.index().stable(quiet)?;
+        report.stable_skipped = left_out;
         let now = buffer::unix_nanos();
         if stable > now.saturating_add(retention) {
             warn!(

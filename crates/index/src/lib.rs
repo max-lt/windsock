@@ -799,6 +799,11 @@ impl Index {
     /// above its last HLC, and another entry, of another chain or later in the chain of the Retire,
     /// is at or above the Retire entry: the reader checks the quiet time and trusts no writer.
     pub fn stable_hlc(&self, quiet: u64) -> Result<u64> {
+        Ok(self.stable(quiet)?.0)
+    }
+
+    /// [`Index::stable_hlc`], and the count of retired chains that it leaves out.
+    pub fn stable(&self, quiet: u64) -> Result<(u64, usize)> {
         let frontiers = self.frontiers()?;
         let marks = self.retire_marks()?;
         let skipped = |node: &NodeId, frontier: &Frontier| {
@@ -813,6 +818,7 @@ impl Index {
                     })
             })
         };
+        let left_out = frontiers.iter().filter(|(n, f)| skipped(n, f)).count();
         let applied = frontiers
             .iter()
             .filter(|(node, frontier)| !skipped(node, frontier))
@@ -823,7 +829,7 @@ impl Index {
             acks.min().unwrap_or(e.hlc).min(e.hlc)
         });
 
-        Ok(applied.chain(pending).min().unwrap_or(0))
+        Ok((applied.chain(pending).min().unwrap_or(0), left_out))
     }
 
     /// Prunes every key with [`ObjectState::prune`]. Returns the number of keys changed or removed.

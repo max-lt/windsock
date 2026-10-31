@@ -1409,3 +1409,28 @@ fn test_open_future_is_send() {
     );
     send(&future);
 }
+
+/// A semaphore takes at most usize::MAX >> 3 permits: a larger budget must fail as a setting,
+/// not as a panic.
+#[tokio::test]
+async fn test_read_budget_over_its_cap_is_refused_at_open() {
+    let config = Config {
+        read_budget: 4_000_000_000_000_000_000,
+        ..Config::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = Engine::open(
+        dir.path(),
+        Arc::new(MemoryRemote::default()),
+        SigningKey::from_bytes(&[1; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config,
+    )
+    .await;
+
+    let Err(EngineError::Config(reason)) = result else {
+        panic!("a read budget over the cap opens");
+    };
+    assert!(reason.contains("read_budget"), "{reason}");
+}

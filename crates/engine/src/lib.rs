@@ -81,6 +81,9 @@ pub const MAX_ENTRY_ACTIONS: u64 = journal::MAX_ENTRY / 2;
 pub const MAX_PACK_TARGET: u64 = 128 * 1024 * 1024;
 /// The smallest read budget: 16 pieces of READ_STEP.
 pub const MIN_READ_BUDGET: u64 = 64 * 1024 * 1024;
+/// The largest read budget. A semaphore takes at most usize::MAX >> 3 permits, and no host needs
+/// more than this much memory for GET pieces.
+pub const MAX_READ_BUDGET: u64 = 1 << 40;
 /// The remote format of this build: each journal entry carries a MAC under the repository key, and
 /// signs the length of its sealed actions.
 const REMOTE_FORMAT: u32 = 4;
@@ -521,6 +524,12 @@ impl<R: Remote + 'static> Engine<R> {
             return Err(EngineError::Config(format!(
                 "read_budget ({}) is under {MIN_READ_BUDGET}: GETs would wait for each other with \
                  few pieces in flight",
+                config.read_budget
+            )));
+        }
+        if config.read_budget > MAX_READ_BUDGET {
+            return Err(EngineError::Config(format!(
+                "read_budget ({}) is over {MAX_READ_BUDGET} (1 TiB)",
                 config.read_budget
             )));
         }

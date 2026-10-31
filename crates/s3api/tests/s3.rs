@@ -2417,6 +2417,25 @@ async fn test_revoked_key_fails_at_the_next_request() {
 }
 
 #[tokio::test]
+async fn test_empty_secret_from_the_store_denies_the_request() {
+    let store = Arc::new(LiveKeys::default());
+    let server = with_key_store(store.clone()).await;
+    put(&server, "k", "data").await;
+    store
+        .keys
+        .lock()
+        .unwrap()
+        .insert(ACCESS.to_string(), String::new());
+
+    let mut get = call("GET", "/bkt/k");
+    get.secret = "";
+    let reply = run(&server, get).await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    assert_eq!(reply.xml("Code").unwrap(), "InvalidAccessKeyId");
+}
+
+#[tokio::test]
 async fn test_key_store_failure_denies_the_request_with_503() {
     let store = Arc::new(LiveKeys::default());
     let server = with_key_store(store.clone()).await;

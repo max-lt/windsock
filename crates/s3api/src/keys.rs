@@ -81,6 +81,14 @@ impl KeyStore for StaticKeys {
 /// The longest wait for one lookup: a store that hangs must not hold the connection.
 pub const KEY_STORE_DEADLINE: Duration = Duration::from_secs(2);
 
+fn unknown_key() -> S3Error {
+    S3Error::new(
+        "InvalidAccessKeyId",
+        StatusCode::FORBIDDEN,
+        "the access key does not exist",
+    )
+}
+
 fn unavailable() -> S3Error {
     S3Error::new(
         "ServiceUnavailable",
@@ -100,12 +108,16 @@ pub(crate) async fn secret_of(store: &dyn KeyStore, access_key: &str) -> Result<
         return Err(unavailable());
     };
     match answer {
+        // Anyone can sign with an empty secret: it is no key.
+        Ok(Some(secret)) if secret.expose().is_empty() => {
+            warn!(
+                access_key,
+                "key store gave an empty secret: the request is denied"
+            );
+            Err(unknown_key())
+        }
         Ok(Some(secret)) => Ok(secret),
-        Ok(None) => Err(S3Error::new(
-            "InvalidAccessKeyId",
-            StatusCode::FORBIDDEN,
-            "the access key does not exist",
-        )),
+        Ok(None) => Err(unknown_key()),
         Err(e) => {
             // The client sees no text of the store: it can name files or hosts.
             warn!(%e, "key store failed: the request is denied");

@@ -220,6 +220,13 @@ impl Config {
 
     /// Refuses a configuration whose [[keys]] do not fit `source`: one source of keys only.
     pub fn check_keys(&self, source: KeySource) -> Result<()> {
+        if self
+            .keys
+            .iter()
+            .any(|k| k.access_key.is_empty() || k.secret_key.expose().is_empty())
+        {
+            bail!("a [[keys]] entry has an empty access_key or secret_key");
+        }
         match (source, self.keys.is_empty()) {
             (KeySource::Config, true) => {
                 bail!("the configuration needs at least one [[keys]] entry")
@@ -413,6 +420,22 @@ mod tests {
         assert!(without.check_keys(KeySource::Store).is_ok());
         assert!(with.check_keys(KeySource::Config).is_ok());
         assert!(with.check_keys(KeySource::Store).is_err());
+    }
+
+    #[test]
+    fn test_empty_access_key_or_secret_is_refused() {
+        let key = |access: &str, secret: &str| {
+            let mut config = Config::local().unwrap();
+            config.keys = vec![KeyConfig {
+                access_key: access.into(),
+                secret_key: Secret(secret.into()),
+            }];
+            config
+        };
+
+        assert!(key("", "secret").check_keys(KeySource::Config).is_err());
+        assert!(key("AKID", "").check_keys(KeySource::Config).is_err());
+        assert!(key("AKID", "secret").check_keys(KeySource::Config).is_ok());
     }
 
     #[test]

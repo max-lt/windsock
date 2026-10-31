@@ -318,7 +318,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - A PUT with a Content-Length over 1 MiB, or with no Content-Length (a chunked or HTTP/2 body),
   writes its body to a spool file in the buffer as it arrives, in pieces of at most 1 MiB: it
   holds about 1 MiB of memory, and the peak for such PUTs is `max_connections` times 1 MiB. Its
-  spool file counts against the buffer limit as it grows. A smaller PUT goes through the buffer
+  spool file counts against the buffer limit as it grows. A PUT with a declared length takes the buffer room of
+  that length at its start: with no room, it gets `503 SlowDown` before its body is read. A smaller PUT goes through the buffer
   in one record, with the group fsync.
 - Every other request body is read whole into memory, up to a cap: 1 MiB for a PUT of an
   object, 4 MiB for an XML body (a POST or a bucket PUT), 64 KiB for any other request, a copy

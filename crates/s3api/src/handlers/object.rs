@@ -487,7 +487,13 @@ async fn streamed_put<R: Remote + 'static>(
     body: Body,
     streamed: StreamedBody,
 ) -> Result<ObjectInfo, S3Error> {
-    let mut spool = state.engine.begin_put(bucket, key, metadata, mode).await?;
+    // The room of a declared body is taken at once, so puts that start together cannot pass the
+    // buffer limit in the middle of their bodies.
+    let size = declared(&streamed);
+    let mut spool = state
+        .engine
+        .begin_put_sized(bucket, key, metadata, mode, size)
+        .await?;
     stream_body(
         state.max_body,
         body,

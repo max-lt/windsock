@@ -2174,6 +2174,43 @@ fn spool_files(server: &Server) -> usize {
         .map_or(0, |entries| entries.count())
 }
 
+/// Puts that start together take the room of their declared bodies at once: the one that the
+/// buffer cannot hold gets 503 before its body, not in the middle of it.
+#[tokio::test]
+async fn test_declared_puts_over_the_buffer_room_are_refused_at_the_start() {
+    let server = bucket_on(
+        server_with(Config {
+            buffer_limit: 8 * 1024 * 1024,
+            ..Config::default()
+        })
+        .await,
+    )
+    .await;
+    let declared = (6u64 * 1024 * 1024).to_string();
+    let mut first = call("PUT", "/bkt/first").header("content-length", declared.clone());
+    first.payload_hash = Some(sigv4::UNSIGNED_PAYLOAD.to_string());
+    let (parts, _) = first.request().into_parts();
+    let stalled =
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+    let app = server.app.clone();
+    let held = tokio::spawn(app.oneshot(Request::from_parts(parts, stalled)));
+    while spool_files(&server) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let second = call("PUT", "/bkt/second").header("content-length", declared);
+    let (reply, taken) = send_counted(&server, second, 6 * 1024 * 1024).await;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        reply.text()
+    );
+    assert_eq!(taken, 0);
+    held.abort();
+}
+
 #[tokio::test]
 async fn test_large_put_streams_through_a_spool_file() {
     let server = with_bucket().await;

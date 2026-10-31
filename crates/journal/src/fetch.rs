@@ -13,6 +13,14 @@ use crate::{ChainError, Entry, EntryHead, MAX_ENTRY, MAX_HEADER, TAIL_LEN, WireE
 /// Reads of one entry. A prune replaces an entry once, so a second change means a fault.
 const ATTEMPTS: u32 = 3;
 
+/// The longest ranged read of the actions of an entry: each read must finish in one attempt of
+/// the remote client, also on a slow link.
+const ACTIONS_RANGE: u64 = if cfg!(test) {
+    100_000
+} else {
+    64 * 1024 * 1024
+};
+
 /// Why a reader refuses the object at an entry key.
 pub(crate) enum Refused {
     Wire(WireError),
@@ -136,11 +144,15 @@ async fn attempt<R: Remote>(
             sealed.extend_from_slice(
                 &prefix[head.header_len() as usize..tail_start.min(MAX_HEADER) as usize],
             );
-            if tail_start > MAX_HEADER {
-                let Some(rest) = part(remote, key, MAX_HEADER..tail_start).await? else {
+            // The MAC passed, so the signed length sizes the buffer.
+            let mut start = MAX_HEADER;
+            while start < tail_start {
+                let end = start.saturating_add(ACTIONS_RANGE).min(tail_start);
+                let Some(piece) = part(remote, key, start..end).await? else {
                     return Ok(None);
                 };
-                sealed.extend_from_slice(&rest);
+                sealed.extend_from_slice(&piece);
+                start = end;
             }
             Some(sealed)
         }
@@ -492,8 +504,33 @@ mod tests {
 
         assert_eq!(read, vec![entry]);
         let reads = remote.reads_of(&key);
-        let rest = wire.len() as u64 - MAX_HEADER - TAIL_LEN;
-        assert_eq!(reads, vec![0, MAX_HEADER, TAIL_LEN, rest]);
+        assert_eq!(reads[..3], [0, MAX_HEADER, TAIL_LEN]);
+        assert_eq!(reads.iter().sum::<u64>(), wire.len() as u64);
+    }
+
+    /// The rest of a large entry comes in ranges of at most ACTIONS_RANGE: no single read must
+    /// carry the whole entry in one attempt of the remote client.
+    #[tokio::test]
+    async fn test_rest_of_a_large_entry_comes_in_bounded_ranges() {
+        let remote = Arc::new(Served::default());
+        let entry = first(600_000, 2, &test_sealer());
+        let wire = entry.to_wire();
+        let key = entry_key(node(), 0);
+        remote
+            .inner
+            .put(&key, Bytes::from(wire.clone()))
+            .await
+            .unwrap();
+
+        let read = reader(&remote).sync_node(node()).await.unwrap();
+
+        assert_eq!(read, vec![entry]);
+        let reads = remote.reads_of(&key);
+        assert!(reads.len() > 4, "{reads:?}");
+        assert!(
+            reads[3..].iter().all(|len| *len <= ACTIONS_RANGE),
+            "{reads:?}"
+        );
         assert_eq!(reads.iter().sum::<u64>(), wire.len() as u64);
     }
 

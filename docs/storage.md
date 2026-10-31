@@ -305,10 +305,10 @@ markers cost 360 LIST. The GC run (1 h by default) adds 1 LIST and 1 GET for eac
 audit LIST starts after the last entry read (`start-after`), so it returns the new entries only,
 in pages of 1000, also for a chain with millions of entries.
 
-An entry of at most 64 KiB (`MAX_HEADER`) costs 1 GET. A larger entry costs 4 requests: a GET
-that the size stops before its body, a ranged GET of the first 64 KiB (the header), a ranged GET
-of the last 96 bytes (the signature and the MAC), and, after the MAC check, a ranged GET of the
-rest of the actions. Before the tail, the reader checks the node and the seq of the header
+An entry of at most 64 KiB (`MAX_HEADER`) costs 1 GET. A larger entry costs 4 requests or more: a
+GET that the size stops before its body, a ranged GET of the first 64 KiB (the header), a ranged
+GET of the last 96 bytes (the signature and the MAC), and, after the MAC check, ranged GETs of the
+rest of the actions, 64 MiB each at most, so each GET fits in one attempt of the client. Before the tail, the reader checks the node and the seq of the header
 against the key, and the length of the actions against the signed length. A reader thus reads
 the actions once. Each answer must have the length of
 its range. When the parts do not fit together, the object changed between two reads: the read

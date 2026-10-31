@@ -206,6 +206,7 @@ async fn test_list_page_is_capped_whatever_max_the_caller_asks() {
         .list("demo", "", first.next.as_deref(), usize::MAX)
         .await
         .unwrap();
+    let empty = node.list("demo", "", None, 0).await;
     daemon.abort();
 
     assert_eq!(windsockd::MAX_PAGE, 1000);
@@ -213,4 +214,6 @@ async fn test_list_page_is_capped_whatever_max_the_caller_asks() {
     assert_eq!(first.next.as_deref(), Some("k00999"));
     assert_eq!(rest.objects.len(), 1);
     assert_eq!(rest.next, None);
+    // A page of 0 objects with no next key would look like the end of the listing.
+    assert!(empty.is_err(), "{empty:?}");
 }

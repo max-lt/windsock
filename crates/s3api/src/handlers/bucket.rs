@@ -132,7 +132,8 @@ async fn list_objects<R: Remote + 'static>(
         delimiter: delimiter.as_deref().map(encode),
         max_keys,
         encoding_type: encoding_type.clone(),
-        is_truncated: page.truncated,
+        // As S3: max-keys=0 gives an empty page that is not truncated, so no client loops on it.
+        is_truncated: page.truncated && max_keys > 0,
         objects: Vec::new(),
         common_prefixes: Vec::new(),
     };

@@ -146,6 +146,11 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
         after: Option<&str>,
         max: usize,
     ) -> Result<Page, EngineError> {
+        if max == 0 {
+            return Err(EngineError::InvalidArgument(
+                "max must be at least 1: a page of 0 objects has no next key".into(),
+            ));
+        }
         let query = ListQuery {
             prefix,
             delimiter: None,

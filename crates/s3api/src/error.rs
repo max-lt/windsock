@@ -92,6 +92,7 @@ impl From<EngineError> for S3Error {
             EngineError::BucketNotEmpty(_) => ("BucketNotEmpty", StatusCode::CONFLICT),
             EngineError::InvalidBucketName(_) => ("InvalidBucketName", StatusCode::BAD_REQUEST),
             EngineError::InvalidKey(_) => ("KeyTooLongError", StatusCode::BAD_REQUEST),
+            EngineError::InvalidArgument(_) => ("InvalidArgument", StatusCode::BAD_REQUEST),
             EngineError::PreconditionFailed { .. } => {
                 ("PreconditionFailed", StatusCode::PRECONDITION_FAILED)
             }

@@ -854,6 +854,21 @@ async fn test_list_v2_pages_with_continuation_tokens() {
 }
 
 #[tokio::test]
+async fn test_list_with_max_keys_0_is_an_empty_page_that_is_not_truncated() {
+    let server = with_bucket().await;
+    put(&server, "a", "1").await;
+
+    for uri in ["/bkt?list-type=2&max-keys=0", "/bkt?max-keys=0"] {
+        let reply = run(&server, call("GET", uri)).await;
+
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
+        assert_eq!(reply.xml("IsTruncated").as_deref(), Some("false"), "{uri}");
+        assert!(reply.xml("Contents").is_none(), "{uri}");
+        assert!(reply.xml("NextContinuationToken").is_none(), "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn test_list_v2_start_after() {
     let server = listing_fixture().await;
 

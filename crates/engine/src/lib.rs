@@ -98,6 +98,9 @@ pub enum EngineError {
     InvalidBucketName(String),
     #[error("invalid key: {0:?}")]
     InvalidKey(String),
+    /// An argument of a call that the engine or its host API refuses.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("no such bucket: {0}")]
     NoSuchBucket(String),
     #[error("no such key: {bucket}/{key}")]

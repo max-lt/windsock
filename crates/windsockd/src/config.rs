@@ -141,6 +141,9 @@ pub struct GcConfig {
     pub late_margin_secs: u64,
     /// The GC writes a snapshot when the latest one is this old.
     pub snapshot_interval_secs: u64,
+    /// The GC retires each chain with no entry for max(R, H) + M, so writers leave it out of their
+    /// seen. Off by default.
+    pub retire_chains: bool,
 }
 
 impl Default for GcConfig {
@@ -152,6 +155,7 @@ impl Default for GcConfig {
             retention_secs: 24 * 3600,
             late_margin_secs: 3600,
             snapshot_interval_secs: 24 * 3600,
+            retire_chains: false,
         }
     }
 }
@@ -257,6 +261,7 @@ impl Config {
             retention: Duration::from_secs(self.gc.retention_secs),
             late_margin: Duration::from_secs(self.gc.late_margin_secs),
             snapshot_interval: Duration::from_secs(self.gc.snapshot_interval_secs),
+            retire_chains: self.gc.retire_chains,
             ..engine::Config::default()
         }
     }

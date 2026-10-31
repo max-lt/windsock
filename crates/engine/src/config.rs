@@ -86,6 +86,9 @@ pub struct Config {
     /// Pieces that a GET of the remote reads ahead of the piece that it sends. 0 turns read-ahead
     /// off; at most [`crate::MAX_READ_AHEAD`].
     pub read_ahead: usize,
+    /// The GC retires each chain with no entry for the quiet time, so writers can leave it out
+    /// of their seen. Off until the model check of the rules passes at its final bounds.
+    pub retire_chains: bool,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
     pub default_policy: Policy,
@@ -109,6 +112,7 @@ impl Default for Config {
             max_entry_actions: 256 * 1024 * 1024,
             read_budget: 1024 * 1024 * 1024,
             read_ahead: 3,
+            retire_chains: false,
             policies: Vec::new(),
             default_policy: Policy::default(),
         }
@@ -116,6 +120,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The quiet time Q of a chain before the GC retires it: after it, each buffered write of
+    /// that chain is past the late limit and each of its plans is past H/2, so its next entry
+    /// can only hold a fresh write.
+    pub fn retire_quiet(&self) -> Duration {
+        self.retention.max(self.gc_horizon) + self.late_margin
+    }
+
     /// A buffered write older than this at flush is not committed: a prune may have removed a
     /// newer delete of its key. A prune keeps every version younger than R on the clock of the
     /// GC runner, so the limit is R less the clock skew that `late_margin` allows.

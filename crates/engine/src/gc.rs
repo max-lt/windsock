@@ -16,6 +16,9 @@ use crate::{
     Engine, EngineError, MANIFESTS_PREFIX, PACKS_PREFIX, Result, buffer, manifest_key, pack_key,
 };
 
+/// Chains that one Retire entry retires: 500 links of at most 74 bytes fit in the 64 KiB header.
+const RETIRE_BATCH: usize = 500;
+
 /// The monotonic time at which this process first saw each object that waits for a delete. The
 /// wall clock of the GC host alone can step ahead: a delete also waits H on this clock.
 #[derive(Default)]
@@ -67,6 +70,8 @@ pub struct GcReport {
     pub redacted_entries: usize,
     /// Old snapshots deleted with all their parts.
     pub deleted_snapshots: usize,
+    /// Chains that this run retired.
+    pub retired_chains: usize,
 }
 
 /// Dead objects of one kind, split by what this run does with them.
@@ -169,6 +174,9 @@ impl<R: Sweep + 'static> Engine<R> {
                 Err(e) => return Err(e),
             }
         }
+        if self.config.retire_chains {
+            report.retired_chains = self.retire_quiet_chains(started).await?;
+        }
         let (redacted, loaded) = self.prune_journal().await?;
         report.redacted_entries = redacted;
         report.deleted_snapshots = self.delete_old_snapshots(loaded).await?;
@@ -239,6 +247,55 @@ impl<R: Sweep + 'static> Engine<R> {
         self.gc_waits.keep(prefix, &condemned);
 
         Ok(dead)
+    }
+
+    /// Retires each other chain with no entry for the quiet time at `now`. An entry retires at
+    /// most RETIRE_BATCH chains and lists only them in its seen: its header stays small, also
+    /// when the full seen is over the header limit.
+    async fn retire_quiet_chains(&self, now: u64) -> Result<usize> {
+        let quiet = self.config.retire_quiet().as_nanos() as u64;
+        let mut retired: BTreeMap<model::NodeId, u64> = BTreeMap::new();
+        for mark in self.index().retire_marks()? {
+            let upto = retired.entry(mark.node).or_default();
+            *upto = (*upto).max(mark.upto);
+        }
+        let quiet_chains: Vec<_> = self
+            .index()
+            .frontiers()?
+            .into_iter()
+            .filter(|(node, frontier)| {
+                *node != self.node
+                    && frontier.next_seq > 0
+                    && retired.get(node).copied().unwrap_or(0) < frontier.next_seq
+                    && frontier.last_hlc.saturating_add(quiet) <= now
+            })
+            .collect();
+        for batch in quiet_chains.chunks(RETIRE_BATCH) {
+            let mut seen = journal::Seen::new();
+            let mut actions = Vec::new();
+            for (node, frontier) in batch {
+                let link = journal::Link {
+                    seq: frontier.next_seq - 1,
+                    hash: frontier.last_hash,
+                };
+                seen.insert(*node, link);
+                actions.push(Action::Retire {
+                    node: *node,
+                    upto: frontier.next_seq,
+                });
+            }
+            let mut journal = self.journal.lock().await;
+            let entry = journal
+                .append(actions, seen)
+                .await
+                .map_err(EngineError::from)?;
+            self.apply_own(&mut journal, entry).await?;
+            info!(
+                chains = batch.len(),
+                "retired chains with no entry for the quiet time"
+            );
+        }
+        Ok(quiet_chains.len())
     }
 
     /// Writes the condemn in entries of at most `max_entry_actions` bytes: one large entry

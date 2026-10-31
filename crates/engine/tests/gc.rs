@@ -895,3 +895,104 @@ async fn test_version_prune_drops_an_old_version_with_live_chains_only() {
 async fn test_stopped_chain_does_not_block_the_version_prune() {
     assert_eq!(prune_with(true).await, 1);
 }
+
+/// The seen of the last entry of `engine` in the remote.
+async fn last_seen(remote: &TestRemote, engine: &Engine<TestRemote>) -> journal::Seen {
+    let prefix = format!("{}{}/", journal::LOG_PREFIX, engine.node());
+    let mut keys = remote.inner.list(&prefix).await.unwrap();
+    keys.sort();
+    let bytes = remote
+        .inner
+        .get(keys.last().unwrap(), u64::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+    let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    journal::Entry::from_wire(&bytes, keys.sealer())
+        .unwrap()
+        .seen
+}
+
+/// Proxy b writes once and stops; proxy a runs the GC after `quiet`, with the retire setting
+/// `retire`, then writes once. The retired chain count and the seen of that write.
+async fn retire_after(quiet: Duration, retire: bool) -> (usize, bool) {
+    let remote = Arc::new(TestRemote::new());
+    let config = Config {
+        retire_chains: retire,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let b = proxy(&remote, 2).await;
+    put(&b.engine, "other", b"b").await;
+    b.engine.flush().await.unwrap();
+    let stopped = b.engine.node();
+    drop(b);
+
+    advance(quiet);
+    let report = a.engine.gc().await.unwrap();
+    put(&a.engine, "k", b"v").await;
+    a.engine.flush().await.unwrap();
+    let listed = last_seen(&remote, &a.engine).await.contains_key(&stopped);
+    (report.retired_chains, listed)
+}
+
+#[tokio::test]
+async fn test_gc_retires_a_chain_quiet_for_q_and_writers_leave_it_out() {
+    // Q is max(R, H) + M: here max(1 s, 0.6 s) + 0.
+    let past = SHORT_RETENTION + Duration::from_millis(500);
+    assert_eq!(retire_after(past, true).await, (1, false));
+}
+
+#[tokio::test]
+async fn test_gc_keeps_a_chain_that_is_not_quiet_for_q() {
+    let early = SHORT_RETENTION - Duration::from_millis(300);
+    assert_eq!(retire_after(early, true).await, (0, true));
+}
+
+#[tokio::test]
+async fn test_gc_retires_nothing_with_the_setting_off() {
+    let past = SHORT_RETENTION + Duration::from_millis(500);
+    assert_eq!(retire_after(past, false).await, (0, true));
+}
+
+/// With more chains than one header holds, a flush stops before its plan. The GC can still retire
+/// them: each Retire entry lists only the chains that it retires, at most 500, so its header
+/// stays small. After that, the flush writes.
+#[tokio::test]
+async fn test_gc_retires_chains_in_batches_when_the_header_guard_trips() {
+    let remote = Arc::new(TestRemote::new());
+    let config = Config {
+        retire_chains: true,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    for n in 0..1100u32 {
+        let key = SigningKey::from_bytes(blake3::hash(&n.to_le_bytes()).as_bytes());
+        let mut chain = journal::Journal::new(
+            remote.clone(),
+            key,
+            keys.sealer().clone(),
+            Default::default(),
+        );
+        chain
+            .append(Vec::new(), journal::Seen::new())
+            .await
+            .unwrap();
+    }
+    a.engine.sync().await.unwrap();
+
+    advance(SHORT_RETENTION + Duration::from_millis(500));
+    let report = a.engine.gc().await.unwrap();
+    // Before the retire, this flush fails with HeaderTooLarge (flush_faults.rs).
+    put(&a.engine, "k", b"v").await;
+    let flushed = a.engine.flush().await;
+
+    assert_eq!(report.retired_chains, 1100);
+    assert!(flushed.is_ok(), "{flushed:?}");
+    assert!(last_seen(&remote, &a.engine).await.len() < 10);
+}

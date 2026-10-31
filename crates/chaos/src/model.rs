@@ -30,10 +30,20 @@ pub struct Counts {
 #[derive(Default)]
 pub struct Model {
     inner: Mutex<(BTreeMap<String, BTreeSet<Value>>, Counts)>,
+    /// Each value that a key ever had or may have had: a copy can read any of them on a proxy that
+    /// is behind.
+    history: Mutex<BTreeMap<String, BTreeSet<Value>>>,
 }
 
 impl Model {
     pub fn record(&self, key: &str, value: Value, outcome: Outcome) {
+        if outcome != Outcome::Refused {
+            let mut history = self
+                .history
+                .lock()
+                .expect("no panic while the lock is held");
+            history.entry(key.to_string()).or_default().insert(value);
+        }
         let mut inner = self.inner.lock().expect("no panic while the lock is held");
         let (allowed, counts) = &mut *inner;
         counts.ops += 1;
@@ -54,6 +64,38 @@ impl Model {
             }
             Outcome::Refused => counts.refused += 1,
         }
+    }
+
+    /// A copy of `source` to `key`. An acked copy gives the value that its ETag names. A copy that
+    /// may have had an effect adds each value that `source` ever had.
+    pub fn record_copy(&self, key: &str, source: &str, value: Value, outcome: Outcome) {
+        if let (Outcome::Acked, Some(_)) | (Outcome::Refused, _) = (outcome, value) {
+            return self.record(key, value, outcome);
+        }
+        let sources = {
+            let history = self
+                .history
+                .lock()
+                .expect("no panic while the lock is held");
+            let all = history.get(source).cloned().unwrap_or_default();
+            // A copy of no object fails: it never removes the target.
+            all.into_iter()
+                .filter(Option::is_some)
+                .collect::<BTreeSet<_>>()
+        };
+        let mut inner = self.inner.lock().expect("no panic while the lock is held");
+        let (allowed, counts) = &mut *inner;
+        counts.ops += 1;
+        counts.unknown += 1;
+        let allowed = allowed
+            .entry(key.to_string())
+            .or_insert_with(|| BTreeSet::from([None]));
+        allowed.extend(sources.iter().copied());
+        let mut history = self
+            .history
+            .lock()
+            .expect("no panic while the lock is held");
+        history.entry(key.to_string()).or_default().extend(sources);
     }
 
     pub fn allowed(&self) -> BTreeMap<String, BTreeSet<Value>> {
@@ -147,6 +189,21 @@ mod tests {
         model.record("k", None, Outcome::Acked);
 
         assert_eq!(model.allowed()["k"], BTreeSet::from([None]));
+    }
+
+    #[test]
+    fn test_copy_with_no_answer_allows_each_value_of_the_source() {
+        let model = Model::default();
+        model.record("src", digest(b"a"), Outcome::Acked);
+        model.record("src", digest(b"b"), Outcome::Acked);
+        model.record("dst", digest(b"c"), Outcome::Acked);
+
+        model.record_copy("dst", "src", None, Outcome::Unknown);
+        model.record_copy("other", "src", digest(b"b"), Outcome::Acked);
+
+        let want = BTreeSet::from([digest(b"a"), digest(b"b"), digest(b"c")]);
+        assert_eq!(model.allowed()["dst"], want);
+        assert_eq!(model.allowed()["other"], BTreeSet::from([digest(b"b")]));
     }
 
     #[test]

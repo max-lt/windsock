@@ -30,6 +30,9 @@ use proxy::{BUCKET, HORIZON, Proxy};
 use s3::Outcome;
 
 const WORKERS: u64 = 6;
+/// The keys of each worker that get large objects: several read pieces, so GETs read ahead.
+const BIG_KEYS: u64 = 4;
+const BIG_SIZES: [usize; 2] = [12 << 20, 24 << 20];
 /// Log lines that a soak must never show.
 const ALARMS: [&str; 6] = [
     "chain is broken",
@@ -105,7 +108,9 @@ async fn worker(
         let key = format!("w{w}/k{}", rng.below(40));
         let path = format!("/{BUCKET}/{key}");
         let level = pressure.level();
-        let write = match rng.weighted(&[40, 20, 10, 10, 5, 15]) {
+        let big = format!("w{w}/b{}", rng.below(BIG_KEYS));
+        let big_path = format!("/{BUCKET}/{big}");
+        let write = match rng.weighted(&[40, 20, 10, 10, 5, 15, 3, 5, 4, 2]) {
             0 => {
                 let size = *rng.pick(&[0, 1, 100, 4096, 65536, 300_000, 2_000_000]);
                 let data = rng.bytes(size);
@@ -130,7 +135,7 @@ async fn worker(
                 let count = 1 + rng.below(3);
                 let parts: Vec<Bytes> = (0..count)
                     .map(|_| {
-                        let size = *rng.pick(&[1, 70_000, 1_100_000]);
+                        let size = *rng.pick(&[1, 70_000, 1_100_000, 6_000_000]);
                         Bytes::from(rng.bytes(size))
                     })
                     .collect();
@@ -141,8 +146,36 @@ async fn worker(
                 }
                 outcome
             }
-            _ => {
+            5 => {
                 let _ = p.s3.get_range(&path, "bytes=10-5000").await;
+                None
+            }
+            6 => {
+                let size = *rng.pick(&BIG_SIZES);
+                let data = rng.bytes(size);
+                let (value, outcome) =
+                    (digest(&data), p.s3.put(&big_path, Bytes::from(data)).await);
+                model.record(&big, value, outcome);
+                Some(outcome)
+            }
+            7 => {
+                let source = match rng.below(2) {
+                    0 => big.clone(),
+                    _ => format!("w{w}/k{}", rng.below(40)),
+                };
+                let (outcome, value) = p.s3.copy(&path, &format!("/{BUCKET}/{source}")).await;
+                model.record_copy(&key, &source, value, outcome);
+                Some(outcome)
+            }
+            // A cold read with read-ahead, by a client that goes away at a random point.
+            8 => {
+                let _ =
+                    p.s3.get_part(&big_path, rng.below(BIG_SIZES[1] as u64))
+                        .await;
+                None
+            }
+            _ => {
+                let _ = p.s3.get(&big_path).await;
                 None
             }
         };

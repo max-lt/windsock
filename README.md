@@ -392,8 +392,10 @@ gives the journal a manual clock. To test the daemon as it ships, with no `sim`,
 `cargo test -p windsockd`.
 
 The chaos soak runs 3 daemons on one directory remote under mixed S3 traffic, with kills,
-restarts, a full disk under the buffer and the index, and a stop longer than H. At the end, every
-proxy must read the same value for each key, and one that the acks allow. It needs macOS
+restarts, a full disk under the buffer and the index, and a stop longer than H. The traffic holds
+puts up to 24 MiB, multipart uploads with parts up to 6 MB, copies, and GETs of large objects that
+read ahead, some by clients that go away at a random point. At the end, every proxy must read the
+same value for each key, and one that the acks allow. It needs macOS
 (`hdiutil`), `rsync` and `lsof`, and exits 1 when a check fails:
 
 ```bash

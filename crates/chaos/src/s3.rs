@@ -64,15 +64,15 @@ impl S3 {
         }
     }
 
-    /// Sends one signed request. `query` is canonical: sorted, already encoded.
-    pub async fn send(
+    /// One signed request. `query` is canonical: sorted, already encoded.
+    fn request(
         &self,
         method: &str,
         path: &str,
         query: &str,
         extra: &[(&str, String)],
         body: Bytes,
-    ) -> Result<Reply, Failure> {
+    ) -> Result<Request<Full<Bytes>>, Failure> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -106,11 +106,22 @@ impl S3 {
         for (name, value) in &headers {
             request = request.header(name.as_str(), value.as_str());
         }
-        let request = request
+        request
             .header("authorization", authorization)
             .body(Full::new(body))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    }
 
+    /// Sends one signed request and reads all of its answer.
+    pub async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        extra: &[(&str, String)],
+        body: Bytes,
+    ) -> Result<Reply, Failure> {
+        let request = self.request(method, path, query, extra, body)?;
         let call = async {
             let response = self
                 .client
@@ -155,6 +166,44 @@ impl S3 {
     pub async fn get_range(&self, path: &str, range: &str) -> Result<Reply, Failure> {
         let extra = [("range", range.to_string())];
         self.send("GET", path, "", &extra, Bytes::new()).await
+    }
+
+    /// A GET that stops to read after `keep` bytes and drops the connection, as a client that
+    /// goes away. Returns the bytes read.
+    pub async fn get_part(&self, path: &str, keep: u64) -> Result<u64, Failure> {
+        let request = self.request("GET", path, "", &[], Bytes::new())?;
+        let call = async {
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut body = response.into_body();
+            let mut read = 0;
+            while read < keep {
+                let Some(frame) = body.frame().await else {
+                    break;
+                };
+                let frame = frame.map_err(|e| e.to_string())?;
+                read += frame.data_ref().map_or(0, |data| data.len() as u64);
+            }
+            Ok(read)
+        };
+        tokio::time::timeout(Duration::from_secs(30), call)
+            .await
+            .map_err(|_| "no answer in 30 s".to_string())?
+    }
+
+    /// A CopyObject of `source` (`/bucket/key`) to `path`, and the blake3 that its ETag names.
+    pub async fn copy(&self, path: &str, source: &str) -> (Outcome, Option<[u8; 16]>) {
+        let extra = [("x-amz-copy-source", source.to_string())];
+        match self.send("PUT", path, "", &extra, Bytes::new()).await {
+            Ok(reply) => {
+                let etag = tag(&reply.body, "ETag");
+                (reply.outcome(), etag.as_deref().and_then(etag_hash))
+            }
+            Err(_) => (Outcome::Unknown, None),
+        }
     }
 
     pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Reply, Failure> {
@@ -207,6 +256,17 @@ fn tag(body: &[u8], name: &str) -> Option<String> {
     Some(text[start..end].to_string())
 }
 
+/// The first 16 bytes of the blake3 hex in an ETag, quoted or not.
+fn etag_hash(etag: &str) -> Option<[u8; 16]> {
+    let hex = etag.replace("&quot;", "");
+    let hex = hex.trim_matches('"');
+    let mut out = [0; 16];
+    for (n, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * n..2 * n + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 fn encode(value: &str) -> String {
     sigv4::uri_encode(value.as_bytes(), sigv4::Slash::Encode)
 }
@@ -221,6 +281,16 @@ mod tests {
 
         assert_eq!(tag(body, "UploadId").as_deref(), Some("abc"));
         assert_eq!(tag(body, "Key"), None);
+    }
+
+    #[test]
+    fn test_etag_hash_reads_a_quoted_hex_etag() {
+        let hex = blake3::hash(b"a").to_hex().to_string();
+        let want: [u8; 16] = blake3::hash(b"a").as_bytes()[..16].try_into().unwrap();
+
+        assert_eq!(etag_hash(&format!("&quot;{hex}&quot;")), Some(want));
+        assert_eq!(etag_hash(&format!("\"{hex}\"")), Some(want));
+        assert_eq!(etag_hash("\"xyz\""), None);
     }
 
     #[test]

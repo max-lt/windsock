@@ -1,7 +1,9 @@
 //! Model check of the pack sweep: a condemn in the journal, a delete after a horizon.
 //!
 //! Writers put objects. A put either dedups against a pack its index knows, or
-//! uploads a fresh pack: a fresh upload always gets a new pack id. The GC
+//! uploads a fresh pack: a fresh upload always gets a new pack id. A copy dedups
+//! against the pack of the current source object and uploads a fresh manifest
+//! before its entry: an aborted copy leaves that manifest with no entry. The GC
 //! appends one condemn for a pack that no current object uses, and deletes the
 //! pack later. A writer that applies a condemn never learns the pack again. A
 //! put from a writer that did not know the condemn can still name the pack: the
@@ -17,9 +19,19 @@ use stateright::{Model, Property};
 /// condemn has one: two puts at different times are one state.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Entry {
-    Put { key: u8, pack: u8 },
-    Delete { key: u8 },
-    Condemn { pack: u8, at: u8 },
+    Put {
+        key: u8,
+        pack: u8,
+        /// The fresh manifest of a copy. The GC sweeps it as it sweeps a pack.
+        manifest: Option<u8>,
+    },
+    Delete {
+        key: u8,
+    },
+    Condemn {
+        pack: u8,
+        at: u8,
+    },
 }
 
 /// A put between its plan and its entry. It survives a crash, as the intent file does.
@@ -27,6 +39,7 @@ pub enum Entry {
 pub struct Plan {
     pub key: u8,
     pub pack: u8,
+    pub manifest: Option<u8>,
     pub at: u8,
 }
 
@@ -52,9 +65,9 @@ pub struct Writer {
 pub struct State {
     pub time: u8,
     pub log: Vec<Entry>,
-    /// Packs in the remote, as a bitmask over pack ids.
+    /// Packs and copy manifests in the remote, as a bitmask over their ids.
     pub packs: u8,
-    /// Pack ids issued so far. The next fresh upload gets this id.
+    /// Ids issued so far. The next fresh upload gets this id.
     pub issued: u8,
     pub writers: Vec<Writer>,
     pub gc: Reader,
@@ -79,9 +92,12 @@ fn head(view: &[Entry], key: u8) -> Option<Entry> {
     })
 }
 
-/// A current object uses `pack`.
-fn is_live(view: &[Entry], keys: u8, pack: u8) -> bool {
-    (0..keys).any(|key| head(view, key) == Some(Entry::Put { key, pack }))
+/// A current object uses `id`, as its pack or as its manifest.
+fn is_live(view: &[Entry], keys: u8, id: u8) -> bool {
+    (0..keys).any(|key| match head(view, key) {
+        Some(Entry::Put { pack, manifest, .. }) => pack == id || manifest == Some(id),
+        _ => false,
+    })
 }
 
 /// The time of the condemn of `pack`.
@@ -125,12 +141,20 @@ pub const SAFE: Rules = Rules {
     sweep_after_horizon: true,
 };
 
+/// The puts that writers make. Each check turns on a part, to keep its state space small.
+#[derive(Clone, Copy, Debug)]
+pub struct Puts {
+    pub dedup: bool,
+    pub copy: bool,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Action {
     Tick,
     Sync { writer: usize },
     PlanDedup { writer: usize, key: u8, pack: u8 },
     PlanFresh { writer: usize, key: u8 },
+    PlanCopy { writer: usize, key: u8, source: u8 },
     Commit { writer: usize },
     Abort { writer: usize },
     Delete { key: u8 },
@@ -150,10 +174,13 @@ pub struct GcModel {
     pub max_packs: u8,
     pub max_crashes: u8,
     pub rules: Rules,
+    pub puts: Puts,
 }
 
 /// Name of the property that a missing rule breaks.
 pub const READABLE: &str = "every current object is readable";
+/// The same property for the objects that a copy wrote, so that a loss shows the copy path.
+pub const COPY_READABLE: &str = "every current copy is readable";
 
 impl GcModel {
     fn half(&self) -> u8 {
@@ -178,6 +205,35 @@ impl GcModel {
         s.writers[writer].plan = Some(Plan {
             key,
             pack,
+            manifest: None,
+            at: s.time,
+        });
+        true
+    }
+
+    /// A copy names the pack of the current source in the writer index, and a fresh manifest.
+    fn plan_copy(&self, s: &mut State, writer: usize, key: u8, source: u8) -> bool {
+        let w = &s.writers[writer];
+        let view = s.view(w.reader);
+        let Some(Entry::Put { pack, .. }) = head(view, source) else {
+            return false;
+        };
+
+        if w.plan.is_some() || s.issued >= self.max_packs || !is_known(view, pack) {
+            return false;
+        }
+
+        if self.rules.fresh_sync && !self.younger_than_half(s.time, w.reader.synced_at) {
+            return false;
+        }
+
+        let manifest = s.issued;
+        s.issued += 1;
+        s.packs |= bit(manifest);
+        s.writers[writer].plan = Some(Plan {
+            key,
+            pack,
+            manifest: Some(manifest),
             at: s.time,
         });
         true
@@ -194,6 +250,7 @@ impl GcModel {
         s.writers[writer].plan = Some(Plan {
             key,
             pack,
+            manifest: None,
             at: s.time,
         });
         true
@@ -215,6 +272,7 @@ impl GcModel {
         s.log.push(Entry::Put {
             key: plan.key,
             pack: plan.pack,
+            manifest: plan.manifest,
         });
         s.writers[writer].plan = None;
         true
@@ -299,8 +357,19 @@ impl Model for GcModel {
 
             for key in 0..self.keys {
                 actions.push(Action::PlanFresh { writer, key });
-                for pack in 0..state.issued {
-                    actions.push(Action::PlanDedup { writer, key, pack });
+                if self.puts.dedup {
+                    for pack in 0..state.issued {
+                        actions.push(Action::PlanDedup { writer, key, pack });
+                    }
+                }
+                if self.puts.copy {
+                    for source in 0..self.keys {
+                        actions.push(Action::PlanCopy {
+                            writer,
+                            key,
+                            source,
+                        });
+                    }
                 }
             }
 
@@ -337,6 +406,11 @@ impl Model for GcModel {
             }
             Action::PlanDedup { writer, key, pack } => self.plan_dedup(&mut s, writer, key, pack),
             Action::PlanFresh { writer, key } => self.plan_fresh(&mut s, writer, key),
+            Action::PlanCopy {
+                writer,
+                key,
+                source,
+            } => self.plan_copy(&mut s, writer, key, source),
             Action::Commit { writer } => self.commit(&mut s, writer),
             Action::Abort { writer } => s.writers[writer].plan.take().is_some(),
             Action::Delete { key } => {
@@ -360,10 +434,60 @@ impl Model for GcModel {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
+        let mut properties = self.base_properties();
+        if self.puts.copy {
+            properties.push(Property::always(COPY_READABLE, |m: &Self, s: &State| {
+                (0..m.keys).all(|key| match head(&s.log, key) {
+                    Some(Entry::Put {
+                        pack,
+                        manifest: Some(manifest),
+                        ..
+                    }) => s.packs & bit(pack) != 0 && s.packs & bit(manifest) != 0,
+                    _ => true,
+                })
+            }));
+            properties.push(Property::sometimes(
+                "a copy commits",
+                |_: &Self, s: &State| {
+                    s.log.iter().any(|e| {
+                        matches!(
+                            e,
+                            Entry::Put {
+                                manifest: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                },
+            ));
+            properties.push(Property::sometimes(
+                "an object that no entry names is swept",
+                |_: &Self, s: &State| {
+                    (0..s.issued).any(|id| {
+                        s.packs & bit(id) == 0
+                            && !s.log.iter().any(|e| match *e {
+                                Entry::Put { pack, manifest, .. } => {
+                                    pack == id || manifest == Some(id)
+                                }
+                                _ => false,
+                            })
+                    })
+                },
+            ));
+        }
+        properties
+    }
+}
+
+impl GcModel {
+    fn base_properties(&self) -> Vec<Property<Self>> {
         vec![
             Property::always(READABLE, |m: &Self, s: &State| {
                 (0..m.keys).all(|key| match head(&s.log, key) {
-                    Some(Entry::Put { pack, .. }) => s.packs & bit(pack) != 0,
+                    Some(Entry::Put { pack, manifest, .. }) => {
+                        s.packs & bit(pack) != 0
+                            && manifest.is_none_or(|manifest| s.packs & bit(manifest) != 0)
+                    }
                     _ => true,
                 })
             }),
@@ -406,6 +530,21 @@ mod tests {
             max_packs: 2,
             max_crashes: 1,
             rules,
+            puts: Puts {
+                dedup: true,
+                copy: false,
+            },
+        }
+    }
+
+    /// Copies and fresh puts, no dedup.
+    fn copy_model(rules: Rules) -> GcModel {
+        GcModel {
+            puts: Puts {
+                dedup: false,
+                copy: true,
+            },
+            ..model(rules)
         }
     }
 
@@ -425,15 +564,19 @@ mod tests {
     }
 
     /// Breadth first: the shortest loss is a few steps deep.
-    fn assert_loses_data(rules: Rules) {
-        let first_loss = HasDiscoveries::AnyOf(BTreeSet::from([READABLE]));
-        model(rules)
+    fn assert_loses_data(model: GcModel) {
+        assert_breaks(model, READABLE);
+    }
+
+    fn assert_breaks(model: GcModel, property: &'static str) {
+        let first_loss = HasDiscoveries::AnyOf(BTreeSet::from([property]));
+        model
             .checker()
             .threads(threads())
             .finish_when(first_loss)
             .spawn_bfs()
             .join()
-            .assert_any_discovery(READABLE);
+            .assert_any_discovery(property);
     }
 
     #[test]
@@ -466,25 +609,74 @@ mod tests {
 
     #[test]
     fn test_sweep_without_horizon_loses_data() {
-        assert_loses_data(Rules {
+        assert_loses_data(model(Rules {
             sweep_after_horizon: false,
             ..SAFE
-        });
+        }));
     }
 
     #[test]
     fn test_dedup_after_an_old_sync_loses_data() {
-        assert_loses_data(Rules {
+        assert_loses_data(model(Rules {
             fresh_sync: false,
             ..SAFE
-        });
+        }));
     }
 
     #[test]
     fn test_commit_of_an_old_plan_loses_data() {
-        assert_loses_data(Rules {
+        assert_loses_data(model(Rules {
             fresh_plan: false,
             ..SAFE
+        }));
+    }
+
+    #[test]
+    #[ignore = "model check: run on a build machine"]
+    fn test_sweep_rules_keep_every_copy_readable() {
+        check_safe(copy_model(SAFE));
+    }
+
+    #[test]
+    #[ignore = "model check: run on a build machine"]
+    fn test_sweep_rules_are_safe_for_a_copy_to_another_key() {
+        check_safe(GcModel {
+            keys: 2,
+            max_packs: 3,
+            ..copy_model(SAFE)
         });
+    }
+
+    #[test]
+    fn test_copy_after_an_old_sync_loses_data() {
+        assert_breaks(
+            copy_model(Rules {
+                fresh_sync: false,
+                ..SAFE
+            }),
+            COPY_READABLE,
+        );
+    }
+
+    #[test]
+    fn test_commit_of_an_old_copy_plan_loses_data() {
+        assert_breaks(
+            copy_model(Rules {
+                fresh_plan: false,
+                ..SAFE
+            }),
+            COPY_READABLE,
+        );
+    }
+
+    #[test]
+    fn test_sweep_of_a_copy_without_horizon_loses_data() {
+        assert_breaks(
+            copy_model(Rules {
+                sweep_after_horizon: false,
+                ..SAFE
+            }),
+            COPY_READABLE,
+        );
     }
 }

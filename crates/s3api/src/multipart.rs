@@ -173,9 +173,7 @@ impl Uploads {
                 true => {
                     self.remove(&claimed).await?;
                 }
-                false => tokio::fs::rename(&claimed, self.dir.join(id))
-                    .await
-                    .map_err(io)?,
+                false => self.unclaim(id, &claimed).await?,
             }
         }
         Ok(())
@@ -404,6 +402,8 @@ impl Uploads {
             Err(e) if e.kind() != ErrorKind::NotFound => return Err(io(e)),
             _ => {}
         }
+        // A mark that a crash brings back would let a later complete look committed.
+        sync_dir(claimed).await?;
         tokio::fs::rename(claimed, self.upload_dir(upload_id)?)
             .await
             .map_err(io)

@@ -2666,6 +2666,47 @@ async fn restarted(server: Server) -> Server {
     server_in(dir, Config::default(), s3api::DEFAULT_PARTS_LIMIT).await
 }
 
+/// Leaves `id` as a complete that a crash stopped after its mark of `hash`.
+fn mark_by_hand(server: &Server, id: &str, hash: &str) -> std::path::PathBuf {
+    let uploads = server._dir.path().join("uploads");
+    let claimed = uploads.join(format!("{id}.completing"));
+    std::fs::rename(uploads.join(id), &claimed).unwrap();
+    std::fs::write(claimed.join("committing"), hash).unwrap();
+    uploads.join(id)
+}
+
+#[tokio::test]
+async fn test_start_gives_back_an_uncommitted_complete_without_its_mark() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let (etags, _) = two_big_parts(&server, &id).await;
+    let back = mark_by_hand(&server, &id, &"ab".repeat(32));
+
+    let server = restarted(server).await;
+
+    assert!(back.join("meta").exists());
+    assert!(!back.join("committing").exists(), "a stale mark stays");
+    let done = complete_all(&server, &id, &etags).await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+}
+
+#[tokio::test]
+async fn test_start_removes_a_committed_complete() {
+    let server = with_bucket().await;
+    let id = start_upload(&server).await;
+    let (_, object) = two_big_parts(&server, &id).await;
+    let put = run(&server, call("PUT", "/bkt/big").body(object.clone())).await;
+    let hash = put.header("etag").unwrap().trim_matches('"').to_string();
+    let back = mark_by_hand(&server, &id, &hash);
+
+    let server = restarted(server).await;
+
+    let uploads = server._dir.path().join("uploads");
+    assert!(!back.exists());
+    assert!(!uploads.join(format!("{id}.completing")).exists());
+    assert_eq!(list_parts(&server, &id).await.status, StatusCode::NOT_FOUND);
+}
+
 /// Two parts of 2 MiB each: the etags and the object they make.
 async fn two_big_parts(server: &Server, id: &str) -> (Vec<String>, Vec<u8>) {
     let parts = ["a".repeat(2 << 20), "b".repeat(2 << 20)];

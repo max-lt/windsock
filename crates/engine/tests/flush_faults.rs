@@ -195,3 +195,34 @@ async fn test_flush_with_a_header_over_the_limit_uploads_nothing() {
     assert_eq!(logs.lines("ERROR").len(), 1, "{:?}", logs.lines("ERROR"));
     assert!(has(&engine, "k").await);
 }
+
+/// A flush with `chains` other chains, twice: the WARN lines of the header size.
+async fn header_warnings(chains: u32) -> Vec<String> {
+    let logs = common::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let remote = Arc::new(MemoryRemote::default());
+    let engine = open(dir.path(), &remote).await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    other_chains(&remote, chains).await;
+    engine.sync().await.unwrap();
+    for key in ["a", "b"] {
+        put(&engine, key).await;
+        engine.flush().await.unwrap();
+    }
+    logs.lines("WARN")
+        .into_iter()
+        .filter(|line| line.contains("header"))
+        .collect()
+}
+
+/// At 75 % of the header limit the flush warns once, before the guard trips.
+#[tokio::test]
+async fn test_flush_warns_once_when_the_header_passes_three_quarters_of_its_limit() {
+    let near = header_warnings(800).await;
+    let far = header_warnings(600).await;
+
+    assert_eq!(near.len(), 1, "{near:?}");
+    assert!(near[0].contains("gc.retire_chains"), "{near:?}");
+    assert!(far.is_empty(), "{far:?}");
+}

@@ -28,7 +28,7 @@ use tracing::{debug, error, warn};
 pub use chain::{ChainError, Frontier};
 pub use entry::{
     Action, Entry, EntryHash, EntryHead, LOG_PREFIX, Link, NODES_PREFIX, Seen, TAIL_LEN, WireError,
-    entry_key, node_key, redact_wire, seq_of,
+    entry_key, header_bound, node_key, redact_wire, seq_of,
 };
 pub use fetch::{Redaction, redaction};
 

@@ -173,6 +173,18 @@ impl<R: Remote + 'static> Engine<R> {
     /// ERROR per streak.
     async fn check_header(&self) -> Result<()> {
         let seen = self.index().seen(self.node)?;
+        let bound = journal::header_bound(self.node, &seen);
+        match bound > journal::MAX_HEADER / 4 * 3 {
+            true if !self.header_near.swap(true, Ordering::SeqCst) => warn!(
+                bytes = bound,
+                limit = journal::MAX_HEADER,
+                chains = seen.len(),
+                "the next journal entry header is over 75 % of its limit: turn on \
+                 gc.retire_chains on the GC runner, or the flush stops at the limit"
+            ),
+            true => {}
+            false => self.header_near.store(false, Ordering::SeqCst),
+        }
         let Err(e) = self.journal.lock().await.check_header(&seen) else {
             self.header_full.store(false, Ordering::SeqCst);
             return Ok(());

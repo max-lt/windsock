@@ -301,6 +301,8 @@ pub struct Engine<R> {
     buffer_failing: AtomicBool,
     /// The next entry header can pass MAX_HEADER: logged once until a flush passes the check.
     header_full: AtomicBool,
+    /// The next entry header is over 75 % of MAX_HEADER: logged once until it is under.
+    header_near: AtomicBool,
     /// The clock was more than R ahead of the wall clock at the last check: logged once.
     clock_ahead: AtomicBool,
     /// Bytes in spool files of puts that stream their body. They count against `buffer_limit`.
@@ -638,6 +640,7 @@ impl<R: Remote + 'static> Engine<R> {
             quarantined: AtomicBool::new(false),
             bad_data: AtomicBool::new(false),
             header_full: AtomicBool::new(false),
+            header_near: AtomicBool::new(false),
             buffer_failing: AtomicBool::new(false),
             clock_ahead: AtomicBool::new(false),
             read_ahead_lock: Mutex::new(()),

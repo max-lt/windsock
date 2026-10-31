@@ -135,6 +135,11 @@ H, R and M are rules of the remote. The first proxy that opens a remote writes t
 the error gives the values of the remote and of the proxy. Known limit: H, R and M are fixed for
 the life of a remote. To change them, start a new remote and copy the objects through the S3 API.
 
+The version prune drops versions below the stable HLC less R. The stable HLC is the lowest last
+HLC over the applied chains, so a stopped chain blocks the version prune until it is retired: a
+proxy that stops for good, or a chain from a lost `data_dir`, keeps its last HLC for ever, and old
+versions stay readable in every proxy from that point.
+
 Late writes. A buffered write can reach the journal long after its ack, for example after a
 restart or a long remote outage. A prune can then have removed a newer delete of its key, and a
 commit would bring the key back. The rule: a proxy never commits a write whose ack HLC is older

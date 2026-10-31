@@ -1,5 +1,7 @@
 //! Puts and deletes: each one is fsynced in the buffer before it is acknowledged.
-//! The fsync runs outside the buffer lock. The writes that arrive during an fsync share the next one.
+//! The fsync of a record runs outside the buffer lock. The writes that arrive during an fsync share
+//! the next one. The commit of a spooled put (spool.rs) holds the lock over its head write and
+//! fsync, the rotation, the rename and the directory fsyncs.
 
 use super::*;
 

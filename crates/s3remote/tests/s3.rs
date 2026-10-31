@@ -646,10 +646,10 @@ async fn test_slow_and_endless_bodies_hit_the_attempt_timeout() {
     }
 }
 
-/// A burst of reads shares a capped number of connections.
+/// A burst of reads shares a capped number of connections, counted open at once on the server.
 /// The descriptor budget holds MAX_IN_FLIGHT connections in use and MAX_IDLE idle ones. A call
-/// frees its slot before hyper puts its connection back in the pool, so the next call can open a
-/// new one: the count of connections opened over the burst can pass MAX_IN_FLIGHT.
+/// reads its body to the end before it frees its slot, so hyper can give its connection to the
+/// next call.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_burst_of_reads_keeps_a_capped_number_of_connections_open() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -376,7 +376,9 @@ A daemon keeps these descriptors open. Each count has a cap.
 The daemon keeps 256 descriptors for the first five kinds and the spool copies, and 2 for each S3
 connection: its socket, and one file that a request can hold at once (a buffer segment, a spool
 file, a cache file or a multipart part). A copy of a buffered source holds 3: its socket, its
-spool file and the source segment. At most 16 copies run at once, so their extra file fits in the 256. More copies get `503 SlowDown` with `Retry-After`. At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
+spool file and the source segment. At most 16 copies run at once, so their extra file fits in the 256. More copies get `503 SlowDown` with `Retry-After`. A call to the remote reads its reply body to the end before it frees its slot, so
+hyper hands the connection to the next call: a test of 1000 reads at once, and of 5000 with no
+server delay, measured 64 remote connections open at the peak, under the 96 of the budget. At start it raises the soft limit to min(hard limit, 8192). Under 512 it does not
 start, and the error names `ulimit -n`. A `max_connections` that needs more than the soft limit
 also stops the start, with the value, the limit and the number needed. With a soft limit of 600
 and 172 connections open, a test measured 190 descriptors at the peak. In a

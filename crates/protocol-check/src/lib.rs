@@ -13,6 +13,7 @@
 //! Sets of entries are bitmasks over entry ids, to keep states small.
 
 pub mod gc;
+pub mod retire;
 
 use stateright::{Model, Property};
 

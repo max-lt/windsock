@@ -937,6 +937,7 @@ pub(crate) async fn write_intent(dir: &Path, intent: &Intent) -> Result<(), Engi
 
     let mut file = File::create(&tmp).await?;
     file.write_all(&bytes).await?;
+    file.flush().await?;
     file.sync_all().await?;
     tokio::fs::rename(&tmp, dir.join(INTENT_FILE)).await?;
     sync_dir(dir).await
@@ -1237,6 +1238,7 @@ async fn copy_spans(
             )));
         }
     }
+    out.flush().await?;
     out.sync_all().await?;
     Ok(())
 }
@@ -1435,6 +1437,7 @@ async fn write_durable(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Engi
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp).await?;
     file.write_all(bytes).await?;
+    file.flush().await?;
     file.sync_all().await?;
     tokio::fs::rename(&tmp, path).await?;
     sync_dir(dir).await

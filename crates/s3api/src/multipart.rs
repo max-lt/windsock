@@ -189,6 +189,7 @@ impl Uploads {
         file.write_all(hex::encode(content_hash).as_bytes())
             .await
             .map_err(io)?;
+        file.flush().await.map_err(io)?;
         file.sync_all().await.map_err(io)?;
         tokio::fs::File::open(claimed)
             .await
@@ -760,6 +761,8 @@ impl PartWriter<'_> {
     /// Fsyncs the part, then gives it its name, which replaces a part of the same number, and
     /// fsyncs the directory. Returns its ETag: the blake3 hash made as the part was written.
     pub(crate) async fn finish(mut self) -> Result<String, S3Error> {
+        // A tokio file drops a failed background write on sync: only flush returns it.
+        self.file.flush().await.map_err(io)?;
         self.file.sync_all().await.map_err(io)?;
         let etag = self.hasher.finalize().to_hex().to_string();
         let name = part_name(self.number, &etag);
@@ -839,6 +842,23 @@ mod tests {
         });
         uploads.unclaim(id, &claimed).await.unwrap();
         joined
+    }
+
+    #[tokio::test]
+    async fn test_part_whose_last_write_fails_gets_no_name() {
+        let (_dir, uploads) = uploads().await;
+        let id = uploads.initiate("b", "k", BTreeMap::new()).await.unwrap();
+        let mut part = uploads.begin_part(&id, ("b", "k"), "1", 12).await.unwrap();
+        part.write(b"hello ").await.unwrap();
+        // A read-only handle fails the next write in the background, as a full disk does.
+        part.file = tokio::fs::File::open(&part.tmp).await.unwrap();
+        part.write(b"world!").await.unwrap();
+
+        let finished = part.finish().await;
+
+        assert!(finished.is_err(), "a short part got the ETag {finished:?}");
+        let parts = uploads.parts(&id, "b", "k").await.unwrap();
+        assert!(parts.is_empty(), "{parts:?}");
     }
 
     #[tokio::test]

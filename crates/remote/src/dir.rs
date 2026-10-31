@@ -61,6 +61,7 @@ async fn write_temp(path: &Path, data: &[u8]) -> Result<PathBuf, RemoteError> {
 
     let mut file = tokio::fs::File::create(&tmp).await?;
     file.write_all(data).await?;
+    file.flush().await?;
     file.sync_all().await?;
     Ok(tmp)
 }

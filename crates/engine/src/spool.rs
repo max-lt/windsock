@@ -29,6 +29,8 @@ pub struct PutSpool {
     spooled: Arc<AtomicU64>,
     /// Room of the buffer limit taken at the start, for a body of a known size.
     reserved: u64,
+    #[cfg(test)]
+    fail_head_write: bool,
 }
 
 impl PutSpool {
@@ -162,6 +164,8 @@ impl<R: Remote + 'static> Engine<R> {
             mode,
             spooled: self.spooled.clone(),
             reserved: size,
+            #[cfg(test)]
+            fail_head_write: false,
         };
         // The record starts with the data length: it is known only at the end, so it goes at
         // offset 0 then.
@@ -226,8 +230,15 @@ impl<R: Remote + 'static> Engine<R> {
                 content_hash,
             },
         };
+        #[cfg(test)]
+        if spool.fail_head_write {
+            // A read-only handle fails the next write in the background, as a full disk does.
+            spool.file = tokio::fs::File::open(&spool.path).await?;
+        }
         spool.file.seek(std::io::SeekFrom::End(0)).await?;
         spool.file.write_all(&encode_head(&head)).await?;
+        // A tokio file drops a failed background write on sync: only flush returns it.
+        spool.file.flush().await?;
         spool.file.sync_data().await?;
         crate::sim::crash_point(crate::sim::Point::SpoolHead)?;
 
@@ -250,5 +261,51 @@ impl<R: Remote + 'static> Engine<R> {
             last_modified: time,
             conflicted: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use remote::MemoryRemote;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_put_whose_head_write_fails_gets_no_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || async {
+            Engine::open(
+                dir.path(),
+                Arc::new(MemoryRemote::default()),
+                SigningKey::from_bytes(&[3; 32]),
+                crate::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+                Config::default(),
+            )
+            .await
+            .unwrap()
+        };
+        let engine = open().await;
+        engine.create_bucket("demo", None).await.unwrap();
+        let mut spool = engine
+            .begin_put_sized("demo", "k", BTreeMap::new(), WriteMode::Overwrite, 4)
+            .await
+            .unwrap();
+        engine.spool_write(&mut spool, b"data").await.unwrap();
+        spool.fail_head_write = true;
+
+        let finished = engine.finish_put(spool).await;
+
+        assert!(finished.is_err(), "a put with no head got an ack");
+        assert!(engine.get("demo", "k", None).await.is_err());
+        let later = engine
+            .put(
+                "demo",
+                "j",
+                Bytes::from_static(b"x"),
+                BTreeMap::new(),
+                WriteMode::Overwrite,
+            )
+            .await;
+        assert!(later.is_ok(), "{later:?}");
     }
 }

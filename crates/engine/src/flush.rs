@@ -13,6 +13,9 @@ const SEGMENTS_PER_ENTRY: usize = 16;
 /// Commits that lose the seq to another process before a flush gives up.
 const MAX_COMMIT_ATTEMPTS: u32 = 8;
 
+/// The pause of the flusher after a header check fails.
+const HEADER_FULL_PAUSE: Duration = Duration::from_secs(60);
+
 #[derive(PartialEq)]
 pub(crate) enum Flushed {
     Committed,
@@ -68,12 +71,19 @@ impl<R: Remote + 'static> Engine<R> {
                 }
                 // The first pass runs at once: writes replayed after a crash do not wait.
                 if let Err(e) = engine.flush().await {
-                    // check_clock logs the start and the end of a wait for the wall clock.
-                    if !matches!(e, EngineError::ClockAhead { .. }) {
+                    let header_full =
+                        matches!(e, EngineError::Journal(JournalError::HeaderTooLarge { .. }));
+                    // check_clock and check_header log their own lines.
+                    if !matches!(e, EngineError::ClockAhead { .. }) && !header_full {
                         warn!(%e, "flush failed");
                     }
                     // Without a pause, a full buffer retries on every put while the remote is down.
-                    tokio::time::sleep(engine.config.flush_delay).await;
+                    let pause = match header_full {
+                        // Only fewer chains can make it pass: no fast retry.
+                        true => HEADER_FULL_PAUSE.max(engine.config.flush_delay),
+                        false => engine.config.flush_delay,
+                    };
+                    tokio::time::sleep(pause).await;
                 }
 
                 tokio::select! {
@@ -157,6 +167,24 @@ impl<R: Remote + 'static> Engine<R> {
             crate::read::keep(cache, chunk.id, &chunk.data).await;
         }
         Ok(())
+    }
+
+    /// The commit refuses a header over MAX_HEADER after the uploads: check it before them. One
+    /// ERROR per streak.
+    async fn check_header(&self) -> Result<()> {
+        let seen = self.index().seen(self.node)?;
+        let Err(e) = self.journal.lock().await.check_header(&seen) else {
+            self.header_full.store(false, Ordering::SeqCst);
+            return Ok(());
+        };
+        if !self.header_full.swap(true, Ordering::SeqCst) {
+            error!(
+                %e,
+                chains = seen.len(),
+                "the next journal entry cannot list every other chain: no flush and no upload"
+            );
+        }
+        Err(e.into())
     }
 
     /// A put whose data does not match its head: no pack of it and no log entry. One ERROR per
@@ -245,6 +273,7 @@ impl<R: Remote + 'static> Engine<R> {
             )));
         }
         let dedup = self.ensure_fresh_sync().await?;
+        self.check_header().await?;
         // A local elapsed time: a wall clock step must not make an old plan look young.
         let planned_at = Stamp::now();
         let seed = blake3::Hasher::new()

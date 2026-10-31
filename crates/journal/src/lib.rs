@@ -202,6 +202,20 @@ impl<R: Remote> Journal<R> {
         Err(JournalError::Contended(MAX_ATTEMPTS))
     }
 
+    /// Refuses the next entry when its header with `seen` can pass MAX_HEADER: a flush checks it
+    /// before it uploads anything for that entry.
+    pub fn check_header(&self, seen: &Seen) -> Result<(), JournalError> {
+        let len = entry::header_bound(self.node, seen);
+        if len > MAX_HEADER {
+            return Err(JournalError::HeaderTooLarge {
+                seq: self.frontier(self.node).next_seq,
+                len,
+                max: MAX_HEADER,
+            });
+        }
+        Ok(())
+    }
+
     /// Signs actions as the next entry of the own chain, without writing it.
     pub fn prepare(&self, actions: Vec<Action>, seen: Seen) -> Result<Entry, JournalError> {
         let frontier = self.frontier(self.node);

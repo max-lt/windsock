@@ -581,6 +581,22 @@ fn header_with_wire_len(fields: &Fields, len: u64) -> Vec<u8> {
     bytes
 }
 
+/// The longest header that an entry of `node` with `seen` can have: every number at its largest.
+pub fn header_bound(node: NodeId, seen: &Seen) -> u64 {
+    let fields = Fields {
+        node,
+        seq: u64::MAX,
+        prev: [0; 32],
+        hlc: u64::MAX,
+        seen: seen.clone(),
+        actions_hash: [0; 32],
+        actions_len: u64::MAX,
+    };
+    let fields = postcard::to_allocvec(&fields).expect("an entry always serializes");
+    // The Some tag, then the length of the sealed actions as a varint of at most 10 bytes.
+    fields.len() as u64 + 1 + 10
+}
+
 /// A fixed repository key for tests.
 #[cfg(test)]
 pub(crate) fn test_sealer() -> Sealer {

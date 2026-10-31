@@ -317,7 +317,10 @@ broken (Malformed).
 
 The header holds the `seen` map, 74 bytes for each other node at most. A writer refuses to sign
 an entry with a header over 64 KiB (`HeaderTooLarge`), so a repository has at most about 880
-nodes.
+nodes. The `seen` map names every chain that the proxy ever read, retired nodes too. A flush
+checks the largest header that its entry can have before its plan: over 64 KiB, it uploads
+nothing, logs one ERROR, and the flusher tries again every 60 s. The buffered writes stay, and go
+to the quarantine at the late limit.
 
 A chain is broken, and the GC refuses to run, when:
 

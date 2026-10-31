@@ -1,4 +1,7 @@
-//! A flush that meets buffered data that does not match its head.
+//! A flush that meets buffered data that does not match its head, or a journal that cannot take
+//! its entry.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -138,4 +141,57 @@ async fn test_data_that_changes_between_the_two_passes_gets_no_log_entry() {
     assert!(error.contains("bucket/b"), "{error}");
     assert_eq!(after, entries);
     assert!(!has(&a, "b").await);
+}
+
+/// Chains of `count` other nodes, one entry each: the seen map of the next entry names them all.
+async fn other_chains(remote: &Arc<MemoryRemote>, count: u32) {
+    let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
+    for n in 0..count {
+        let key = SigningKey::from_bytes(blake3::hash(&n.to_le_bytes()).as_bytes());
+        let mut chain = journal::Journal::new(
+            remote.clone(),
+            key,
+            keys.sealer().clone(),
+            journal::Frontiers::new(),
+        );
+        chain
+            .append(Vec::new(), journal::Seen::new())
+            .await
+            .unwrap();
+    }
+}
+
+/// With too many chains for one header, a flush stops before its plan: no pack, manifest or
+/// entry goes up on any retry, and one ERROR names the cause.
+#[tokio::test]
+async fn test_flush_with_a_header_over_the_limit_uploads_nothing() {
+    let logs = common::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let remote = Arc::new(MemoryRemote::default());
+    let engine = open(dir.path(), &remote).await.unwrap();
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    other_chains(&remote, 1100).await;
+    engine.sync().await.unwrap();
+    put(&engine, "k").await;
+    let before = remote.list("").await.unwrap();
+
+    for _ in 0..10 {
+        let flushed = engine.flush().await;
+        assert!(
+            matches!(
+                flushed,
+                Err(EngineError::Journal(
+                    journal::JournalError::HeaderTooLarge { .. }
+                ))
+            ),
+            "{flushed:?}"
+        );
+    }
+
+    let after = remote.list("").await.unwrap();
+    let new: Vec<_> = after.iter().filter(|key| !before.contains(key)).collect();
+    assert!(new.is_empty(), "{new:?}");
+    assert_eq!(logs.lines("ERROR").len(), 1, "{:?}", logs.lines("ERROR"));
+    assert!(has(&engine, "k").await);
 }

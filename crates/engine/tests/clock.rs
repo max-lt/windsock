@@ -164,3 +164,107 @@ async fn test_own_acks_under_a_snapshot_stay_above_the_next_ack_after_an_index_l
         "{write:?}"
     );
 }
+
+/// A memory remote that stores the next entry create and loses its answer.
+#[derive(Default)]
+struct LossyRemote {
+    inner: MemoryRemote,
+    lose_next_entry: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl remote::Remote for LossyRemote {
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), remote::RemoteError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn create(&self, key: &str, data: Bytes) -> Result<(), remote::RemoteError> {
+        self.inner.create(key, data).await?;
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        if key.starts_with(journal::LOG_PREFIX) && self.lose_next_entry.swap(false, ordering) {
+            return Err(remote::RemoteError::Io(std::io::Error::other(
+                "lost answer",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn get(&self, key: &str, max: u64) -> Result<Option<Bytes>, remote::RemoteError> {
+        self.inner.get(key, max).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Bytes>, remote::RemoteError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>, remote::RemoteError> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// An entry that reached the remote with a lost answer stays in the intent file. After a step
+/// back of the wall clock and a restart, the next own entry must still take a higher HLC, or
+/// every later commit fails: the own chain must rise.
+#[tokio::test]
+async fn test_entry_with_a_lost_answer_keeps_the_chain_rising_after_a_step_back() {
+    let remote = Arc::new(LossyRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let open = || async {
+        Engine::open(
+            dir.path(),
+            remote.clone(),
+            SigningKey::from_bytes(&[1; 32]),
+            engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            config(),
+        )
+        .await
+        .unwrap()
+    };
+    set_wall(START);
+    let a = open().await;
+    a.create_bucket(BUCKET, None).await.unwrap();
+    a.flush().await.unwrap();
+    let data = || Bytes::from_static(b"v");
+    a.put(BUCKET, "k1", data(), BTreeMap::new(), WriteMode::Overwrite)
+        .await
+        .unwrap();
+    // The entry takes an HLC 10 s above the ack, and the wall then steps back 5 s: only the entry
+    // in the intent and in the remote is above the next ack.
+    set_wall(START + 10_000_000_000);
+    remote
+        .lose_next_entry
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(a.flush().await.is_err(), "the lost answer fails the flush");
+    drop(a);
+
+    set_wall(START + 5_000_000_000);
+    let b = open().await;
+    b.put(BUCKET, "k2", data(), BTreeMap::new(), WriteMode::Overwrite)
+        .await
+        .unwrap();
+    let flushed = b.flush().await;
+
+    assert!(flushed.is_ok(), "{flushed:?}");
+    assert_eq!(b.buffered_bytes().await, 0);
+    for key in ["k1", "k2"] {
+        assert_eq!(b.get(BUCKET, key, None).await.unwrap().data, "v");
+    }
+    // Another proxy reads the chain: an entry under the one before it breaks the chain there.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = Engine::open(
+        other_dir.path(),
+        remote.clone(),
+        SigningKey::from_bytes(&[2; 32]),
+        engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+        config(),
+    )
+    .await
+    .unwrap();
+    let report = other.sync().await.unwrap();
+    assert!(report.broken.is_empty(), "{:?}", report.broken_causes);
+    assert_eq!(other.get(BUCKET, "k2", None).await.unwrap().data, "v");
+}

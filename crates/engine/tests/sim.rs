@@ -226,6 +226,8 @@ struct Stats {
     step_back: bool,
     /// A spooled put crashed at one of its steps.
     spool_crash: bool,
+    /// A flush wrote its entry and lost the answer: the entry is in the remote and in the intent.
+    lost_entry_answer: bool,
     /// A power loss changed the data of an unacked put under a valid head, or cut its record.
     power_loss_data: u64,
     power_loss_cut: u64,
@@ -1057,6 +1059,8 @@ impl Sim {
                 let result = self.engine(i).flush().await;
                 let used = self.remote.next.lock().unwrap().is_none();
                 self.stats.marker_fault |= prefix == "nodes/" && used && result.is_err();
+                self.stats.lost_entry_answer |=
+                    prefix == "log/" && matches!(fault, Fault::LoseAnswer) && used;
                 if let Err(e) = result {
                     self.quarantine(i, &e);
                 }
@@ -1389,6 +1393,7 @@ struct Totals {
     far_ahead: u64,
     step_back: u64,
     spool_crash: u64,
+    lost_entry_answer: u64,
     power_loss_data: u64,
     power_loss_cut: u64,
     refused_starts: u64,
@@ -1416,6 +1421,7 @@ impl Totals {
         self.far_ahead += u64::from(stats.far_ahead);
         self.step_back += u64::from(stats.step_back);
         self.spool_crash += u64::from(stats.spool_crash);
+        self.lost_entry_answer += u64::from(stats.lost_entry_answer);
         self.power_loss_data += stats.power_loss_data;
         self.power_loss_cut += stats.power_loss_cut;
         self.refused_starts += stats.refused_starts;
@@ -1451,6 +1457,10 @@ impl Totals {
             ("a clock more than R ahead", self.far_ahead),
             ("a wall step back over R with a buffer", self.step_back),
             ("a spooled put that crashed", self.spool_crash),
+            (
+                "a flush that lost the answer of its entry",
+                self.lost_entry_answer,
+            ),
             (
                 "a power loss with bad data under a valid head",
                 self.power_loss_data,

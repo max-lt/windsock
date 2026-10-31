@@ -10,6 +10,7 @@ check:
     cargo clippy --all-targets --features windsockd/tls,s3remote/tls -- -D warnings
     cd fuzz && cargo fmt --check && cargo clippy --all-targets -- -D warnings
 
+# Do not run this with the chaos soak: the CPU load causes StalePlan at the soak H of 20 s.
 test:
     cargo test --no-fail-fast
 

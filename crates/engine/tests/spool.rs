@@ -1,5 +1,7 @@
 //! Puts that stream their body through a spool file.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -362,4 +364,50 @@ async fn test_reserved_room_counts_at_once_and_comes_back_when_the_spool_goes() 
     );
     inside.unwrap();
     assert_eq!(committed.unwrap().size, 7 * PIECE as u64);
+}
+
+/// A spooled commit whose rename fails after the buffer tracked its segment: one ERROR names the
+/// cause, the buffer refuses writes and the key of that record fails to read, and a restart
+/// recovers. The commit got no ack, so the record is gone after the restart.
+#[tokio::test]
+async fn test_failed_rename_of_a_spooled_commit_breaks_the_buffer_until_a_restart() {
+    let logs = common::capture();
+    let remote = Arc::new(MemoryRemote::default());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(dir.path(), &remote, Config::default()).await;
+    engine.create_bucket(BUCKET, None).await.unwrap();
+    engine.flush().await.unwrap();
+    // The empty active segment takes the spool: a directory in its place fails the rename.
+    let active = std::fs::read_dir(dir.path().join("buffer"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .max()
+        .unwrap();
+    assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
+    std::fs::remove_file(&active).unwrap();
+    std::fs::create_dir(&active).unwrap();
+
+    let failed = spooled_put(&engine, "k", &data(2 * PIECE), WriteMode::Overwrite).await;
+    let later = spooled_put(&engine, "j", &data(PIECE), WriteMode::Overwrite).await;
+    let read = engine.get(BUCKET, "k", None).await;
+
+    assert!(failed.is_err(), "{failed:?}");
+    assert!(matches!(later, Err(EngineError::BufferBroken)), "{later:?}");
+    assert!(read.is_err(), "the key of the record reads");
+    let errors = logs.lines("ERROR");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("restart"), "{errors:?}");
+
+    drop(engine);
+    std::fs::remove_dir(&active).unwrap();
+    let engine = open(dir.path(), &remote, Config::default()).await;
+    let read = engine.get(BUCKET, "k", None).await;
+    assert!(
+        matches!(read, Err(EngineError::NoSuchKey { .. })),
+        "{read:?}"
+    );
+    spooled_put(&engine, "j", &data(PIECE), WriteMode::Overwrite)
+        .await
+        .unwrap();
 }

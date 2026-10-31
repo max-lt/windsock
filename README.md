@@ -133,6 +133,12 @@ directory, the proxy starts, and the writes in that file are lost. A `.log` file
 20 digits also stops the start: rename it, or move it out. A gap in the segment numbers is normal,
 because the proxy deletes empty segments.
 
+A PUT, copy or complete that streams its body commits it as a new segment. When that commit fails
+after its segment is known to the buffer, for example on a full disk, the log names the cause once:
+`a spooled commit failed`. From then on the buffer refuses writes, and the key of that write fails
+to read, until a restart. The restart reads the buffer again and recovers: the failed write had no
+ack, so it is not there, and the other writes are.
+
 The buffer directory holds a file `format` with the record format (2). A buffer of another
 format stops the start with both numbers: start the build that wrote it and let it flush. If the
 file is empty or does not read, for example after a power loss, and this build wrote the buffer,

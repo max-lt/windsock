@@ -22,7 +22,7 @@ use journal::Entry;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::EngineError;
 
@@ -882,6 +882,12 @@ impl Buffer {
         // later acks would depend on it.
         if let Err(e) = self.adopt_steps(spool, seq, head, data_len).await {
             self.broken = true;
+            error!(
+                %e,
+                segment = seq,
+                "a spooled commit failed: the buffer refuses writes, and the keys of that write fail \
+                 to read, until a restart reads the buffer again"
+            );
             return Err(e);
         }
         Ok(self.written)

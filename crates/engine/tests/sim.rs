@@ -13,7 +13,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use engine::sim::Point;
-use engine::{Config, Engine, EngineError, ListEntry, ListQuery, RepoKey, WriteMode};
+use engine::{
+    Chunking, Config, CopyPath, Engine, EngineError, ListEntry, ListQuery, Policy, PrefixPolicy,
+    RepoKey, WriteMode,
+};
 use remote::{MemoryRemote, Remote, RemoteError, Sweep};
 use tempfile::TempDir;
 
@@ -32,6 +35,17 @@ const POINTS: [Point; 7] = [
     Point::Apply,
     Point::Release,
 ];
+/// The points after which a copy can crash.
+const COPY_POINTS: [Point; 5] = [
+    Point::CopyRefPlan,
+    Point::CopyRefManifest,
+    Point::CopyRefCommit,
+    Point::CopyRefApply,
+    Point::CopyPiece,
+];
+/// On even seeds, copies of at least this size go by reference: the 64 KiB values and the
+/// spooled puts. On odd seeds, every stored source goes by reference.
+const COPY_REF_MIN: u64 = 64 * 1024;
 /// A fixed start time, so a seed gives the same HLCs on every run.
 const START: u64 = 1_800_000_000 * SECOND;
 
@@ -242,6 +256,12 @@ struct Stats {
     corrupt_quarantined: u64,
     keyless: bool,
     slow_stale_plan: bool,
+    /// The way each acked copy went.
+    copies: BTreeSet<CopyPath>,
+    /// A copy that failed is a version at the settle: its entry was in the remote.
+    late_copy: bool,
+    /// No manifest in the remote that no version names, after the GC ran twice past H.
+    orphans_checked: bool,
     /// Chunks that a flush found stored and did not upload again.
     dedup_hits: u64,
 }
@@ -296,6 +316,19 @@ fn config() -> Config {
         snapshot_interval: Duration::from_secs(3600),
         // Half of the seeds run the GC that retires quiet chains.
         retire_chains: CURRENT_SEED.with(std::cell::Cell::get).is_multiple_of(2),
+        copy_ref_min: match CURRENT_SEED.with(std::cell::Cell::get).is_multiple_of(2) {
+            true => COPY_REF_MIN,
+            false => 1,
+        },
+        // A copy from or to k7 takes the spool: its chunks are fixed.
+        policies: vec![PrefixPolicy {
+            bucket: BUCKET.to_string(),
+            prefix: "k7".to_string(),
+            policy: Policy {
+                chunking: Chunking::Fixed,
+                ..Policy::default()
+            },
+        }],
         ..Config::default()
     }
 }
@@ -328,6 +361,10 @@ struct Sim {
     retires: Vec<([u8; 32], u64, [u8; 32], u64)>,
     /// The largest clock offset of the run: an HLC from it stays in the journal.
     max_offset: u64,
+    /// Copies draw from their own stream, as power losses do.
+    copier: Rng,
+    /// Copies that failed, as (proxy, key, value, HLC window): an entry can be in the remote.
+    failed_copies: Vec<(usize, String, Vec<u8>, Range<u64>)>,
     /// Real time since the start: it never steps back, unlike the wall clocks.
     elapsed: u64,
 }
@@ -772,6 +809,9 @@ impl Sim {
         for _ in 0..8 {
             self.pass(80 * SECOND);
             self.put(o).await?;
+            if self.copier.chance(30) {
+                self.copy(o).await?;
+            }
             self.delete(other).await?;
             if let Err(e) = self.engine(other).flush().await {
                 self.quarantine(other, &e);
@@ -945,6 +985,152 @@ impl Sim {
         Ok(())
     }
 
+    /// A copy of one key to another, now and then with a crash at one of its steps. An acked copy
+    /// has the content hash of its source at the copy. A copy that fails can have its entry in
+    /// the remote: the settle finds its version.
+    async fn copy(&mut self, i: usize) -> Result<(), String> {
+        let source = format!("k{}", self.copier.below(KEYS));
+        let target = format!("k{}", self.copier.below(KEYS));
+        let Ok(read) = self.engine(i).get(BUCKET, &source, None).await else {
+            return Ok(());
+        };
+        let value = read.data.to_vec();
+        let before = self.engine(i).last_hlc();
+        // The open after a crash needs the remote: in an outage it would fail for ever.
+        let outage = self.proxies[i].outage.load(Ordering::SeqCst);
+        let point = (!outage && self.copier.chance(50))
+            .then(|| COPY_POINTS[self.copier.below(COPY_POINTS.len() as u64) as usize]);
+        engine::sim::arm_crash(point);
+        let wait = Duration::from_secs(5);
+        let result = self
+            .engine(i)
+            .copy(
+                (BUCKET, &source),
+                (BUCKET, &target),
+                None,
+                WriteMode::Overwrite,
+                wait,
+            )
+            .await;
+        engine::sim::arm_crash(None);
+        self.log.push(format!(
+            "p{i} copy {source} to {target} {point:?}: {:?}",
+            result.as_ref().map(|c| (c.path, c.info.last_modified))
+        ));
+        let copied = match result {
+            Ok(copied) => copied,
+            Err(e) => {
+                if let EngineError::SimCrash(point) = &e {
+                    self.stats.crashes.insert(*point);
+                    self.proxies[i].engine = None;
+                    self.open(i).await?;
+                }
+                self.quarantine(i, &e);
+                // The copy took its HLC in this window: later writes of the proxy rank above.
+                let after = self.proxies[i]
+                    .engine
+                    .as_ref()
+                    .map_or(u64::MAX, |e| e.last_hlc());
+                self.failed_copies
+                    .push((i, target, value, before + 1..after + 1));
+                return Ok(());
+            }
+        };
+        // The sync of the copy can apply a newer write of the source, which a spool copy reads.
+        let mut value = value;
+        if copied.info.content_hash != read.info.content_hash {
+            let after = self.engine(i).get(BUCKET, &source, None).await;
+            let after = after.map_err(|e| format!("p{i} get {source} after a copy: {e}"))?;
+            if copied.info.content_hash != after.info.content_hash {
+                return Err(format!(
+                    "p{i} copy {source} to {target}: hash {:?}, the source had {:?} then {:?}",
+                    copied.info.content_hash, read.info.content_hash, after.info.content_hash
+                ));
+            }
+            value = after.data.to_vec();
+        }
+        self.stats.copies.insert(copied.path);
+        let hlc = copied.info.last_modified;
+        self.acked(i, hlc)?;
+        let node = self.proxies[i].node;
+        self.keys.entry(target).or_default().push(Acked {
+            hlc,
+            node,
+            value: Some(value),
+            proxy: i,
+            dropped: false,
+        });
+        Ok(())
+    }
+
+    /// The version of each failed copy whose entry reached the remote: a write with no ack that
+    /// a reader may see. Its value is the source of the copy.
+    fn find_failed_copies(&mut self) -> Result<(), String> {
+        for (i, key, value, window) in std::mem::take(&mut self.failed_copies) {
+            let node = self.proxies[i].node;
+            // Only the GC runner prunes versions: another proxy can hold one that p0 dropped.
+            let mut held = Vec::new();
+            for p in 0..3 {
+                let state = self.engine(p).versions(BUCKET, &key);
+                let state = state.map_err(|e| format!("p{p} versions {key}: {e}"))?;
+                held.extend(state.into_iter().flat_map(|s| s.versions));
+            }
+            let known: BTreeSet<u64> = self
+                .keys
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter(|a| a.node == node)
+                .map(|a| a.hlc)
+                .collect();
+            let late = held.into_iter().find(|v| {
+                *v.node.as_bytes() == node && window.contains(&v.hlc) && !known.contains(&v.hlc)
+            });
+            if let Some(version) = late {
+                self.stats.late_copy = true;
+                self.keys.entry(key).or_default().push(Acked {
+                    hlc: version.hlc,
+                    node,
+                    value: Some(value),
+                    proxy: i,
+                    dropped: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// After two GC runs past H, every manifest in the remote is named by a version: the GC
+    /// deleted the manifest of each copy or flush that stopped before its entry.
+    async fn check_orphan_manifests(&mut self) -> Result<(), String> {
+        let horizon = config().gc_horizon.as_nanos() as u64;
+        for _ in 0..2 {
+            self.pass(horizon + SECOND);
+            if self.engine(0).gc().await.is_err() {
+                return Ok(());
+            }
+        }
+        let mut named = BTreeSet::new();
+        for key in 0..KEYS {
+            let state = self.engine(0).versions(BUCKET, &format!("k{key}"));
+            let state = state.map_err(|e| format!("p0 versions k{key}: {e}"))?;
+            named.extend(
+                state
+                    .into_iter()
+                    .flat_map(|s| s.versions)
+                    .filter_map(|v| v.manifest_id)
+                    .map(engine::manifest_key),
+            );
+        }
+        let stored = self.remote.inner.list(engine::MANIFESTS_PREFIX).await;
+        let stored = stored.map_err(|e| format!("list manifests: {e}"))?;
+        if let Some(orphan) = stored.iter().find(|key| !named.contains(*key)) {
+            return Err(format!("{orphan} is in the remote and no version names it"));
+        }
+        self.stats.orphans_checked = true;
+        Ok(())
+    }
+
     async fn delete(&mut self, i: usize) -> Result<(), String> {
         let key = format!("k{}", self.rng.below(KEYS));
         match self.engine(i).delete(BUCKET, &key).await {
@@ -975,7 +1161,12 @@ impl Sim {
         self.pass(by);
 
         match roll {
-            0..=27 => self.put(i).await?,
+            0..=27 => {
+                self.put(i).await?;
+                if self.copier.chance(15) {
+                    self.copy(i).await?;
+                }
+            }
             28..=37 => self.delete(i).await?,
             38..=39 => self.outage().await?,
             40..=45 => {
@@ -1011,6 +1202,10 @@ impl Sim {
                 if let Err(e) = r {
                     self.stats.stale_plan |= matches!(e, EngineError::StalePlan);
                     self.quarantine(i, &e);
+                }
+                // A copy after a flush finds its source stored.
+                if self.copier.chance(80) {
+                    self.copy(i).await?;
                 }
             }
             61 => {
@@ -1185,6 +1380,7 @@ impl Sim {
                 }
             }
         }
+        self.find_failed_copies()?;
         Ok(())
     }
 
@@ -1388,6 +1584,8 @@ async fn run(seed: u64) -> Result<Stats, String> {
         retires: Vec::new(),
         max_offset: 0,
         elapsed: SECOND,
+        copier: Rng(seed ^ 0x51ed_270b_27d9_ac2f),
+        failed_copies: Vec::new(),
     };
     for seed in 1..=3u8 {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -1421,6 +1619,7 @@ async fn run(seed: u64) -> Result<Stats, String> {
     }
     sim.settle().await?;
     sim.check().await?;
+    sim.check_orphan_manifests().await?;
     sim.stats.dedup_hits = engine::sim::dedup_hits() - dedup_before;
     sim.stats.log_hash = *blake3::hash(sim.log.join("\n").as_bytes()).as_bytes();
     Ok(sim.stats)
@@ -1455,6 +1654,9 @@ struct Totals {
     corrupt_quarantined: u64,
     keyless: u64,
     slow_stale_plan: u64,
+    late_copy: u64,
+    orphans_checked: u64,
+    copies: BTreeMap<CopyPath, u64>,
     dedup_hits: u64,
     crashes: BTreeMap<Point, u64>,
 }
@@ -1488,6 +1690,11 @@ impl Totals {
         self.slow_stale_plan += u64::from(stats.slow_stale_plan);
         self.keyless += u64::from(stats.keyless);
         self.dedup_hits += stats.dedup_hits;
+        self.late_copy += u64::from(stats.late_copy);
+        self.orphans_checked += u64::from(stats.orphans_checked);
+        for path in &stats.copies {
+            *self.copies.entry(*path).or_default() += 1;
+        }
         for point in &stats.crashes {
             *self.crashes.entry(*point).or_default() += 1;
         }
@@ -1532,14 +1739,29 @@ impl Totals {
             ("a StalePlan after a slow upload", self.slow_stale_plan),
             ("a chain from a writer with no repo key", self.keyless),
             ("a dedup hit", self.dedup_hits),
+            ("a failed copy whose entry applied", self.late_copy),
+            ("an orphan manifest check", self.orphans_checked),
         ];
         for (branch, count) in branches {
             assert!(count > 0, "no seed had {branch}: {self:?}");
         }
-        for point in POINTS {
+        for point in POINTS.iter().chain(&COPY_POINTS) {
             assert!(
-                self.crashes.contains_key(&point),
+                self.crashes.contains_key(point),
                 "no crash after {point:?}: {self:?}"
+            );
+        }
+        let paths = [
+            CopyPath::Reference,
+            CopyPath::Spool(engine::SpoolReason::Small),
+            CopyPath::Spool(engine::SpoolReason::BufferedSource),
+            CopyPath::Spool(engine::SpoolReason::BufferedTarget),
+            CopyPath::Spool(engine::SpoolReason::Policy),
+        ];
+        for path in paths {
+            assert!(
+                self.copies.contains_key(&path),
+                "no copy went {path:?}: {self:?}"
             );
         }
     }

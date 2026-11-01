@@ -105,6 +105,8 @@ fn configure(text: &str, n: usize, port: u16, remote: &Path, repo_key: &Path) ->
         ("snapshot_interval_secs", "15".to_string()),
         // The GC of proxy 0 retires quiet chains, as the final runs of the retire rules need.
         ("retire_chains", "true".to_string()),
+        // Copies of 1 MiB and more go by reference, as the final runs of the copy rules need.
+        ("copy_ref_min", (1u64 << 20).to_string()),
     ];
     let mut out = String::new();
     let mut in_remote = false;

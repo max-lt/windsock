@@ -299,6 +299,25 @@ pub fn copy_result(etag: &str, last_modified: u64) -> String {
 }
 
 #[derive(Serialize)]
+#[serde(rename = "CopyPartResult")]
+struct CopyPartResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
+pub fn copy_part_result(etag: &str, last_modified: u64) -> String {
+    to_xml(&CopyPartResult {
+        xmlns: XMLNS,
+        last_modified: iso8601(last_modified),
+        etag: quoted(etag),
+    })
+}
+
+#[derive(Serialize)]
 #[serde(rename = "DeleteResult")]
 struct DeleteResult {
     #[serde(rename = "@xmlns")]

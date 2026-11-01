@@ -142,6 +142,34 @@ pub(super) fn byte_range(headers: &HeaderMap, size: u64) -> Result<Option<Range<
     Ok(Some(range))
 }
 
+/// The `x-amz-copy-source-range` of a part copy: `bytes=first-last`, both bytes in the source.
+/// `None` when the header is absent: the part takes the whole source.
+pub(super) fn copy_source_range(
+    headers: &HeaderMap,
+    size: u64,
+) -> Result<Option<Range<u64>>, S3Error> {
+    let Some(value) = header(headers, "x-amz-copy-source-range") else {
+        return Ok(None);
+    };
+    let invalid = || {
+        S3Error::invalid_argument(format!(
+            "x-amz-copy-source-range must be bytes=first-last inside the {size} bytes of the \
+             source: {value}"
+        ))
+    };
+    let (first, last) = value
+        .strip_prefix("bytes=")
+        .and_then(|spec| spec.split_once('-'))
+        .ok_or_else(invalid)?;
+    let (Ok(first), Ok(last)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+        return Err(invalid());
+    };
+    if first > last || last >= size {
+        return Err(invalid());
+    }
+    Ok(Some(first..last + 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

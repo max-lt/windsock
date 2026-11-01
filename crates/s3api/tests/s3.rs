@@ -3340,25 +3340,30 @@ async fn test_copy_over_the_copy_cap_gets_503_at_once() {
         .collect();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
+    let id = initiate(&server).await;
+
     let started = std::time::Instant::now();
     let over = run(&server, copy_call("/bkt/over", "/bkt/src")).await;
+    let over_part = part_copy(&server, &id, 1, None).await;
 
-    assert_eq!(
-        over.status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{}",
-        over.text()
-    );
+    for over in [&over, &over_part] {
+        assert_eq!(
+            over.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            over.text()
+        );
+        assert!(
+            over.text().contains("copies run at once"),
+            "{}",
+            over.text()
+        );
+        assert!(over.header("retry-after").is_some());
+    }
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the copy waited"
     );
-    assert!(
-        over.text().contains("copies run at once"),
-        "{}",
-        over.text()
-    );
-    assert!(over.header("retry-after").is_some());
     drop(held);
     for copy in waiting {
         copy.await.unwrap().unwrap();
@@ -3420,4 +3425,206 @@ async fn test_blocking_store_on_a_blocking_thread_gets_503_at_the_deadline() {
         waited < s3api::KEY_STORE_DEADLINE + Duration::from_secs(1),
         "{waited:?}"
     );
+}
+
+/// An UploadPartCopy of `src` into part `number` of upload `id` on `big`, of `range` or all of it.
+async fn part_copy(server: &Server, id: &str, number: u32, range: Option<&str>) -> Reply {
+    let uri = format!("/bkt/big?partNumber={number}&uploadId={id}");
+    let mut copy = call("PUT", &uri).header("x-amz-copy-source", "/bkt/src");
+    if let Some(range) = range {
+        copy = copy.header("x-amz-copy-source-range", range);
+    }
+    run(server, copy).await
+}
+
+/// The bytes in the files of upload `id` that never got their name.
+fn temp_part_bytes(server: &Server, id: &str) -> u64 {
+    std::fs::read_dir(server._dir.path().join("uploads").join(id)).map_or(0, |entries| {
+        entries
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp."))
+            .map(|entry| entry.metadata().map_or(0, |m| m.len()))
+            .sum()
+    })
+}
+
+/// A server with a flushed `src` of 3 read pieces and 17 bytes, and an upload on `big`.
+async fn with_part_source() -> (Server, Vec<u8>, String) {
+    let server = with_bucket().await;
+    let data = large_object();
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+    server.engine.flush().await.unwrap();
+    let id = initiate(&server).await;
+    (server, data, id)
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_gives_the_etag_of_upload_part() {
+    let (server, data, id) = with_part_source().await;
+    let cut = 5 * 1024 * 1024;
+    let first = format!("bytes=0-{}", cut - 1);
+    let rest = format!("bytes={cut}-{}", data.len() - 1);
+
+    let copied = [
+        part_copy(&server, &id, 1, Some(&first)).await,
+        part_copy(&server, &id, 2, Some(&rest)).await,
+    ];
+    let other = initiate(&server).await;
+    let uploaded = run(
+        &server,
+        call("PUT", &format!("/bkt/big?partNumber=1&uploadId={other}")).body(&data[..cut]),
+    )
+    .await;
+    let etags: Vec<String> = copied.iter().map(|c| c.xml("ETag").unwrap()).collect();
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let completed = run(
+        &server,
+        call("POST", &format!("/bkt/big?uploadId={id}")).body(body),
+    )
+    .await;
+    let read = run(&server, call("GET", "/bkt/big")).await;
+
+    for copy in &copied {
+        assert_eq!(copy.status, StatusCode::OK, "{}", copy.text());
+        assert!(copy.text().contains("<CopyPartResult"), "{}", copy.text());
+    }
+    assert_eq!(Some(etags[0].as_str()), uploaded.header("etag"));
+    assert_eq!(completed.status, StatusCode::OK, "{}", completed.text());
+    assert!(read.body == data);
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_with_no_range_copies_the_whole_source() {
+    let (server, data, id) = with_part_source().await;
+
+    let copied = part_copy(&server, &id, 1, None).await;
+
+    assert_eq!(copied.status, StatusCode::OK, "{}", copied.text());
+    let etag = format!("\"{}\"", blake3::hash(&data).to_hex());
+    assert_eq!(copied.xml("ETag").unwrap(), etag);
+}
+
+/// The range must name bytes of the source: `bytes=first-last`, first <= last < size.
+#[tokio::test]
+async fn test_upload_part_copy_refuses_a_range_outside_the_source() {
+    let (server, data, id) = with_part_source().await;
+    let size = data.len();
+    let ranges = [
+        format!("bytes=0-{size}"),
+        format!("bytes={size}-{size}"),
+        "bytes=9-3".to_string(),
+        "bytes=5-".to_string(),
+        "bytes=-5".to_string(),
+        "5-6".to_string(),
+        "bytes=0-1,4-5".to_string(),
+    ];
+
+    for range in &ranges {
+        let refused = part_copy(&server, &id, 1, Some(range)).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{range}: {}",
+            refused.text()
+        );
+        assert_eq!(refused.xml("Code").unwrap(), "InvalidArgument", "{range}");
+    }
+    let parts = run(&server, call("GET", &format!("/bkt/big?uploadId={id}"))).await;
+    assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
+    assert_eq!(part_temps(&server, &id), 0);
+}
+
+/// As for a CopyObject: no condition on the source is checked, so none is taken.
+#[tokio::test]
+async fn test_upload_part_copy_refuses_source_conditions() {
+    let (server, _, id) = with_part_source().await;
+    let uri = format!("/bkt/big?partNumber=1&uploadId={id}");
+
+    let refused = run(
+        &server,
+        call("PUT", &uri)
+            .header("x-amz-copy-source", "/bkt/src")
+            .header("x-amz-copy-source-if-match", "\"x\""),
+    )
+    .await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_IMPLEMENTED,
+        "{}",
+        refused.text()
+    );
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_of_a_missing_source_or_upload_fails() {
+    let (server, _, id) = with_part_source().await;
+    let uri = format!("/bkt/big?partNumber=1&uploadId={id}");
+
+    let no_source = run(
+        &server,
+        call("PUT", &uri).header("x-amz-copy-source", "/bkt/missing"),
+    )
+    .await;
+    let no_upload = part_copy(&server, "0123456789abcdef0123456789abcdef", 1, None).await;
+
+    assert_eq!(no_source.xml("Code").unwrap(), "NoSuchKey");
+    assert_eq!(no_upload.xml("Code").unwrap(), "NoSuchUpload");
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_of_a_buffered_source_works() {
+    let server = with_bucket().await;
+    let data = large_object();
+    sized_put(&server, "src", data.clone(), data.len(), None).await;
+    let id = initiate(&server).await;
+
+    let copied = part_copy(&server, &id, 1, Some("bytes=10-20")).await;
+
+    assert_eq!(copied.status, StatusCode::OK, "{}", copied.text());
+    let etag = format!("\"{}\"", blake3::hash(&data[10..21]).to_hex());
+    assert_eq!(copied.xml("ETag").unwrap(), etag);
+}
+
+/// The copy reads the version of the source that it opened: an overwrite during the copy does
+/// not change the part.
+#[tokio::test]
+async fn test_upload_part_copy_keeps_the_source_version_of_its_start() {
+    let (server, data, id) = with_part_source().await;
+
+    let (copied, _) = tokio::join!(part_copy(&server, &id, 1, None), async {
+        while temp_part_bytes(&server, &id) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let newer = put(&server, "src", "newer").await;
+        assert_eq!(newer.status, StatusCode::OK);
+        server.engine.flush().await.unwrap();
+    });
+
+    assert_eq!(copied.status, StatusCode::OK, "{}", copied.text());
+    let etag = format!("\"{}\"", blake3::hash(&data).to_hex());
+    assert_eq!(copied.xml("ETag").unwrap(), etag);
+}
+
+/// A client that goes away drops the request: the part file goes, and no part is listed.
+#[tokio::test]
+async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
+    let (server, _, id) = with_part_source().await;
+
+    tokio::select! {
+        _ = part_copy(&server, &id, 1, None) => panic!("the copy ended before the drop"),
+        _ = async {
+            while temp_part_bytes(&server, &id) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        } => {}
+    }
+    let parts = run(&server, call("GET", &format!("/bkt/big?uploadId={id}"))).await;
+
+    assert_eq!(part_temps(&server, &id), 0);
+    assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
 }

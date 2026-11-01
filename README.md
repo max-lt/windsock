@@ -423,6 +423,15 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   its destination on this proxy (`If-None-Match: *`, `If-Match`, a create-only prefix) gets
   `409 ConditionalRequestConflict`.
 
+- An UploadPartCopy reads a range of its source as a GET does, with room in the read budget, and
+  writes it as an upload part, with the checks and the room of an UploadPart. The range in
+  `x-amz-copy-source-range` is `bytes=first-last`, with both bytes in the source; any other value
+  gets `400 InvalidArgument`. With no range, the part is the whole source. The reader fixes the
+  source version at the start. The part ETag is the blake3 hash of its data, as for an
+  UploadPart. A condition on the source (`x-amz-copy-source-if-*`) gets `501 NotImplemented`, as
+  for a CopyObject. Part copies count in the 16 copies that run at once. A client that goes away
+  drops the part file.
+
 ## Scale
 
 Measured with 200,000 small objects in one bucket:

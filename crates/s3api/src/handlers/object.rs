@@ -1,7 +1,8 @@
 //! Object operations and multipart uploads.
 
 use super::conditions::{
-    Precondition, byte_range, check_conditions, not_modified, precondition, write_mode,
+    Precondition, byte_range, check_conditions, copy_source_range, not_modified, precondition,
+    write_mode,
 };
 use super::*;
 
@@ -42,8 +43,11 @@ pub(crate) async fn object_put<R: Remote + 'static>(
     })?;
 
     // Every other upload part streams: here only a part copy comes.
-    if params.contains_key("uploadId") && params.contains_key("partNumber") {
-        return Err(S3Error::not_implemented("UploadPartCopy is not supported"));
+    if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber")) {
+        let source = header(&headers, "x-amz-copy-source")
+            .ok_or_else(|| S3Error::invalid_argument("a part with no body stream is a copy"))?;
+        let part = (upload_id.as_str(), number.as_str());
+        return copy_part(&state, source, (&bucket, &key), part, &headers).await;
     }
 
     let mode = write_mode(&headers)?;
@@ -69,6 +73,50 @@ async fn copy_object<R: Remote + 'static>(
     headers: &HeaderMap,
     mode: WriteMode,
 ) -> Reply {
+    let (source_bucket, source_key) = copy_source(source, headers)?;
+    let (source_bucket, source_key) = (source_bucket.as_str(), source_key.as_str());
+
+    let replace = match header(headers, "x-amz-metadata-directive") {
+        None | Some("COPY") => false,
+        Some("REPLACE") => true,
+        Some(_) => {
+            return Err(S3Error::invalid_argument(
+                "x-amz-metadata-directive must be COPY or REPLACE",
+            ));
+        }
+    };
+    if !replace && source_bucket == bucket && source_key == key {
+        return Err(S3Error::new(
+            "InvalidRequest",
+            StatusCode::BAD_REQUEST,
+            "a copy onto itself must replace the metadata",
+        ));
+    }
+
+    let _slot = copy_slot(state)?;
+    let metadata = match replace {
+        true => Some(metadata(headers)?),
+        false => None,
+    };
+    // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
+    let info = state
+        .engine
+        .copy(
+            (source_bucket, source_key),
+            (bucket, key),
+            metadata,
+            mode,
+            FIRST_PIECE_WAIT,
+        )
+        .await?
+        .info;
+
+    xml_reply(xml::copy_result(&etag(&info), info.last_modified))
+}
+
+/// The bucket and key of `x-amz-copy-source`. No condition on the source is checked, so a copy
+/// that asks for one is refused.
+fn copy_source(source: &str, headers: &HeaderMap) -> Result<(String, String), S3Error> {
     if headers
         .keys()
         .any(|name| name.as_str().starts_with("x-amz-copy-source-if-"))
@@ -88,52 +136,76 @@ async fn copy_object<R: Remote + 'static>(
             "versioned copy sources are not supported",
         ));
     }
-    let (source_bucket, source_key) = source
+    let (bucket, key) = source
         .split_once('/')
         .ok_or_else(|| S3Error::invalid_argument("x-amz-copy-source must be bucket/key"))?;
+    Ok((bucket.to_string(), key.to_string()))
+}
 
-    let replace = match header(headers, "x-amz-metadata-directive") {
-        None | Some("COPY") => false,
-        Some("REPLACE") => true,
-        Some(_) => {
-            return Err(S3Error::invalid_argument(
-                "x-amz-metadata-directive must be COPY or REPLACE",
-            ));
-        }
-    };
-    if !replace && source_bucket == bucket && source_key == key {
-        return Err(S3Error::new(
-            "InvalidRequest",
-            StatusCode::BAD_REQUEST,
-            "a copy onto itself must replace the metadata",
-        ));
-    }
-
-    let _slot = state.copies.try_acquire().map_err(|_| {
+/// One of the MAX_COPIES slots of the copies that run at once, or 503.
+fn copy_slot<R>(state: &AppState<R>) -> Result<tokio::sync::SemaphorePermit<'_>, S3Error> {
+    state.copies.try_acquire().map_err(|_| {
         S3Error::new(
             "SlowDown",
             StatusCode::SERVICE_UNAVAILABLE,
             format!("{} copies run at once: try again", crate::MAX_COPIES),
         )
-    })?;
-    let metadata = match replace {
-        true => Some(metadata(headers)?),
-        false => None,
-    };
-    // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
-    let info = state
-        .engine
-        .copy(
-            (source_bucket, source_key),
-            (bucket, key),
-            metadata,
-            mode,
-            FIRST_PIECE_WAIT,
-        )
-        .await?
-        .info;
+    })
+}
 
-    xml_reply(xml::copy_result(&etag(&info), info.last_modified))
+/// UploadPartCopy: a range of the source, read as a GET and written as an upload part. The part
+/// ETag is the blake3 hash of its data, as for UploadPart.
+async fn copy_part<R: Remote + 'static>(
+    state: &AppState<R>,
+    source: &str,
+    object: (&str, &str),
+    (upload_id, number): (&str, &str),
+    headers: &HeaderMap,
+) -> Reply {
+    let (source_bucket, source_key) = copy_source(source, headers)?;
+    // A part waits for no buffer room, but a far-ahead clock or a drain stops every write.
+    state.engine.check_writes()?;
+    let _slot = copy_slot(state)?;
+    // The head decides the range; the reader must open the same version, which it then keeps.
+    let (mut reader, length, room) = loop {
+        let info = state.engine.head(&source_bucket, &source_key).await?;
+        let range = copy_source_range(headers, info.size)?;
+        let length = range
+            .as_ref()
+            .map_or(info.size, |range| range.end - range.start);
+        // As a GET: with no room in the read budget, a 503 after the wait of the first piece.
+        let room = state.engine.read_room(Some(FIRST_PIECE_WAIT)).await?;
+        let reader = state
+            .engine
+            .get_reader(&source_bucket, &source_key, range)
+            .await?;
+        if reader.info.content_hash == info.content_hash {
+            break (reader, length, room);
+        }
+    };
+    let mut part = state
+        .uploads
+        .begin_part(upload_id, object, number, length)
+        .await?;
+    let mut room = Some(room);
+    loop {
+        let held = match room.take() {
+            Some(room) => room,
+            None => state.engine.piece_room(&mut reader).await?,
+        };
+        let Some(piece) = state.engine.next_piece(&mut reader).await? else {
+            break;
+        };
+        for piece in piece.chunks(PUT_PIECE) {
+            Sink::write(&mut part, piece).await?;
+        }
+        drop(held);
+    }
+    let etag = part.finish().await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    xml_reply(xml::copy_part_result(&etag, now))
 }
 
 pub(crate) async fn object_get<R: Remote + 'static>(

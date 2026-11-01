@@ -650,3 +650,44 @@ async fn test_new_node_identity_on_a_remote_with_chains_warns_at_start() {
     );
     assert!(restarted.stop());
 }
+
+/// A copy by reference on A names the packs of the source, and B reads it with no new pack.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_copy_by_reference_on_one_proxy_reads_on_the_other() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cluster = Cluster::new();
+    let by_reference = |name: &str| {
+        let path = cluster.config(name, 100, false);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace("[engine]\n", "[engine]\ncopy_ref_min = 1\n"),
+        )
+        .unwrap();
+        path
+    };
+    let mut a = start(&by_reference("a"), "info,engine=debug");
+    let b = start(&by_reference("b"), "info");
+    let data = random_bytes(7, 4 * 1024 * 1024);
+    share_bucket(&a, &b).await;
+    put(&a, "/shared/src", &data).await;
+    eventually(&b, "/shared/src", &data, Duration::from_secs(60)).await;
+    let packs = count(&cluster.remote(), "packs");
+
+    let copied = common::call_with(
+        &a.address,
+        &test_keys(),
+        ("PUT", "/shared/dst"),
+        b"",
+        &[("x-amz-copy-source", "/shared/src")],
+    )
+    .await;
+
+    assert_eq!(copied.status, StatusCode::OK, "{}", copied.text());
+    eventually(&b, "/shared/dst", &data, Duration::from_secs(30)).await;
+    assert_eq!(count(&cluster.remote(), "packs"), packs);
+    let spooled = a.count_after("copy through the spool", Duration::from_millis(200));
+    assert_eq!(spooled, 0, "the copy went through the spool");
+    assert!(a.stop() && b.stop());
+    assert_chains_whole(&cluster.remote());
+}

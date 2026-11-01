@@ -223,10 +223,21 @@ pub async fn call_at(
     path: &str,
     body: &[u8],
 ) -> Reply {
+    call_with(address, keys, (method, path), body, &[]).await
+}
+
+/// A signed request to `address` with the signed headers `extra`.
+pub async fn call_with(
+    address: &str,
+    keys: &(String, String),
+    (method, path): (&str, &str),
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> Reply {
     let mut request = Request::builder()
         .method(method)
         .uri(format!("http://{address}{path}"));
-    for (name, value) in signed_headers_at(address, keys, method, path, body) {
+    for (name, value) in signed_headers_with(address, keys, (method, path), body, extra) {
         request = request.header(name, value);
     }
     let request = request
@@ -270,6 +281,17 @@ pub fn signed_headers_at(
     path: &str,
     body: &[u8],
 ) -> Vec<(String, String)> {
+    signed_headers_with(address, keys, (method, path), body, &[])
+}
+
+/// [`signed_headers_at`] with the headers `extra` signed too.
+pub fn signed_headers_with(
+    address: &str,
+    keys: &(String, String),
+    (method, path): (&str, &str),
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
     let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -282,6 +304,11 @@ pub fn signed_headers_at(
         ("x-amz-content-sha256".to_string(), payload_hash.clone()),
         ("x-amz-date".to_string(), timestamp.clone()),
     ];
+    headers.extend(
+        extra
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
     let (authorization, _) = sigv4::sign(
         &sigv4::Request {
             method,

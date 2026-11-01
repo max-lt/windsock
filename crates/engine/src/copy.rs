@@ -113,7 +113,7 @@ impl<R: Remote + 'static> Engine<R> {
         let Some(manifest_id) = self.retry_after_sync(|| self.stored_source(source)).await? else {
             return Ok(Err(SpoolReason::BufferedSource));
         };
-        let from = self.manifest(manifest_id).await?;
+        let (from, encoded) = self.sized_manifest(manifest_id).await?;
         if from.size < self.config.copy_ref_min {
             return Ok(Err(SpoolReason::Small));
         }
@@ -149,9 +149,10 @@ impl<R: Remote + 'static> Engine<R> {
             .acquire()
             .await
             .expect("the copy slots are never closed");
-        // The source manifest and the new one, as GET pieces in memory.
+        // At most two manifests in memory, then the new one with its encoding and its sealed form.
+        let decoded = (from.chunks.len() * std::mem::size_of::<ChunkRef>()) as u64;
         let _room = self
-            .room_for(2 * from.encode().len() as u64, Some(wait))
+            .room_for((2 * decoded).max(decoded + 2 * encoded), Some(wait))
             .await?;
         let fresh = match tokio::time::timeout(COPY_SYNC_DEADLINE, self.ensure_fresh_sync()).await {
             Err(_) => return Ok(Err(SpoolReason::RemoteDown)),

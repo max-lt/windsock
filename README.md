@@ -399,9 +399,15 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   manifest PUT (none for a manifest of 4 KiB or less, which goes in the entry) and 1 entry
   create. The ack waits for the entry in the remote and its apply in the index, not for a local
   fsync. It reads no pack, so it does not find a damaged pack of the source; a later read of the
-  copy finds it, as a read of the source does. At most 4 copies by reference run at once; each
-  holds 2 times the size of the source manifest in the read budget. A copy goes through the spool
-  in place of a reference when:
+  copy finds it, as a read of the source does. At most 4 copies by reference run at once. Each
+  holds room in the read budget for its manifests in memory: the larger of 2 decoded manifests,
+  or 1 decoded manifest and 2 times its encoding. Measured on macOS, release build, on a local
+  remote with 30 ms per call, after the first write of the process: a copy by reference made 2
+  remote calls and took 100 to 120 ms from 4 MiB to 256 MiB. A spool copy took 61 ms at 16 MiB
+  and 539 ms at 256 MiB with the cache on, and 210 ms and 979 ms with the cache off, plus the
+  flush. For 327,680 chunks (5 GiB in chunks of 16 KiB), the manifest has 23.7 MiB, and its
+  decode, the index lookups and the new encoding took 245 ms. A copy goes through the spool in
+  place of a reference when:
   - `engine.copy_ref_min` is 0, or the source is smaller;
   - the source is still only in the buffer of this proxy;
   - the destination has a buffered write on this proxy;

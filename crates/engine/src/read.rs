@@ -391,8 +391,13 @@ impl<R: Remote + 'static> Engine<R> {
 
     /// The manifest from the index, or from the remote on a miss.
     pub(crate) async fn manifest(&self, id: ObjectId) -> Result<Manifest> {
+        Ok(self.sized_manifest(id).await?.0)
+    }
+
+    /// [`Engine::manifest`] and the length of its encoding.
+    pub(crate) async fn sized_manifest(&self, id: ObjectId) -> Result<(Manifest, u64)> {
         if let Some(bytes) = self.index().manifest(id)? {
-            return Manifest::decode(id, &bytes);
+            return Ok((Manifest::decode(id, &bytes)?, bytes.len() as u64));
         }
 
         let Some(sealed) = self
@@ -410,7 +415,7 @@ impl<R: Remote + 'static> Engine<R> {
             .map_err(|e| EngineError::Corrupt(format!("manifest {id}: {e}")))?;
         let manifest = Manifest::decode(id, &bytes)?;
         self.index().put_manifest(id, &bytes)?;
-        Ok(manifest)
+        Ok((manifest, bytes.len() as u64))
     }
 
     pub(crate) async fn entry_manifest(

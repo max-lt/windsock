@@ -76,11 +76,13 @@ Windsock also reserves `repo/`: it holds `repo/key-check`, see `encryption.md`.
 
 ## The S3 client
 
-- At most 64 calls to the remote run at one time. The client keeps at most 64 idle connections.
+- At most 64 calls to the remote run at one time. The client keeps at most 32 idle connections.
   More calls wait for a slot.
 - A call has at most 6 attempts. The pause between attempts starts at 100 ms and doubles up to
   5 s. One attempt stops after 60 s, and all attempts of one call stop after 120 s.
 - Statuses 408, 429, 500, 502, 503 and 504 cause a new attempt, and so does a lost connection.
+  So does 409 `ConditionalRequestConflict`, which S3 gives to two conditional writes of one key at
+  once, and a Windsock remote to a conditional write during a copy by reference.
   Other statuses, such as 403 `RequestTimeTooSkewed`, fail at once with their S3 code in the log.
 - The client does not follow a redirect.
 - The client always verifies the TLS certificate and its host name. No setting turns the check

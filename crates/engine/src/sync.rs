@@ -7,10 +7,10 @@ const SYNC_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// A sync that stops before the index applies its entries, on an error or a drop of its future,
 /// moves the journal back to the applied frontiers: the next sync reads those entries again.
-struct Unapplied<'a, R: Remote + 'static> {
-    engine: &'a Engine<R>,
-    journal: &'a mut Journal<R>,
-    applied: bool,
+pub(crate) struct Unapplied<'a, R: Remote + 'static> {
+    pub(crate) engine: &'a Engine<R>,
+    pub(crate) journal: &'a mut Journal<R>,
+    pub(crate) applied: bool,
 }
 
 impl<R: Remote + 'static> Drop for Unapplied<'_, R> {

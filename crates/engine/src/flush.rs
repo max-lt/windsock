@@ -544,17 +544,19 @@ impl<R: Remote + 'static> Engine<R> {
     /// Applies an own entry, with the own-chain entries the commit read, and
     /// persists the index: the buffer may drop the writes after this.
     pub(crate) async fn apply_own(&self, journal: &mut Journal<R>, entry: Entry) -> Result<()> {
-        let mut entries = journal.take_stashed();
+        // A copy by reference runs this in a request future: a client can drop it at any await.
+        let mut cut = crate::sync::Unapplied {
+            engine: self,
+            journal,
+            applied: false,
+        };
+        let mut entries = cut.journal.take_stashed();
         // A pruned copy of the entry can come back from the remote: keep the whole one.
         entries.retain(|stashed| (stashed.node, stashed.seq) != (entry.node, entry.seq));
 
         // Another process with this identity wrote entries that a prune redacted.
         if entries.iter().any(|stashed| stashed.actions.is_none()) {
-            let loaded = self.bootstrap(journal).await;
-            if !matches!(loaded, Ok(Ok(()))) {
-                self.reset_journal(journal);
-            }
-            if let Err(none) = loaded? {
+            if let Err(none) = self.bootstrap(cut.journal).await? {
                 return Err(EngineError::Corrupt(format!("redacted entries and {none}")));
             }
             entries.clear();
@@ -562,13 +564,10 @@ impl<R: Remote + 'static> Engine<R> {
 
         entries.push(entry);
 
-        if let Err(e) = self.ingest(&entries).await {
-            // The journal is past these entries and the index never got them: read them again.
-            self.reset_journal(journal);
-            return Err(e);
-        }
+        self.ingest(&entries).await?;
         let mut index = self.index();
         index.apply(entries)?;
+        cut.applied = true;
         index.persist()?;
         Ok(())
     }

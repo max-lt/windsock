@@ -32,6 +32,8 @@ struct FaultRemote {
     inner: MemoryRemote,
     next: Mutex<Option<(&'static str, Fault)>>,
     failing_reads: Mutex<Option<&'static str>>,
+    /// Reads under this prefix never answer, as on a link that hangs.
+    stalling_reads: Mutex<Option<&'static str>>,
     /// Reads of journal entries.
     log_gets: std::sync::atomic::AtomicUsize,
     /// A put on a key that exists fails, as on a write-once store.
@@ -97,6 +99,10 @@ impl Remote for FaultRemote {
         if key.starts_with("log/") {
             self.log_gets
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let stalling = *self.stalling_reads.lock().unwrap();
+        if stalling.is_some_and(|prefix| key.starts_with(prefix)) {
+            std::future::pending::<()>().await;
         }
         let failing = *self.failing_reads.lock().unwrap();
         if failing.is_some_and(|prefix| key.starts_with(prefix)) {
@@ -439,6 +445,48 @@ async fn test_own_write_stays_visible_when_the_commit_reads_a_bad_manifest() {
 
     let object = second.engine.get(BUCKET, "own", None).await.unwrap();
     assert_eq!(&object.data[..], b"mine");
+}
+
+/// As above, but the commit stops at a manifest read that never answers, and its caller drops it,
+/// as a client drops a copy by reference. The entries that it read must come back at a later sync.
+#[tokio::test]
+async fn test_own_write_stays_visible_when_the_commit_is_dropped_in_its_apply() {
+    let remote = Arc::new(FaultRemote::default());
+    let first = proxy(&remote, 1).await;
+    let second = proxy(&remote, 1).await;
+    first.engine.create_bucket(BUCKET, None).await.unwrap();
+    first.engine.flush().await.unwrap();
+    second.engine.sync().await.unwrap();
+    let big = BTreeMap::from([("x-amz-meta-a".to_string(), "m".repeat(6000))]);
+    let put = first.engine.put(
+        BUCKET,
+        "big",
+        Bytes::from_static(b"v"),
+        big,
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    first.engine.flush().await.unwrap();
+
+    let put = second.engine.put(
+        BUCKET,
+        "own",
+        Bytes::from_static(b"mine"),
+        BTreeMap::new(),
+        WriteMode::Overwrite,
+    );
+    put.await.unwrap();
+    *remote.stalling_reads.lock().unwrap() = Some("manifests/");
+    let dropped = tokio::time::timeout(Duration::from_millis(500), second.engine.flush()).await;
+    *remote.stalling_reads.lock().unwrap() = None;
+    second.engine.flush().await.unwrap();
+    second.engine.sync().await.unwrap();
+
+    assert!(dropped.is_err(), "the commit did not stall");
+    let own = second.engine.get(BUCKET, "own", None).await.unwrap();
+    assert_eq!(&own.data[..], b"mine");
+    let big = second.engine.get(BUCKET, "big", None).await.unwrap();
+    assert_eq!(&big.data[..], b"v");
 }
 
 /// A flush writes its intent, then the journal refuses the entry. The intent waits past the late

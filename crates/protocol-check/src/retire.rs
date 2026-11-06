@@ -1,7 +1,7 @@
 //! Model check of chain retirement: a GC runner retires a quiet chain, and writers leave it out
 //! of `seen`.
 //!
-//! Node 0 is the GC runner. It writes only Retire entries, and a Retire entry lists only the
+//! Node 0 is the GC runner. It writes puts and Retire entries, and a Retire entry lists only the
 //! chain that it retires: a repository whose header guard trips can still write it. Nodes 1
 //! and 2 write puts to one key; either can go quiet, be retired, and write again. Each node
 //! applies entries to its own index, and two more readers apply them in any order, one of them
@@ -12,6 +12,9 @@
 //! reader decides that one put knew another from `listed` and the Retire entries that the GC
 //! link of the put reaches. The properties compare that with `full`. A Retire entry lists only
 //! its chain, so a reader applies it once it has that link, as the index does.
+//!
+//! Not in the model: a second GC runner (a handover, a Retire in a retired chain) and the skip
+//! of a retired chain in the stable HLC. Unit tests of the index cover them.
 
 use stateright::{Model, Property};
 
@@ -65,6 +68,8 @@ pub struct Rules {
     pub retire_applied_only: bool,
     /// A put knows the retired entries at all: without this rule a writer only drops links.
     pub knew_retired: bool,
+    /// A put of the GC runner knows what the Retire entries before it in its chain retired.
+    pub knew_own_retires: bool,
 }
 
 pub const SAFE: Rules = Rules {
@@ -72,6 +77,7 @@ pub const SAFE: Rules = Rules {
     drop_at_frontier_only: true,
     retire_applied_only: true,
     knew_retired: true,
+    knew_own_retires: true,
 };
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -188,7 +194,7 @@ impl State {
 
     /// The applied puts of `reader`: (node, seq).
     fn puts(&self, reader: usize) -> Vec<Put> {
-        (1..NODES)
+        (0..NODES)
             .flat_map(|n| (0..usize::from(self.applied[reader][n])).map(move |s| (n, s)))
             .filter(|&(n, s)| self.chains[n][s].kind == Kind::Put)
             .collect()
@@ -235,7 +241,9 @@ impl RetireModel {
         if !self.rules.knew_retired {
             return false;
         }
+        // The GC runner lists no link to its own chain: its earlier entries are its link.
         let gc = match self.rules.knew_needs_gc_link {
+            true if a.0 == GC && self.rules.knew_own_retires => a.1 as u8,
             true => entry.listed[GC].unwrap_or(0),
             false => s.chains[GC].len() as u8,
         };
@@ -271,6 +279,7 @@ impl Model for RetireModel {
 
     fn actions(&self, s: &State, actions: &mut Vec<Action>) {
         if s.entries() < self.max_entries {
+            actions.push(Action::Put { node: GC });
             for node in 1..NODES {
                 actions.push(Action::Put { node });
                 if s.retires() < self.max_retires {
@@ -523,6 +532,17 @@ mod tests {
                 ..SAFE
             },
             CAUSAL,
+        );
+    }
+
+    #[test]
+    fn test_gc_put_with_no_knew_of_its_own_retires_breaks_knew() {
+        assert_breaks(
+            Rules {
+                knew_own_retires: false,
+                ..SAFE
+            },
+            SAME_KNEW,
         );
     }
 

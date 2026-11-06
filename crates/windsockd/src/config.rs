@@ -211,6 +211,17 @@ impl Config {
             );
         }
 
+        // An interval of 0 runs its task back to back, and a timeout of 0 cuts every connection.
+        let positive = [
+            ("sync_interval_secs", config.sync_interval_secs),
+            ("idle_timeout_secs", config.idle_timeout_secs),
+            ("request_timeout_secs", config.request_timeout_secs),
+            ("gc.interval_secs", config.gc.interval_secs),
+        ];
+        if let Some((name, _)) = positive.iter().find(|(_, value)| *value == 0) {
+            bail!("{}: {name} is 0, it must be at least 1", path.display());
+        }
+
         let base = path.parent().unwrap_or(Path::new("."));
         config.data_dir = base.join(&config.data_dir);
         config.repo_key = base.join(&config.repo_key);
@@ -460,5 +471,32 @@ mod tests {
         let error = Config::load(&path).unwrap_err().to_string();
 
         assert!(error.contains("uploads_expire_secs"), "{error}");
+    }
+
+    /// An interval of 0 runs the sync or the GC back to back against a paid remote, and a
+    /// timeout of 0 cuts every connection at once.
+    #[test]
+    fn test_zero_interval_or_timeout_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("windsock.toml");
+        let text = toml::to_string(&Config::local().unwrap()).unwrap();
+        let fields = [
+            "sync_interval_secs",
+            "idle_timeout_secs",
+            "request_timeout_secs",
+            "interval_secs",
+        ];
+
+        for field in fields {
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&format!("{field} = ")))
+                .unwrap();
+            std::fs::write(&path, text.replace(line, &format!("{field} = 0"))).unwrap();
+            let loaded = Config::load(&path);
+
+            let error = loaded.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(error.contains(field), "{field}: {error}");
+        }
     }
 }

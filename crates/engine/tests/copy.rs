@@ -786,3 +786,40 @@ async fn test_copy_that_waits_for_a_flush_holds_no_read_room() {
     assert_eq!(copied.unwrap().path, CopyPath::Reference);
     assert_eq!(during, budget);
 }
+
+/// A copy marks its target until its apply: a copy that ends, with an ack or with an error,
+/// leaves no mark, or every later conditional write to that key gets Conflict.
+#[tokio::test]
+async fn test_conditional_write_after_a_reference_copy_ends_gets_no_conflict() {
+    let remote = Arc::new(TestRemote::default());
+    let (a, _) = with_source(&remote, config()).await;
+    let create = |key: &'static str| {
+        let engine = &a.engine;
+        async move {
+            engine
+                .put(
+                    BUCKET,
+                    key,
+                    Bytes::from_static(b"later"),
+                    BTreeMap::new(),
+                    WriteMode::CreateOnly,
+                )
+                .await
+        }
+    };
+
+    let copied = copy(&a.engine, "done", WriteMode::Overwrite).await;
+    let after_ack = create("done").await;
+    engine::sim::arm_crash(Some(Point::CopyRefPlan));
+    let crashed = copy(&a.engine, "failed", WriteMode::Overwrite).await;
+    engine::sim::arm_crash(None);
+    let after_error = create("failed").await;
+
+    assert_eq!(copied.unwrap().path, CopyPath::Reference);
+    assert!(
+        matches!(after_ack, Err(EngineError::PreconditionFailed { .. })),
+        "{after_ack:?}"
+    );
+    assert!(crashed.is_err());
+    assert!(after_error.is_ok(), "{after_error:?}");
+}

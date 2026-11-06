@@ -375,11 +375,12 @@ impl Drop for RefTarget<'_> {
             .targets
             .lock()
             .expect("no panic while the lock is held");
-        if let Some(count) = targets.get_mut(&self.target) {
-            *count -= 1;
-            if *count == 0 {
-                targets.remove(&self.target);
-            }
+        let count = targets
+            .get_mut(&self.target)
+            .expect("a live guard has its entry");
+        *count -= 1;
+        if *count == 0 {
+            targets.remove(&self.target);
         }
     }
 }

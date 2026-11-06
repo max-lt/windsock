@@ -1741,6 +1741,13 @@ impl Totals {
             ("a dedup hit", self.dedup_hits),
             ("a failed copy whose entry applied", self.late_copy),
             ("an orphan manifest check", self.orphans_checked),
+            ("a retire entry", self.retire_written),
+            ("an entry that left out a retired chain", self.link_dropped),
+            ("a retired chain that wrote again", self.retired_again),
+            (
+                "a stable HLC that skipped a retired chain",
+                self.stable_skip,
+            ),
         ];
         for (branch, count) in branches {
             assert!(count > 0, "no seed had {branch}: {self:?}");
@@ -1756,6 +1763,7 @@ impl Totals {
             CopyPath::Spool(engine::SpoolReason::Small),
             CopyPath::Spool(engine::SpoolReason::BufferedSource),
             CopyPath::Spool(engine::SpoolReason::BufferedTarget),
+            CopyPath::Spool(engine::SpoolReason::NoFreshSync),
             CopyPath::Spool(engine::SpoolReason::Policy),
         ];
         for path in paths {

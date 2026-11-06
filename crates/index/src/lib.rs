@@ -1808,6 +1808,77 @@ mod tests {
         assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
     }
 
+    /// The GC proxy leaves a chain out of its own next entry once it retired it: its own Retire,
+    /// earlier in its chain, says that it knew the retired entries.
+    #[tokio::test]
+    async fn test_put_after_its_writer_retired_a_chain_knew_that_chain() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut x = journal(&remote, 1);
+        let mut gc = journal(&remote, 3);
+        let first = x.append(put("k", 1), Seen::new()).await.unwrap();
+        let link = Link {
+            seq: first.seq,
+            hash: first.hash(),
+        };
+        let retire = vec![Action::Retire {
+            node: first.node,
+            upto: 1,
+        }];
+        let retired = gc
+            .append(retire, Seen::from([(first.node, link)]))
+            .await
+            .unwrap();
+        let second = gc.append(put("k", 2), Seen::new()).await.unwrap();
+        let entries = vec![first, retired, second];
+        let mut index = Index::open_temporary().unwrap();
+        let mut reversed = Index::open_temporary().unwrap();
+
+        index.apply(entries.clone()).unwrap();
+        reversed.apply(entries.into_iter().rev().collect()).unwrap();
+
+        assert!(!conflicted(&index));
+        assert_eq!(index.resolve("b", "k").unwrap(), Some(manifest(2)));
+        assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
+    }
+
+    /// A GC runner that took over retires the chain of the one before it, which retired others: a
+    /// writer that reached the last Retire knew all the entries that the first one retired.
+    #[tokio::test]
+    async fn test_put_that_reached_a_retire_of_a_retiring_chain_knew_both() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut x = journal(&remote, 1);
+        let mut w = journal(&remote, 2);
+        let mut gc1 = journal(&remote, 3);
+        let mut gc2 = journal(&remote, 4);
+        let link = |e: &Entry| Link {
+            seq: e.seq,
+            hash: e.hash(),
+        };
+        let retire = |e: &Entry| {
+            vec![Action::Retire {
+                node: e.node,
+                upto: e.seq + 1,
+            }]
+        };
+        let first = x.append(put("k", 1), Seen::new()).await.unwrap();
+        let seen = Seen::from([(first.node, link(&first))]);
+        let retired = gc1.append(retire(&first), seen).await.unwrap();
+        let seen = Seen::from([(retired.node, link(&retired))]);
+        let retired_gc = gc2.append(retire(&retired), seen).await.unwrap();
+        let seen = Seen::from([(retired_gc.node, link(&retired_gc))]);
+        let second = w.append(put("k", 2), seen).await.unwrap();
+        let entries = vec![first, retired, retired_gc, second];
+        let mut index = Index::open_temporary().unwrap();
+        let mut reversed = Index::open_temporary().unwrap();
+
+        index.apply(entries.clone()).unwrap();
+        reversed.apply(entries.into_iter().rev().collect()).unwrap();
+
+        assert!(!conflicted(&index));
+        assert_eq!(index.resolve("b", "k").unwrap(), Some(manifest(2)));
+        assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
+    }
+
     /// A Retire of an entry that its writer did not apply moves nothing.
     #[tokio::test]
     async fn test_retire_past_what_its_writer_applied_is_ignored() {

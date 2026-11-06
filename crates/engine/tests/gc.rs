@@ -977,8 +977,51 @@ async fn test_gc_retires_chains_in_batches_when_the_header_guard_trips() {
     let a = proxy_with(&remote, 1, config).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     a.engine.flush().await.unwrap();
+    quiet_chains(&remote, 1100).await;
+    a.engine.sync().await.unwrap();
+
+    advance(SHORT_RETENTION + Duration::from_millis(500));
+    let report = a.engine.gc().await.unwrap();
+    // Before the retire, this flush fails with HeaderTooLarge (flush_faults.rs).
+    put(&a.engine, "k", b"v").await;
+    let flushed = a.engine.flush().await;
+
+    assert_eq!(report.retired_chains, 1100);
+    assert!(flushed.is_ok(), "{flushed:?}");
+    assert!(last_seen(&remote, &a.engine).await.len() < 10);
+}
+
+/// Past the header limit, every entry with the full seen fails: the retire must come before the
+/// condemn, or no GC run ever gets out.
+#[tokio::test]
+async fn test_gc_retires_before_it_condemns_past_the_header_limit() {
+    let remote = Arc::new(TestRemote::new());
+    let config = Config {
+        retire_chains: true,
+        ..config(Duration::ZERO)
+    };
+    let a = proxy_with(&remote, 1, config).await;
+    a.engine.create_bucket(BUCKET, None).await.unwrap();
+    a.engine.flush().await.unwrap();
+    quiet_chains(&remote, 1100).await;
+    let orphan = format!("packs/{}", "ab".repeat(32));
+    remote
+        .put(&orphan, Bytes::from("partial flush"))
+        .await
+        .unwrap();
+    a.engine.sync().await.unwrap();
+
+    advance(SHORT_RETENTION + Duration::from_millis(500));
+    let report = a.engine.gc().await.unwrap();
+
+    assert_eq!(report.retired_chains, 1100);
+    assert_eq!(report.condemned_packs, 1);
+}
+
+/// `n` chains of one empty entry each, from writers that never write again.
+async fn quiet_chains(remote: &Arc<TestRemote>, n: u32) {
     let keys = engine::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys();
-    for n in 0..1100u32 {
+    for n in 0..n {
         let key = SigningKey::from_bytes(blake3::hash(&n.to_le_bytes()).as_bytes());
         let mut chain = journal::Journal::new(
             remote.clone(),
@@ -991,17 +1034,6 @@ async fn test_gc_retires_chains_in_batches_when_the_header_guard_trips() {
             .await
             .unwrap();
     }
-    a.engine.sync().await.unwrap();
-
-    advance(SHORT_RETENTION + Duration::from_millis(500));
-    let report = a.engine.gc().await.unwrap();
-    // Before the retire, this flush fails with HeaderTooLarge (flush_faults.rs).
-    put(&a.engine, "k", b"v").await;
-    let flushed = a.engine.flush().await;
-
-    assert_eq!(report.retired_chains, 1100);
-    assert!(flushed.is_ok(), "{flushed:?}");
-    assert!(last_seen(&remote, &a.engine).await.len() < 10);
 }
 
 /// Every copy of at least 1 byte goes by reference.

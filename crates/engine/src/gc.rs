@@ -98,6 +98,13 @@ impl<R: Sweep + 'static> Engine<R> {
             warn!(broken = ?sync.broken, "gc refused: a chain is broken");
             return Err(EngineError::BrokenChains(sync.broken));
         }
+        // A retire entry lists only its batch: past the header limit, the later entries of this
+        // run fit only once the retire is applied.
+        let retired_chains = if self.config.retire_chains {
+            self.retire_quiet_chains(started).await?
+        } else {
+            0
+        };
 
         let horizon = self.config.gc_horizon.as_nanos() as u64;
         let retention = self.config.retention.as_nanos() as u64;
@@ -124,6 +131,7 @@ impl<R: Sweep + 'static> Engine<R> {
         let mut report = GcReport {
             condemned_packs: packs.to_condemn.len(),
             condemned_manifests: manifests.to_condemn.len(),
+            retired_chains,
             ..GcReport::default()
         };
 
@@ -177,9 +185,6 @@ impl<R: Sweep + 'static> Engine<R> {
                 }
                 Err(e) => return Err(e),
             }
-        }
-        if self.config.retire_chains {
-            report.retired_chains = self.retire_quiet_chains(started).await?;
         }
         let (redacted, loaded) = self.prune_journal().await?;
         report.redacted_entries = redacted;

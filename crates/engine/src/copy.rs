@@ -113,7 +113,15 @@ impl<R: Remote + 'static> Engine<R> {
         let Some(manifest_id) = self.retry_after_sync(|| self.stored_source(source)).await? else {
             return Ok(Err(SpoolReason::BufferedSource));
         };
+        // The decoded source is outside the read budget until its room is taken: the slots bound
+        // how many copies hold one.
+        let _slot = self
+            .ref_copies
+            .acquire()
+            .await
+            .expect("the copy slots are never closed");
         let (from, encoded) = self.sized_manifest(manifest_id).await?;
+        crate::sim::count_copy_source();
         if from.size < self.config.copy_ref_min {
             return Ok(Err(SpoolReason::Small));
         }
@@ -144,11 +152,6 @@ impl<R: Remote + 'static> Engine<R> {
             },
         })?;
 
-        let _slot = self
-            .ref_copies
-            .acquire()
-            .await
-            .expect("the copy slots are never closed");
         // At most two manifests in memory, then the new one with its encoding and its sealed form.
         let decoded = (from.chunks.len() * std::mem::size_of::<ChunkRef>()) as u64;
         let _room = self

@@ -712,3 +712,33 @@ async fn test_delete_of_the_target_bucket_during_a_reference_copy_is_refused() {
         "{deleted:?}"
     );
 }
+
+/// A decoded source manifest is outside the read budget until the room is taken: a copy that waits
+/// for its slot must not hold one, or 16 copies hold 16 of them.
+#[tokio::test]
+async fn test_copy_that_waits_for_its_slot_holds_no_source_manifest() {
+    let remote = Arc::new(TestRemote::default());
+    let (a, _) = with_source(&remote, config()).await;
+    remote.hold_manifests.store(true, Ordering::SeqCst);
+    let before = engine::sim::copy_sources();
+    let targets: Vec<String> = (0..6).map(|n| format!("dst{n}")).collect();
+
+    let copies = futures_util::future::join_all(
+        targets
+            .iter()
+            .map(|target| copy(&a.engine, target, WriteMode::Overwrite)),
+    );
+    let check = async {
+        remote.held_manifests(4).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let decoded = engine::sim::copy_sources() - before;
+        remote.release.add_permits(6);
+        decoded
+    };
+    let (copied, decoded) = tokio::join!(copies, check);
+
+    assert_eq!(decoded, 4);
+    for copied in copied {
+        assert_eq!(copied.unwrap().path, CopyPath::Reference);
+    }
+}

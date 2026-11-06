@@ -89,7 +89,8 @@ pub struct Index {
     redacted: Keyspace,
     /// `retired node | writer | seq` of each valid Retire action, to its point and entry HLC.
     retired: Keyspace,
-    pending: Vec<Entry>,
+    /// Entries that wait for a dependency, by node and seq: a sync can read one again.
+    pending: BTreeMap<(NodeId, u64), Entry>,
     _temp: Option<tempfile::TempDir>,
 }
 
@@ -227,7 +228,7 @@ impl Index {
             redacted: db.keyspace("redacted", KeyspaceCreateOptions::default)?,
             retired: db.keyspace("retired", KeyspaceCreateOptions::default)?,
             db,
-            pending: Vec::new(),
+            pending: BTreeMap::new(),
             _temp: temp,
         })
     }
@@ -293,21 +294,23 @@ impl Index {
     /// Applies every entry whose causal dependencies are applied, and keeps the
     /// others pending. Returns the number of entries applied.
     pub fn apply(&mut self, entries: Vec<Entry>) -> Result<usize> {
-        self.pending.extend(entries);
+        for entry in entries {
+            self.pending.entry((entry.node, entry.seq)).or_insert(entry);
+        }
         let mut applied = 0;
 
         loop {
             let mut progress = false;
-            let mut i = 0;
+            let waiting: Vec<_> = self.pending.keys().copied().collect();
 
-            while i < self.pending.len() {
-                match self.readiness(&self.pending[i])? {
-                    Readiness::Wait => i += 1,
+            for key in waiting {
+                match self.readiness(&self.pending[&key])? {
+                    Readiness::Wait => {}
                     Readiness::AlreadyApplied => {
-                        self.pending.remove(i);
+                        self.pending.remove(&key);
                     }
                     Readiness::Ready => {
-                        let entry = self.pending.remove(i);
+                        let entry = self.pending.remove(&key).expect("a key of the map");
                         self.apply_one(&entry)?;
                         applied += 1;
                         progress = true;
@@ -796,7 +799,11 @@ impl Index {
             live.extend(state.live_manifests(recent));
         }
 
-        for action in self.pending.iter().flat_map(|e| e.actions.iter().flatten()) {
+        for action in self
+            .pending
+            .values()
+            .flat_map(|e| e.actions.iter().flatten())
+        {
             if let Action::Put { manifest_id, .. } = action {
                 live.insert(*manifest_id);
             }
@@ -839,7 +846,7 @@ impl Index {
             .filter(|(node, frontier)| !skipped(node, frontier))
             .map(|(_, f)| f.last_hlc);
         // A waiting entry can carry acks far under its own HLC.
-        let pending = self.pending.iter().map(|e| {
+        let pending = self.pending.values().map(|e| {
             let acks = e.actions.iter().flatten().filter_map(Action::hlc);
             acks.min().unwrap_or(e.hlc).min(e.hlc)
         });
@@ -987,6 +994,27 @@ mod tests {
         assert_eq!(index.pending(), 0);
         assert_eq!(index.resolve("b", "k").unwrap(), Some(manifest(1)));
         assert!(index.bucket("b").unwrap().unwrap().exists);
+    }
+
+    /// A sync that fails moves the journal back to the applied frontiers, so it reads a waiting
+    /// entry again: the index must keep one copy of it.
+    #[tokio::test]
+    async fn test_entry_read_again_while_it_waits_is_kept_once() {
+        let remote = Arc::new(MemoryRemote::default());
+        let mut a = journal(&remote, 1);
+        let mut b = journal(&remote, 2);
+        let mut index = Index::open_temporary().unwrap();
+        a.append(create_bucket("b"), Seen::new()).await.unwrap();
+        b.sync_all().await.unwrap();
+        let seen = journal::seen_from(b.frontiers(), b.node());
+        b.append(put("k", 1), seen).await.unwrap();
+
+        let from_b = journal(&remote, 9).sync_node(b.node()).await.unwrap();
+        for _ in 0..3 {
+            index.apply(from_b.clone()).unwrap();
+        }
+
+        assert_eq!(index.pending(), 1);
     }
 
     #[tokio::test]

@@ -10,7 +10,8 @@
 //! An entry keeps two seen maps: `full`, every chain that its writer had applied, and `listed`,
 //! the links that it writes. A writer leaves out a chain that it saw retired at its frontier. A
 //! reader decides that one put knew another from `listed` and the Retire entries that the GC
-//! link of the put reaches. The properties compare that with `full`.
+//! link of the put reaches. The properties compare that with `full`. A Retire entry lists only
+//! its chain, so a reader applies it once it has that link, as the index does.
 
 use stateright::{Model, Property};
 
@@ -98,7 +99,7 @@ pub struct RetireModel {
 
 /// Name of the property that a missing rule breaks.
 pub const SAME_KNEW: &str = "knew with retired chains equals knew with the full seen";
-pub const CAUSAL: &str = "a reader applies an entry after all that its writer applied";
+pub const CAUSAL: &str = "a reader applies a put after all that its writer applied";
 
 /// The writers 1 and 2 swap places: no rule names a writer.
 fn swap_writers(s: &State) -> State {
@@ -134,6 +135,17 @@ pub fn representative(s: &State) -> State {
     match swapped < *s {
         true => swapped,
         false => s.clone(),
+    }
+}
+
+impl Entry {
+    /// The entries of chain `m` that a reader applies before this one. A Retire lists only the
+    /// chain that it retires, so a reader waits for that link alone, as the index does.
+    fn needs(&self, m: usize) -> u8 {
+        match self.kind {
+            Kind::Put => self.full[m],
+            Kind::Retire { .. } => self.listed[m].unwrap_or(0),
+        }
     }
 }
 
@@ -331,7 +343,7 @@ impl Model for RetireModel {
                     (0..NODES).all(|n| {
                         s.chains[n][..usize::from(s.applied[r][n])]
                             .iter()
-                            .all(|e| (0..NODES).all(|m| m == n || s.applied[r][m] >= e.full[m]))
+                            .all(|e| (0..NODES).all(|m| m == n || s.applied[r][m] >= e.needs(m)))
                     })
                 })
             }),
@@ -383,7 +395,7 @@ impl Model for RetireModel {
 mod tests {
     use std::collections::BTreeSet;
 
-    use stateright::{Checker, HasDiscoveries};
+    use stateright::{Checker, Expectation, HasDiscoveries};
 
     use super::*;
 
@@ -446,6 +458,26 @@ mod tests {
             reduced * 2 >= full && reduced * 10 <= full * 6,
             "{full} {reduced}"
         );
+    }
+
+    /// The same space as the writer symmetry test: a property that no state can keep fails here
+    /// in a second, before the full check on a build machine.
+    #[test]
+    fn test_retire_rules_hold_at_3_entries() {
+        let small = RetireModel {
+            max_entries: 3,
+            ..model(SAFE)
+        };
+        let checked = small.clone().checker().spawn_bfs().join();
+
+        // The sometimes properties need more entries than 3.
+        let always = small
+            .properties()
+            .into_iter()
+            .filter(|p| p.expectation == Expectation::Always);
+        for property in always {
+            checked.assert_no_discovery(property.name);
+        }
     }
 
     #[test]

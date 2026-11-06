@@ -619,25 +619,31 @@ async fn test_conditional_write_during_a_reference_copy_gets_a_conflict() {
 
     let (copied, raced) = tokio::join!(copy(&a.engine, "dst", WriteMode::CreateOnly), async {
         remote.held_manifests(1).await;
-        let raced = a
-            .engine
-            .put(
-                BUCKET,
-                "dst",
-                Bytes::from_static(b"raced"),
-                BTreeMap::new(),
-                WriteMode::CreateOnly,
-            )
-            .await;
+        let mut raced = Vec::new();
+        for mode in [WriteMode::CreateOnly, WriteMode::IfMatch(vec![[0; 32]])] {
+            let put = a
+                .engine
+                .put(
+                    BUCKET,
+                    "dst",
+                    Bytes::from_static(b"raced"),
+                    BTreeMap::new(),
+                    mode,
+                )
+                .await;
+            raced.push(put);
+        }
         remote.release.add_permits(1);
         raced
     });
 
     assert_eq!(copied.unwrap().path, CopyPath::Reference);
-    assert!(
-        matches!(raced, Err(EngineError::Conflict { .. })),
-        "{raced:?}"
-    );
+    for raced in raced {
+        assert!(
+            matches!(raced, Err(EngineError::Conflict { .. })),
+            "{raced:?}"
+        );
+    }
 }
 
 #[tokio::test]

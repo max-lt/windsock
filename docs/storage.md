@@ -331,11 +331,14 @@ starts again, 3 times at most, because a prune replaces an entry once. After tha
 broken (Malformed).
 
 The header holds the `seen` map, 74 bytes for each other node at most. A writer refuses to sign
-an entry with a header over 64 KiB (`HeaderTooLarge`), so a repository has at most about 880
-nodes. The `seen` map names every chain that the proxy ever read, retired nodes too. A node identity
-is the public key of `data_dir/node.key`, which the first start makes: a restart or a crash keeps
-it, and only a start with no `node.key` makes a new one. At one new identity per month for each of
-10 proxies, a repository reaches the limit in about 7 years. A flush
+an entry with a header over 64 KiB (`HeaderTooLarge`), so an entry lists at most about 880 other
+chains. The `seen` map names every chain that the proxy read, less each chain that a Retire entry
+retired at its last entry. With `gc.retire_chains` off (the default), no chain is retired, and the
+map names every chain for ever. A node identity is the public key of `data_dir/node.key`, which the
+first start makes: a restart or a crash keeps it, and only a start with no `node.key` makes a new
+one. At one new identity per month for each of 10 proxies, a repository with `gc.retire_chains` off
+reaches the limit in about 7 years. With it on, only the chains that wrote in the quiet time Q
+count. A flush
 checks the largest header that its entry can have before its plan: over 64 KiB, it uploads
 nothing, logs one ERROR, and the flusher tries again every 60 s. The buffered writes stay, and go
 to the quarantine at the late limit.

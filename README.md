@@ -92,7 +92,8 @@ host) gives the reason.
 
 `data_dir` must persist across restarts: it holds the buffer of acked writes and `node.key`. A
 restart with the same `data_dir` keeps its node identity and makes no new chain. A start with no
-`node.key` makes a new identity, and its first write makes a new chain for ever; on a remote that
+`node.key` makes a new identity, and its first write makes a new chain, which each entry lists until
+the GC retires it (`gc.retire_chains`); on a remote that
 has chains, that start logs `a new node identity on a remote with N chains`. A container with no
 persistent volume for `data_dir` loses acked writes and adds one chain at each start.
 

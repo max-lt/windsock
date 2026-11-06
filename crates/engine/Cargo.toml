@@ -32,5 +32,5 @@ engine = { path = ".", features = ["sim"] }
 async-trait.workspace = true
 futures-util = { workspace = true, features = ["alloc"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 tracing-subscriber.workspace = true

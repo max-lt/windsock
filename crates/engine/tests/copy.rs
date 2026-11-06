@@ -21,7 +21,7 @@ const WAIT: Duration = Duration::from_secs(5);
 const SIZE: usize = 8 * 1024 * 1024;
 
 /// A memory remote that counts its calls, fails them all while `down`, and can make the next
-/// log create ambiguous or hold the manifest or pack PUTs.
+/// log create ambiguous, hold the manifest or pack PUTs, or never answer a read of the journal.
 struct TestRemote {
     inner: MemoryRemote,
     calls: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
@@ -29,6 +29,7 @@ struct TestRemote {
     ambiguous_log_create: AtomicBool,
     hold_manifests: AtomicBool,
     hold_packs: AtomicBool,
+    stall_journal: AtomicBool,
     /// Manifest and pack PUTs that wait for `release`.
     held: AtomicU64,
     release: tokio::sync::Semaphore,
@@ -43,6 +44,7 @@ impl Default for TestRemote {
             ambiguous_log_create: AtomicBool::new(false),
             hold_manifests: AtomicBool::new(false),
             hold_packs: AtomicBool::new(false),
+            stall_journal: AtomicBool::new(false),
             held: AtomicU64::new(0),
             release: tokio::sync::Semaphore::new(0),
         }
@@ -67,6 +69,13 @@ impl TestRemote {
     fn calls(&self, call: &'static str, prefix: &str) -> u64 {
         let calls = self.calls.lock().unwrap();
         calls.get(&(call, prefix.to_string())).copied().unwrap_or(0)
+    }
+
+    async fn stall(&self, key: &str) {
+        let journal = key.starts_with(journal::LOG_PREFIX) || key.starts_with("nodes/");
+        if journal && self.stall_journal.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
     }
 
     fn reset(&self) {
@@ -107,6 +116,7 @@ impl Remote for TestRemote {
 
     async fn get(&self, key: &str, max_len: u64) -> Result<Option<Bytes>, RemoteError> {
         self.count("get", key)?;
+        self.stall(key).await;
         self.inner.get(key, max_len).await
     }
 
@@ -117,6 +127,7 @@ impl Remote for TestRemote {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
         self.count("list", prefix)?;
+        self.stall(prefix).await;
         self.inner.list(prefix).await
     }
 }
@@ -832,4 +843,27 @@ async fn test_conditional_write_after_a_reference_copy_ends_gets_no_conflict() {
     );
     assert!(crashed.is_err());
     assert!(after_error.is_ok(), "{after_error:?}");
+}
+
+/// A sync that never answers must not hold the copy: after 10 s the copy goes through the
+/// spool, as with a remote that is down.
+#[tokio::test]
+async fn test_copy_whose_sync_hangs_takes_the_spool_after_its_deadline() {
+    let remote = Arc::new(TestRemote::default());
+    let start = hold_clock();
+    let (a, body) = with_source(&remote, config()).await;
+    journal::set_manual_wall(Some(start + past_half_horizon()));
+    remote.stall_journal.store(true, Ordering::SeqCst);
+    tokio::time::pause();
+
+    let copy = copy(&a.engine, "dst", WriteMode::Overwrite);
+    let copied = tokio::time::timeout(Duration::from_secs(60), copy)
+        .await
+        .expect("the copy waited past its deadline")
+        .unwrap();
+    tokio::time::resume();
+    remote.stall_journal.store(false, Ordering::SeqCst);
+
+    assert_eq!(copied.path, CopyPath::Spool(SpoolReason::RemoteDown));
+    assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
 }

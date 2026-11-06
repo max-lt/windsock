@@ -1066,3 +1066,24 @@ async fn test_long_data_dir_starts_with_no_admin_socket_and_one_warn() {
     );
     assert!(daemon.stop());
 }
+
+#[test]
+fn test_version_flag_prints_the_package_version_and_the_commit() {
+    let out = Command::new(BIN).arg("--version").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(printed, format!("{}\n", windsockd::VERSION));
+
+    let (package, commit) = windsockd::VERSION.split_once('+').unwrap();
+    assert_eq!(package, env!("CARGO_PKG_VERSION"));
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    assert!(
+        head.starts_with(commit),
+        "{commit} is not a prefix of {head}"
+    );
+}

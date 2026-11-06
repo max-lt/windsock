@@ -40,6 +40,9 @@ use listener::{
     raise_fd_limit, track_requests,
 };
 
+/// The package version, then `+` and the short commit when the build ran in a git checkout.
+pub const VERSION: &str = env!("WINDSOCKD_VERSION");
+
 const CONFIG_FILE: &str = "windsock.toml";
 const NODE_KEY_FILE: &str = "node.key";
 const REPO_KEY_FILE: &str = "repo.key";
@@ -492,7 +495,12 @@ async fn serve<R: Sweep + 'static>(
         .await
         .with_context(|| format!("cannot listen on {}", config.listen))?;
     let max_connections = connections(config)?;
-    info!(address = %listener.local_addr()?, max_connections, "listening");
+    info!(
+        address = %listener.local_addr()?,
+        max_connections,
+        version = VERSION,
+        "listening"
+    );
 
     let timeouts = Timeouts {
         idle: Duration::from_secs(config.idle_timeout_secs),

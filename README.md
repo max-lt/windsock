@@ -14,6 +14,10 @@ Most of that time is the first build (under a minute on an M-series Mac).
    cargo build --release -p windsockd
    ```
 
+   `./target/release/windsockd --version` prints the package version and the commit of the
+   build, for example `0.1.0+4d30d42`. A build from a source tree with no git checkout prints
+   the package version only. The `listening` log line has the same value in its `version` field.
+
 2. Make a configuration. This writes `./local/windsock.toml` with a new access key and secret, and
    `./local/repo.key`, the secret of the remote. Keep a copy of `repo.key` away from the remote:
    without it, nobody can read the data.

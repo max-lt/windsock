@@ -26,6 +26,10 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--version"] => {
+            println!("{}", windsockd::VERSION);
+            Ok(())
+        }
         ["init", dir] => windsockd::init(Path::new(dir)),
         ["run", path] => windsockd::run(&Config::load(Path::new(path))?).await,
         ["diagnose", path] => windsockd::diagnose(&Config::load(Path::new(path))?).await,
@@ -41,8 +45,9 @@ async fn main() -> Result<()> {
             windsockd::cache_trim(&Config::load(Path::new(path))?, bytes).await
         }
         _ => bail!(
-            "usage: windsockd init <dir> | run <config> | diagnose <config> | quarantine list \
-             <config> | quarantine export <config> <new dir> | cache-trim <config> [bytes]"
+            "usage: windsockd --version | init <dir> | run <config> | diagnose <config> | \
+             quarantine list <config> | quarantine export <config> <new dir> | cache-trim \
+             <config> [bytes]"
         ),
     }
 }

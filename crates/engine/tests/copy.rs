@@ -690,7 +690,17 @@ async fn test_reference_copy_holds_read_budget_for_its_manifests() {
     });
 
     assert_eq!(copied.unwrap().path, CopyPath::Reference);
-    assert!(during < budget, "{during} of {budget}");
+    // The room holds the new manifest at least twice: its encoding and its sealed form.
+    let mut sealed = 0;
+    for key in remote.inner.list(engine::MANIFESTS_PREFIX).await.unwrap() {
+        let object = remote.inner.get(&key, u64::MAX).await.unwrap().unwrap();
+        sealed = sealed.max(object.len() as u64);
+    }
+    let held = budget - during;
+    assert!(
+        held >= 2 * (sealed - 64),
+        "{held} bytes for a manifest of {sealed}"
+    );
     assert_eq!(a.engine.read_state().budget_free, budget);
 }
 

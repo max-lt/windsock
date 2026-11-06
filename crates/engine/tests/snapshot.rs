@@ -20,6 +20,7 @@ const BUCKET: &str = "bkt";
 struct TestRemote {
     inner: MemoryRemote,
     log_gets: AtomicUsize,
+    log_lists: AtomicUsize,
     /// Bytes of the entry reads.
     log_bytes: std::sync::atomic::AtomicU64,
     /// A put of this key fails once, as a remote outage in the middle of a prune does.
@@ -145,6 +146,9 @@ impl Remote for TestRemote {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>, RemoteError> {
+        if prefix.starts_with(journal::LOG_PREFIX) {
+            self.log_lists.fetch_add(1, Ordering::SeqCst);
+        }
         let mut keys = self.inner.list(prefix).await?;
         if prefix.starts_with(engine::SNAPSHOTS_PREFIX)
             && self.hide_newest_snapshot.swap(false, Ordering::SeqCst)
@@ -1501,7 +1505,8 @@ async fn test_prune_reads_no_actions_of_a_large_entry() {
 }
 
 /// An entry under the snapshot frontier that does not read back does not stop the prune: the
-/// chain is broken and named, the prune goes on, and the bad object stays as it is.
+/// prune marks the chain, goes on, and leaves the bad object as it is. The mark makes the next
+/// sync audit the chain. The audit reads the last entry only, which is whole, so the mark goes.
 #[tokio::test]
 async fn test_prune_skips_an_entry_that_does_not_read_back() {
     let remote = Arc::new(TestRemote::default());
@@ -1523,9 +1528,18 @@ async fn test_prune_skips_an_entry_that_does_not_read_back() {
         .unwrap();
 
     let report = a.engine.gc().await;
+    let lists = remote.log_lists.load(Ordering::SeqCst);
+    let audit = a.engine.sync().await.unwrap();
+    let audit_lists = remote.log_lists.load(Ordering::SeqCst) - lists;
+    let after = a.engine.sync().await.unwrap();
 
     let report = report.unwrap();
     assert!(report.redacted_entries >= 1, "{report:?}");
+    assert!(
+        audit_lists >= 1,
+        "the next sync did not audit the marked chain"
+    );
+    assert!(audit.broken.is_empty() && after.broken.is_empty());
     let stored = remote.inner.get(&bad, u64::MAX).await.unwrap().unwrap();
     assert_eq!(&stored[..], b"junk");
     let last = remote

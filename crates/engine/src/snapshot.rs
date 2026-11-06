@@ -492,7 +492,7 @@ impl<R: Remote + 'static> Engine<R> {
                 let bytes = match found.await? {
                     Ok(journal::Redaction::Bytes(bytes)) => bytes,
                     Ok(journal::Redaction::Missing | journal::Redaction::Done) => continue,
-                    // As a sync does: the chain is broken and named, and the rest goes on.
+                    // The mark makes the next sync audit the chain, and the rest goes on.
                     Err(source) => {
                         warn!(key, %source, "the prune skipped an entry that does not read back");
                         self.journal.lock().await.report_broken(*node, source);

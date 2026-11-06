@@ -243,7 +243,7 @@ impl ChunkCache {
 
     /// Stores a raw chunk and evicts the least recently used ones above the bound.
     /// The caller checks that `data` is the chunk `id`.
-    pub async fn insert(&self, id: ChunkId, data: &[u8]) -> Result<()> {
+    async fn insert(&self, id: ChunkId, data: &[u8]) -> Result<()> {
         let size = data.len() as u64;
 
         if size > self.limit() || self.lru().touch(id) {
@@ -257,10 +257,17 @@ impl ChunkCache {
         // The dot prefix keeps a partial write out of the scan at open.
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = parent.join(format!(".tmp.{}.{seq}", std::process::id()));
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(data).await?;
-        file.flush().await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        let written = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            file.write_all(data).await?;
+            file.flush().await?;
+            tokio::fs::rename(&tmp, &path).await
+        };
+        if let Err(e) = written.await {
+            // The scan at open skips the file and the bound does not count it.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e.into());
+        }
 
         let evicted = {
             let mut lru = self.lru();
@@ -454,6 +461,28 @@ mod tests {
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert_eq!(logs.matches("cache writes fail").count(), 1, "{logs}");
         assert_eq!(logs.matches("cache writes work again").count(), 1, "{logs}");
+    }
+
+    /// The scan at open skips a temporary file, and the bound does not count it: a write that
+    /// fails must remove its own, or a failing disk fills with them.
+    #[tokio::test]
+    async fn test_failed_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::open(dir.path(), 1 << 20, keys()).await.unwrap();
+        let (id, data) = chunk(1, 100);
+        // A directory with a file in it at the path of the chunk: the rename fails.
+        let path = cache.path(id);
+        std::fs::create_dir_all(path.join("blocker")).unwrap();
+
+        let inserted = cache.insert(id, &data).await;
+
+        assert!(inserted.is_err());
+        let left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".tmp."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[tokio::test]

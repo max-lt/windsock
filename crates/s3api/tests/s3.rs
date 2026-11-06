@@ -3628,3 +3628,39 @@ async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
     assert_eq!(part_temps(&server, &id), 0);
     assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
 }
+
+/// A copy header that is not visible ASCII, read as absent, turns a copy into a PUT of the empty
+/// body, a part copy of a range into one of the whole source, and REPLACE into COPY.
+#[tokio::test]
+async fn test_copy_header_that_is_not_ascii_is_refused() {
+    let (server, _, id) = with_part_source().await;
+
+    let copy = run(
+        &server,
+        call("PUT", "/bkt/dst").header("x-amz-copy-source", "/bkt/sré"),
+    )
+    .await;
+    let directive = run(
+        &server,
+        call("PUT", "/bkt/dst")
+            .header("x-amz-copy-source", "/bkt/src")
+            .header("x-amz-metadata-directive", "REPLACEé"),
+    )
+    .await;
+    let part = part_copy(&server, &id, 1, Some("bytes=0-é")).await;
+
+    for (reply, what) in [(copy, "copy"), (directive, "directive"), (part, "part")] {
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{what}: {}",
+            reply.text()
+        );
+    }
+    assert_eq!(
+        run(&server, call("HEAD", "/bkt/dst")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    let parts = run(&server, call("GET", &format!("/bkt/big?uploadId={id}"))).await;
+    assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
+}

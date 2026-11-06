@@ -23,13 +23,32 @@ pub(super) fn etag_matches(list: &str, etag: &str) -> bool {
 /// Refuses a conditional header that is not visible ASCII. Read as absent, it would drop the
 /// condition and write or read with none.
 pub(super) fn check_conditions(headers: &HeaderMap) -> Result<(), S3Error> {
-    const NAMES: [&str; 4] = [
-        "if-match",
-        "if-none-match",
-        "if-modified-since",
-        "if-unmodified-since",
-    ];
-    for name in NAMES {
+    check_visible(
+        headers,
+        &[
+            "if-match",
+            "if-none-match",
+            "if-modified-since",
+            "if-unmodified-since",
+        ],
+    )
+}
+
+/// Refuses a copy header that is not visible ASCII. Read as absent, it would make a copy a PUT
+/// of the empty body, a part copy of a range one of the whole source, and REPLACE a COPY.
+pub(super) fn check_copy_headers(headers: &HeaderMap) -> Result<(), S3Error> {
+    check_visible(
+        headers,
+        &[
+            "x-amz-copy-source",
+            "x-amz-copy-source-range",
+            "x-amz-metadata-directive",
+        ],
+    )
+}
+
+fn check_visible(headers: &HeaderMap, names: &[&str]) -> Result<(), S3Error> {
+    for &name in names {
         if headers
             .get(name)
             .is_some_and(|value| value.to_str().is_err())

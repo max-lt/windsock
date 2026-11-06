@@ -1,8 +1,8 @@
 //! Object operations and multipart uploads.
 
 use super::conditions::{
-    Precondition, byte_range, check_conditions, copy_source_range, not_modified, precondition,
-    write_mode,
+    Precondition, byte_range, check_conditions, check_copy_headers, copy_source_range,
+    not_modified, precondition, write_mode,
 };
 use super::*;
 
@@ -15,6 +15,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
     body: Body,
 ) -> Reply {
     reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
+    check_copy_headers(&headers)?;
     if let Some(Extension(streamed)) = streamed {
         if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber"))
         {

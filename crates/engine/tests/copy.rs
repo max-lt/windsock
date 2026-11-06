@@ -440,8 +440,10 @@ async fn test_ambiguous_entry_create_fails_the_copy_with_no_spool() {
     assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
 }
 
+/// The open reads the own chain, so it applies the entry that the crash left; the next flush
+/// then only removes the intent.
 #[tokio::test]
-async fn test_crash_after_the_entry_of_a_copy_recovers_at_the_next_flush() {
+async fn test_crash_after_the_entry_of_a_copy_applies_at_the_next_open() {
     let remote = Arc::new(TestRemote::default());
     let (a, body) = with_source(&remote, config()).await;
 
@@ -451,12 +453,15 @@ async fn test_crash_after_the_entry_of_a_copy_recovers_at_the_next_flush() {
     let Proxy { dir, engine } = a;
     drop(engine);
     let a = open(&remote, 1, dir, config()).await;
-    a.engine.flush().await.unwrap();
+    let after_open = get(&a.engine, "dst").await;
+    let flushed = a.engine.flush().await;
 
     assert!(
         matches!(crashed, Err(EngineError::SimCrash(_))),
         "{crashed:?}"
     );
+    assert_eq!(after_open.unwrap(), body);
+    flushed.unwrap();
     assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
 }
 

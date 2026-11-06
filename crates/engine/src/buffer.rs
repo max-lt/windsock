@@ -439,6 +439,8 @@ pub(crate) struct SyncJob {
     /// The last record that this fsync covers.
     target: u64,
     file: Arc<std::fs::File>,
+    /// The buffer directory and the renames that its fsync covers, when one has no fsync yet.
+    dir: Option<(PathBuf, u64)>,
     #[cfg(test)]
     fail: bool,
 }
@@ -451,9 +453,16 @@ impl SyncJob {
         }
 
         let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || file.sync_data())
-            .await
-            .map_err(std::io::Error::other)?
+        let dir = self.dir.as_ref().map(|(dir, _)| dir.clone());
+        tokio::task::spawn_blocking(move || {
+            file.sync_data()?;
+            match dir {
+                Some(dir) => std::fs::File::open(dir)?.sync_all(),
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 }
 
@@ -476,8 +485,15 @@ pub(crate) struct Buffer {
     bad_data: Vec<BadRecord>,
     #[cfg(test)]
     pub syncs: u64,
+    /// Spool files renamed into the buffer, and how many of those renames a directory fsync
+    /// covers.
+    renames: u64,
+    dir_synced: u64,
     #[cfg(test)]
     pub fail_next_sync: bool,
+    /// Makes an adoption wait for ever after its rename, before its directory fsync.
+    #[cfg(test)]
+    pub stall_dir_sync: bool,
 }
 
 impl Buffer {
@@ -513,10 +529,14 @@ impl Buffer {
             lost: Vec::new(),
             broken: false,
             bad_data: Vec::new(),
+            renames: 0,
+            dir_synced: 0,
             #[cfg(test)]
             syncs: 0,
             #[cfg(test)]
             fail_next_sync: false,
+            #[cfg(test)]
+            stall_dir_sync: false,
         };
 
         for (i, &seq) in existing.iter().enumerate() {
@@ -694,6 +714,11 @@ impl Buffer {
         (self.written > self.durable).then_some(self.written)
     }
 
+    #[cfg(test)]
+    pub fn dir_unsynced(&self) -> bool {
+        self.dir_synced < self.renames
+    }
+
     pub fn is_broken(&self) -> bool {
         self.broken
     }
@@ -705,6 +730,7 @@ impl Buffer {
             len: self.active.len,
             target: self.written,
             file: Arc::clone(&self.active.sync),
+            dir: (self.dir_synced < self.renames).then(|| (self.dir.clone(), self.renames)),
             #[cfg(test)]
             fail: std::mem::take(&mut self.fail_next_sync),
         }
@@ -724,6 +750,9 @@ impl Buffer {
         match result {
             Ok(()) => {
                 self.durable = self.durable.max(job.target);
+                if let Some((_, renames)) = job.dir {
+                    self.dir_synced = self.dir_synced.max(renames);
+                }
                 if job.seq == self.active.seq {
                     self.active.durable_len = self.active.durable_len.max(job.len);
                 }
@@ -851,6 +880,11 @@ impl Buffer {
                 return Err(EngineError::WriteLost);
             }
             self.active.durable_len = self.active.len;
+            // The records written so far can hold a spooled one whose commit was dropped.
+            if self.dir_synced < self.renames {
+                sync_dir(&self.dir).await?;
+                self.dir_synced = self.renames;
+            }
             self.durable = self.written;
         }
 
@@ -910,11 +944,19 @@ impl Buffer {
         // the buffer tracks the segment first, so the flush never misses a record on disk.
         self.sealed.insert(seq, size);
         self.written += 1;
-        self.durable = self.written;
         self.track(seq, head, DATA_LEN_LEN as u64, data_len);
+        // A power loss before the directory fsync loses the rename: the record is durable only
+        // after it, here or in the next fsync if this commit is dropped first.
+        self.renames += 1;
         tokio::fs::rename(&spool, self.segment_path(seq)).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;
+        #[cfg(test)]
+        if self.stall_dir_sync {
+            std::future::pending::<()>().await;
+        }
         sync_dir(&self.dir).await?;
+        self.dir_synced = self.renames;
+        self.durable = self.written;
         crate::sim::crash_point(crate::sim::Point::SpoolRename)?;
         Ok(())
     }

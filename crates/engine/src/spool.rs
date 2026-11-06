@@ -321,6 +321,44 @@ mod tests {
         assert_eq!(reopened.buffered_bytes().await, 0);
     }
 
+    /// After its rename, a spooled record is durable only once the directory is fsynced. A commit
+    /// dropped in between leaves that fsync to the next reader, which must not see the record
+    /// first.
+    #[tokio::test]
+    async fn test_record_of_a_commit_dropped_before_its_directory_fsync_waits_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(
+            dir.path(),
+            Arc::new(MemoryRemote::default()),
+            SigningKey::from_bytes(&[3; 32]),
+            crate::RepoKey::from_hex(&"07".repeat(32)).unwrap().keys(),
+            Config::default(),
+        )
+        .await
+        .unwrap();
+        engine.create_bucket("demo", None).await.unwrap();
+        let mut spool = engine
+            .begin_put_sized("demo", "k", BTreeMap::new(), WriteMode::Overwrite, 4)
+            .await
+            .unwrap();
+        engine.spool_write(&mut spool, b"data").await.unwrap();
+        engine.buffer.lock().await.stall_dir_sync = true;
+
+        let commit = tokio::time::timeout(Duration::from_millis(200), engine.finish_put(spool));
+        assert!(commit.await.is_err(), "the commit passed its stall");
+        let pending = engine.buffer.lock().await.pending();
+        let syncs = engine.buffer.lock().await.syncs;
+        engine.buffer.lock().await.stall_dir_sync = false;
+        let read = engine.get("demo", "k", None).await;
+
+        assert!(pending.is_some(), "a reader sees the record with no fsync");
+        assert_eq!(read.unwrap().data, Bytes::from_static(b"data"));
+        let buffer = engine.buffer.lock().await;
+        assert!(buffer.syncs > syncs);
+        assert_eq!(buffer.pending(), None);
+        assert!(!buffer.dir_unsynced(), "no directory fsync");
+    }
+
     #[tokio::test]
     async fn test_put_whose_head_write_fails_gets_no_ack() {
         let dir = tempfile::tempdir().unwrap();

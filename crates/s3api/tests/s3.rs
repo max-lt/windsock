@@ -3610,10 +3610,13 @@ async fn test_upload_part_copy_keeps_the_source_version_of_its_start() {
     assert_eq!(copied.xml("ETag").unwrap(), etag);
 }
 
-/// A client that goes away drops the request: the part file goes, and no part is listed.
+/// A client that goes away drops the request: the part file goes, no part is listed, and the room
+/// of the parts limit and of the read budget comes back.
 #[tokio::test]
 async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
     let (server, _, id) = with_part_source().await;
+    let held = server.uploads.held();
+    let budget = server.engine.read_state().budget_free;
 
     tokio::select! {
         _ = part_copy(&server, &id, 1, None) => panic!("the copy ended before the drop"),
@@ -3627,6 +3630,8 @@ async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
 
     assert_eq!(part_temps(&server, &id), 0);
     assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
+    assert_eq!(server.uploads.held(), held);
+    assert_eq!(server.engine.read_state().budget_free, budget);
 }
 
 /// A copy header that is not visible ASCII, read as absent, turns a copy into a PUT of the empty
@@ -3663,4 +3668,37 @@ async fn test_copy_header_that_is_not_ascii_is_refused() {
     );
     let parts = run(&server, call("GET", &format!("/bkt/big?uploadId={id}"))).await;
     assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
+}
+
+/// A part copy reads its source as a GET does: with no room in the read budget, its first piece
+/// waits 5 s, then the part copy gets 503 and stores nothing.
+#[tokio::test]
+async fn test_upload_part_copy_with_no_room_in_the_read_budget_gets_503() {
+    let server = small_budget().await;
+    let data = vec![3u8; 2 * engine::READ_STEP];
+    run(&server, call("PUT", "/bkt/src").body(data.clone())).await;
+    server.engine.flush().await.unwrap();
+    let id = initiate(&server).await;
+    let parts_held = server.uploads.held();
+    let mut held = Vec::new();
+    for _ in 0..engine::MIN_READ_BUDGET as usize / engine::READ_STEP {
+        let response = get_response(&server, "/bkt/src").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+
+    let refused = part_copy(&server, &id, 1, None).await;
+    drop(held);
+    let parts = run(&server, call("GET", &format!("/bkt/big?uploadId={id}"))).await;
+
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(refused.xml("Code").unwrap(), "SlowDown");
+    assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
+    assert_eq!(part_temps(&server, &id), 0);
+    assert_eq!(server.uploads.held(), parts_held);
 }

@@ -328,3 +328,53 @@ async fn test_aborted_serve_frees_the_engine_and_stops_its_node() {
     );
     assert!(opened.is_ok(), "the second serve did not open: {opened:?}");
 }
+
+/// A request in progress holds the router, and so the engine: an aborted serve must stop it, or
+/// a new serve of the same data_dir waits for the request timeout of 300 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_aborted_serve_stops_the_requests_in_progress() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let config = config_without_keys(dir.path(), port);
+    let keys = common::test_keys();
+    let store = Arc::new(Keys::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert(keys.0.clone(), keys.1.clone());
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let first_config = config.clone();
+    let daemon = tokio::spawn(async move {
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(&first_config, store, std::future::pending(), on_open).await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&address).await;
+    let bucket = common::call_at(&address, &keys, "PUT", "/demo", b"").await;
+    // A signed upload of 1000 bytes that sends 10 of them and stops.
+    let body = [7u8; 1000];
+    let headers = common::signed_headers_at(&address, &keys, "PUT", "/demo/k", &body);
+    let mut request = String::from("PUT /demo/k HTTP/1.1\r\n");
+    for (name, value) in &headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("content-length: 1000\r\n\r\n");
+    let mut upload = tokio::net::TcpStream::connect(&address).await.unwrap();
+    upload.write_all(request.as_bytes()).await.unwrap();
+    upload.write_all(&body[..10]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    daemon.abort();
+    let _ = daemon.await;
+    drop(node);
+    let opened = serve_again(&config).await;
+
+    assert_eq!(bucket.status, StatusCode::OK, "{}", bucket.text());
+    assert!(opened.is_ok(), "the second serve did not open: {opened:?}");
+    drop(upload);
+}

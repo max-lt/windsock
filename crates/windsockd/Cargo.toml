@@ -17,6 +17,7 @@ axum.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 http-body.workspace = true
+hyper-util = { workspace = true, features = ["server", "service"] }
 rustix.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

@@ -9,7 +9,6 @@ mod node;
 pub mod quarantine;
 
 use std::collections::HashMap;
-use std::future::IntoFuture;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -36,8 +35,7 @@ pub use s3api::KeyStore;
 
 use config::RemoteConfig;
 use listener::{
-    ConnectionActivity, LimitedListener, Timeouts, check_connections, connection_limit,
-    raise_fd_limit, track_requests,
+    LimitedListener, Timeouts, check_connections, connection_limit, raise_fd_limit, track_requests,
 };
 
 /// The package version, then `+` and the short commit when the build ran in a git checkout.
@@ -67,9 +65,10 @@ pub async fn run(config: &Config) -> Result<()> {
 
 /// Serves with the keys of `keys` until `shutdown` returns, then flushes the buffer. A SIGINT or
 /// SIGTERM after `shutdown` stops at once. `config` must have no [[keys]] entry. `on_open` gets
-/// the [`Node`] once the engine is open, before the S3 port listens. When the serve returns, or its future
-/// is dropped, its tasks stop and each Node call gets `EngineError::Stopped`: drop the Node too,
-/// as it holds the engine, and a new serve of the same `data_dir` opens once both are gone.
+/// the [`Node`] once the engine is open, before the S3 port listens. When the serve returns, or
+/// its future is dropped, its tasks and client connections stop, with the requests in progress,
+/// and each Node call gets `EngineError::Stopped`: drop the Node too, as it holds the engine, and
+/// a new serve of the same `data_dir` opens once both are gone.
 pub async fn serve_with(
     config: &Config,
     keys: Arc<dyn KeyStore>,
@@ -390,12 +389,10 @@ async fn serve<R: Sweep + 'static>(
     let engine = Arc::new(engine);
     info!(node = %engine.node(), "engine open");
 
-    let (serving, ended) = tokio::sync::oneshot::channel::<()>();
     let mut running = Running {
         tasks: vec![engine.spawn_flusher()],
         socket: None,
         stopped: Arc::new(AtomicBool::new(false)),
-        _serving: serving,
     };
     let syncer = engine.clone();
     running.tasks.push(every(
@@ -508,26 +505,18 @@ async fn serve<R: Sweep + 'static>(
     };
     let listener = LimitedListener::new(listener, max_connections, timeouts);
     let draining = Arc::new(Notify::new());
-    let server = axum::serve(
+    let server = listener::serve(
         listener,
-        router.into_make_service_with_connect_info::<ConnectionActivity>(),
-    )
-    // axum runs this future in its own task: it must end with the serve, or it keeps the engine.
-    .with_graceful_shutdown(until_ended(
+        router,
         drain_then_flush(engine.clone(), draining.clone(), shutdown),
-        ended,
-    ))
-    .into_future();
+    );
     let second_signal = async {
         draining.notified().await;
         shutdown_signal().await;
     };
 
     let outcome = tokio::select! {
-        result = server => match result {
-            Ok(()) => stopped_after_flush(&engine).await,
-            Err(e) => Err(e.into()),
-        },
+        () = server => stopped_after_flush(&engine).await,
         () = second_signal => {
             let bytes = engine.buffered_bytes().await;
             warn!(bytes, "second signal: stopped before the remote has the buffer; it flushes at the next start");
@@ -553,8 +542,6 @@ struct Running {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     socket: Option<PathBuf>,
     stopped: Arc<AtomicBool>,
-    /// Its drop ends the shutdown future that axum holds in a task of its own.
-    _serving: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Drop for Running {
@@ -594,14 +581,6 @@ async fn index_poisoned<R: Sweep + 'static>(engine: &Engine<R>) {
 
 /// At `shutdown`, refuses new writes and flushes the buffer. The server keeps serving reads, and
 /// 503 for writes, until the remote has every buffered write.
-/// Runs `task` until `ended` resolves, which the drop of its sender does.
-async fn until_ended(task: impl Future<Output = ()>, ended: tokio::sync::oneshot::Receiver<()>) {
-    tokio::select! {
-        () = task => {}
-        _ = ended => {}
-    }
-}
-
 async fn drain_then_flush<R: Sweep + 'static>(
     engine: Arc<Engine<R>>,
     draining: Arc<Notify>,

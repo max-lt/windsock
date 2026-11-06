@@ -14,16 +14,20 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::{Body, HttpBody};
-use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::serve::{IncomingStream, Listener};
+use axum::serve::Listener;
+use axum::{Extension, Router};
 use http_body::{Frame, SizeHint};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 use tracing::debug;
 
@@ -147,12 +151,6 @@ impl Activity {
 #[derive(Clone, Debug)]
 pub struct ConnectionActivity(Arc<Activity>);
 
-impl Connected<IncomingStream<'_, LimitedListener>> for ConnectionActivity {
-    fn connect_info(stream: IncomingStream<'_, LimitedListener>) -> Self {
-        Self(Arc::clone(&stream.io().activity))
-    }
-}
-
 /// A request in progress. The connection is idle again when the last one drops.
 struct InProgress(Arc<Activity>);
 
@@ -222,6 +220,55 @@ pub async fn track_requests(
     let response = next.run(request).await;
     drop(in_progress);
     response
+}
+
+/// Serves `router` until `shutdown` returns, then lets each connection end its request in
+/// progress. The connections run in tasks that this future owns: its drop stops them, and so frees
+/// the engine that each router holds.
+pub async fn serve(
+    mut listener: LimitedListener,
+    router: Router,
+    shutdown: impl Future<Output = ()>,
+) {
+    let (closing, _) = watch::channel(());
+    let mut connections = JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            (connection, _) = Listener::accept(&mut listener) => {
+                let closing = closing.subscribe();
+                connections.spawn(serve_connection(connection, router.clone(), closing));
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
+    }
+    drop(listener);
+    closing.send_replace(());
+    while connections.join_next().await.is_some() {}
+}
+
+async fn serve_connection(
+    connection: Connection,
+    router: Router,
+    mut closing: watch::Receiver<()>,
+) {
+    let activity = ConnectionActivity(Arc::clone(&connection.activity));
+    let service = TowerToHyperService::new(router.layer(Extension(ConnectInfo(activity))));
+    let builder = Builder::new(TokioExecutor::new());
+    let mut served =
+        std::pin::pin!(builder.serve_connection_with_upgrades(TokioIo::new(connection), service));
+    loop {
+        tokio::select! {
+            result = served.as_mut() => {
+                if let Err(e) = result {
+                    debug!(%e, "a connection ended with an error");
+                }
+                return;
+            }
+            Ok(()) = closing.changed() => served.as_mut().graceful_shutdown(),
+        }
+    }
 }
 
 impl Listener for LimitedListener {

@@ -260,9 +260,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   embeds windsockd gives the keys through a `KeyStore` (`windsockd::serve_with`), and the
   configuration then has no `[[keys]]` entry. The store is asked on every request, with no cache:
   a failed lookup, or one that takes more than 2 s (`KEY_STORE_DEADLINE`), gets
-  `503 ServiceUnavailable`. When `serve_with` returns or its future is dropped, its tasks stop, and each
-  call of its `Node` gets `EngineError::Stopped`. The host drops the `Node`: it holds the engine,
-  and a new serve of the same `data_dir` opens only once it is gone.
+  `503 ServiceUnavailable`. When `serve_with` returns or its future is dropped, its tasks and its
+  client connections stop, with the requests in progress, and each call of its `Node` gets
+  `EngineError::Stopped`. The host drops the `Node`: it holds the engine, and a new serve of the
+  same `data_dir` opens only once it is gone.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.
 - The proxy does not check the value of `Content-MD5` or of `x-amz-checksum-*`, in a header or in

@@ -177,6 +177,9 @@ fn object_key(bucket: &str, key: &str) -> Vec<u8> {
 /// the 256 descriptors that windsockd keeps out of the S3 connection limit.
 pub const MAX_OPEN_FILES: usize = 128;
 
+/// Keys that a load removes in one batch. Small in tests, so a test index takes several.
+const CLEAR_BATCH: usize = if cfg!(test) { 2 } else { 65_536 };
+
 /// The state format of this build: versions ordered by their ack HLC.
 const FORMAT: u32 = 2;
 const FORMAT_KEY: &str = "format";
@@ -735,7 +738,9 @@ impl Index {
     /// Replaces the applied state with `snapshot`. Chunk locations are cleared:
     /// the caller rebuilds them from the manifests.
     pub fn load(&mut self, snapshot: &Snapshot) -> Result<()> {
-        let mut clear = self.db.batch();
+        // The frontiers go first: an index with none loads a snapshot at open, so a crash in the
+        // middle of the clear is safe. The rest goes in batches: one batch of every key of a full
+        // index would sit in memory next to the decoded snapshot.
         for keyspace in [
             &self.frontiers,
             &self.entries,
@@ -746,12 +751,19 @@ impl Index {
             &self.condemned,
             &self.retired,
         ] {
+            let mut clear = self.db.batch();
+            let mut keys = 0;
             for guard in keyspace.iter() {
                 let (key, _) = guard.into_inner()?;
                 clear.remove(keyspace, key);
+                keys += 1;
+                if keys == CLEAR_BATCH {
+                    std::mem::replace(&mut clear, self.db.batch()).commit()?;
+                    keys = 0;
+                }
             }
+            clear.commit()?;
         }
-        clear.commit()?;
 
         let mut fill = self.db.batch();
         for (node, frontier) in &snapshot.frontiers {
@@ -1626,6 +1638,23 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A load over a full index clears it in several batches: no key of the old state stays.
+    #[tokio::test]
+    async fn test_load_over_a_full_index_keeps_only_the_snapshot() {
+        let remote = Arc::new(MemoryRemote::default());
+        let (source, _) = busy_index(&remote).await;
+        let snapshot = source.snapshot().unwrap();
+        let (mut target, _) = busy_index(&Arc::new(MemoryRemote::default())).await;
+        let empty = Index::open_temporary().unwrap().snapshot().unwrap();
+
+        target.load(&empty).unwrap();
+        let cleared = target.snapshot().unwrap();
+        target.load(&snapshot).unwrap();
+
+        assert_eq!(cleared, empty);
+        assert_eq!(target.snapshot().unwrap(), snapshot);
     }
 
     #[test]

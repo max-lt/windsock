@@ -122,8 +122,9 @@ impl Uploads {
             if !entry.file_type().await.map_err(io)?.is_dir() {
                 continue;
             }
-            // No initiate runs at start: a directory with no meta is what a killed removal left.
-            if !entry.path().join(META).exists() {
+            // No initiate runs at start: a directory with no meta is what a killed removal
+            // left, and a meta that does not decode lost its bytes in a power loss.
+            if !meta_decodes(&entry.path()).await? {
                 remove_dir(&entry.path()).await?;
                 continue;
             }
@@ -329,6 +330,8 @@ impl Uploads {
         tokio::fs::create_dir_all(&dir).await.map_err(io)?;
         let bytes = postcard::to_allocvec(&meta).expect("upload metadata always serializes");
         write_file(&dir, META, &bytes).await?;
+        // The acked parts of this upload live in its directory: its name must survive a power loss.
+        sync_dir(&self.dir).await?;
 
         Ok(upload_id)
     }
@@ -692,13 +695,25 @@ async fn part_files(dir: &Path) -> Result<BTreeMap<(u16, String), (u64, u64)>, S
 }
 
 /// Writes a temporary file, then renames it: a reader never sees a partial file.
+/// Writes `name` in `dir` durably: a power loss leaves the old file or the whole new one.
 async fn write_file(dir: &Path, name: &str, data: &[u8]) -> Result<(), S3Error> {
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{TEMP_PREFIX}{}.{seq}", std::process::id()));
     let mut file = tokio::fs::File::create(&tmp).await.map_err(io)?;
     file.write_all(data).await.map_err(io)?;
     file.flush().await.map_err(io)?;
-    tokio::fs::rename(&tmp, dir.join(name)).await.map_err(io)
+    file.sync_all().await.map_err(io)?;
+    tokio::fs::rename(&tmp, dir.join(name)).await.map_err(io)?;
+    sync_dir(dir).await
+}
+
+/// False when the upload in `dir` has no meta, or one that does not decode.
+async fn meta_decodes(dir: &Path) -> Result<bool, S3Error> {
+    match tokio::fs::read(dir.join(META)).await {
+        Ok(bytes) => Ok(postcard::from_bytes::<UploadMeta>(&bytes).is_ok()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io(e)),
+    }
 }
 
 async fn remove_if_present(path: &Path) -> Result<(), S3Error> {
@@ -928,6 +943,23 @@ mod tests {
         let again = uploads.begin_part(&id, ("b", "k"), "1", LARGEST).await;
 
         assert!(again.is_ok(), "{:?}", again.err());
+    }
+
+    /// A power loss can keep the name of a meta and lose its bytes. Such an upload can never
+    /// complete or abort, so the start removes it, and its parts do not count.
+    #[tokio::test]
+    async fn test_start_removes_an_upload_whose_meta_does_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let upload = dir.path().join("a".repeat(32));
+        std::fs::create_dir_all(&upload).unwrap();
+        std::fs::write(upload.join(META), b"").unwrap();
+        std::fs::write(upload.join(part_name(1, &"c".repeat(64))), b"12345").unwrap();
+        let uploads = Uploads::new(dir.path(), 100);
+
+        let held = uploads.start().await.unwrap();
+
+        assert_eq!(held, 0);
+        assert!(!upload.exists());
     }
 
     /// A kill in the middle of a removal can leave parts with no meta: the start removes them,

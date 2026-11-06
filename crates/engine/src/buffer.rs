@@ -862,10 +862,11 @@ impl Buffer {
 
     /// Adds a spooled put as the next segment. The spool file holds the data and then the head,
     /// both fsynced. The active segment is sealed first, so the order of the segments stays the
-    /// order of the acks. Returns the record number, durable at once.
+    /// order of the acks. Returns the record number, durable at once. `spool` is empty once the
+    /// buffer tracks the segment: the file is then the buffer's to keep or remove.
     pub async fn adopt(
         &mut self,
-        spool: &Path,
+        spool: &mut PathBuf,
         head: &Head,
         data_len: u64,
     ) -> Result<u64, EngineError> {
@@ -895,21 +896,23 @@ impl Buffer {
 
     async fn adopt_steps(
         &mut self,
-        spool: &Path,
+        spool: &mut PathBuf,
         seq: u64,
         head: &Head,
         data_len: u64,
     ) -> Result<(), EngineError> {
         self.active = create_segment(&self.dir, seq + 1).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolNext)?;
-        let size = tokio::fs::metadata(spool).await?.len();
+        let size = tokio::fs::metadata(&*spool).await?.len();
+        // A drop of the commit before this point leaves the file to the spool, which removes it.
+        let spool = std::mem::take(spool);
         // A dropped commit stops at an await, and the rename runs to its end on its own thread:
         // the buffer tracks the segment first, so the flush never misses a record on disk.
         self.sealed.insert(seq, size);
         self.written += 1;
         self.durable = self.written;
         self.track(seq, head, DATA_LEN_LEN as u64, data_len);
-        tokio::fs::rename(spool, self.segment_path(seq)).await?;
+        tokio::fs::rename(&spool, self.segment_path(seq)).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;
         sync_dir(&self.dir).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolRename)?;

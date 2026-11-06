@@ -244,10 +244,7 @@ impl<R: Remote + 'static> Engine<R> {
         crate::sim::crash_point(crate::sim::Point::SpoolHead)?;
 
         let len = spool.len;
-        // From here the file belongs to the buffer: a drop of this commit must not remove it while
-        // its rename runs.
-        let path = std::mem::take(&mut spool.path);
-        buffer.adopt(&path, &head, len).await?;
+        buffer.adopt(&mut spool.path, &head, len).await?;
         // The bytes count in the segments of the buffer.
         let counted = spool.counted();
         spool.len = 0;
@@ -316,6 +313,9 @@ mod tests {
         }
         engine.flush().await.unwrap();
         drop(engine);
+        let spool_dir = dir.path().join(crate::BUFFER_DIR).join(SPOOL_DIR);
+        let left: Vec<_> = std::fs::read_dir(&spool_dir).unwrap().collect();
+        assert!(left.is_empty(), "spool files that nothing tracks: {left:?}");
 
         let reopened = open().await;
         assert_eq!(reopened.buffered_bytes().await, 0);

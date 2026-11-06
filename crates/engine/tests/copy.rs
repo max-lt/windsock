@@ -21,7 +21,8 @@ const WAIT: Duration = Duration::from_secs(5);
 const SIZE: usize = 8 * 1024 * 1024;
 
 /// A memory remote that counts its calls, fails them all while `down`, and can make the next
-/// log create ambiguous, hold the manifest or pack PUTs, or never answer a read of the journal.
+/// log create ambiguous, hold the manifest or pack PUTs, or never answer a read or a create of
+/// the journal.
 struct TestRemote {
     inner: MemoryRemote,
     calls: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
@@ -30,6 +31,7 @@ struct TestRemote {
     hold_manifests: AtomicBool,
     hold_packs: AtomicBool,
     stall_journal: AtomicBool,
+    stall_log_creates: AtomicBool,
     /// Manifest and pack PUTs that wait for `release`.
     held: AtomicU64,
     release: tokio::sync::Semaphore,
@@ -45,6 +47,7 @@ impl Default for TestRemote {
             hold_manifests: AtomicBool::new(false),
             hold_packs: AtomicBool::new(false),
             stall_journal: AtomicBool::new(false),
+            stall_log_creates: AtomicBool::new(false),
             held: AtomicU64::new(0),
             release: tokio::sync::Semaphore::new(0),
         }
@@ -105,6 +108,9 @@ impl Remote for TestRemote {
 
     async fn create(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         self.count("create", key)?;
+        if key.starts_with(journal::LOG_PREFIX) && self.stall_log_creates.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.inner.create(key, data).await?;
         if key.starts_with(journal::LOG_PREFIX)
             && self.ambiguous_log_create.swap(false, Ordering::SeqCst)
@@ -866,4 +872,58 @@ async fn test_copy_whose_sync_hangs_takes_the_spool_after_its_deadline() {
 
     assert_eq!(copied.path, CopyPath::Spool(SpoolReason::RemoteDown));
     assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
+}
+
+/// A client can go away at any await of a copy by reference. Dropped at its manifest PUT, the copy
+/// gives back its room, its slot and its target. Dropped in its commit, after its intent, it
+/// gives them back too, and the next flush ends what the intent holds.
+#[tokio::test]
+async fn test_dropped_reference_copy_gives_back_what_it_holds() {
+    let remote = Arc::new(TestRemote::default());
+    let (a, body) = with_source(&remote, config()).await;
+    let budget = a.engine.read_state().budget_free;
+    let wait = Duration::from_millis(500);
+
+    remote.hold_manifests.store(true, Ordering::SeqCst);
+    let at_manifest = tokio::time::timeout(wait, copy(&a.engine, "first", WriteMode::Overwrite));
+    let at_manifest = at_manifest.await;
+    remote.hold_manifests.store(false, Ordering::SeqCst);
+    let room_after_manifest = a.engine.read_state().budget_free;
+    remote.stall_log_creates.store(true, Ordering::SeqCst);
+    let in_commit = tokio::time::timeout(wait, copy(&a.engine, "second", WriteMode::Overwrite));
+    let in_commit = in_commit.await;
+    remote.stall_log_creates.store(false, Ordering::SeqCst);
+    let room_after_commit = a.engine.read_state().budget_free;
+    a.engine.flush().await.unwrap();
+    let targets: Vec<String> = (0..4).map(|n| format!("next{n}")).collect();
+    let copies = targets
+        .iter()
+        .map(|target| copy(&a.engine, target, WriteMode::Overwrite));
+    let next = tokio::time::timeout(
+        Duration::from_secs(30),
+        futures_util::future::join_all(copies),
+    );
+    let next = next.await.expect("4 copies wait for a slot");
+    let first = a
+        .engine
+        .put(
+            BUCKET,
+            "first",
+            Bytes::from_static(b"x"),
+            BTreeMap::new(),
+            WriteMode::CreateOnly,
+        )
+        .await;
+
+    assert!(
+        at_manifest.is_err() && in_commit.is_err(),
+        "a copy did not stall"
+    );
+    assert_eq!(room_after_manifest, budget);
+    assert_eq!(room_after_commit, budget);
+    assert_eq!(get(&a.engine, "second").await.unwrap(), body);
+    for copied in next {
+        assert_eq!(copied.unwrap().path, CopyPath::Reference);
+    }
+    assert!(first.is_ok(), "{first:?}");
 }

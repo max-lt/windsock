@@ -593,14 +593,25 @@ fn header_with_wire_len(fields: &Fields, len: u64) -> Vec<u8> {
     bytes
 }
 
-/// The longest header that an entry of `node` with `seen` can have: every number at its largest.
+/// The longest header that an entry of `node` with the chains of `seen` can have: every number at
+/// its largest, the seq of each link too, as the links move on before the entry is signed.
 pub fn header_bound(node: NodeId, seen: &Seen) -> u64 {
+    let seen = seen
+        .iter()
+        .map(|(chain, link)| {
+            let link = Link {
+                seq: u64::MAX,
+                hash: link.hash,
+            };
+            (*chain, link)
+        })
+        .collect();
     let fields = Fields {
         node,
         seq: u64::MAX,
         prev: [0; 32],
         hlc: u64::MAX,
-        seen: seen.clone(),
+        seen,
         actions_hash: [0; 32],
         actions_len: u64::MAX,
     };
@@ -622,6 +633,36 @@ pub(crate) fn test_sealer() -> Sealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flush checks the bound before its uploads and computes the seen of its entry after them:
+    /// the links can be at higher seqs then, with longer varints.
+    #[test]
+    fn test_header_bound_covers_links_that_move_on() {
+        let nodes: Vec<NodeId> = (0..50u8).map(|n| NodeId::from_bytes([n; 32])).collect();
+        let at = |seq| -> Seen {
+            nodes
+                .iter()
+                .map(|node| (*node, Link { seq, hash: [1; 32] }))
+                .collect()
+        };
+        let later = Entry::sign(
+            &key(),
+            u64::MAX,
+            [2; 32],
+            u64::MAX,
+            at(u64::MAX),
+            vec![],
+            &test_sealer(),
+        );
+
+        let bound = header_bound(later.node, &at(1));
+
+        assert!(
+            bound >= later.header_len(),
+            "{bound} < {}",
+            later.header_len()
+        );
+    }
 
     #[test]
     fn test_wire_len_is_the_length_of_the_wire_bytes() {

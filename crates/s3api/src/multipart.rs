@@ -904,6 +904,32 @@ mod tests {
         assert_eq!(grown, Some(StatusCode::BAD_REQUEST));
     }
 
+    /// An SDK sends a part again when it loses the answer. Under the default limit, an upload of
+    /// the largest object in one part of the largest size can do that, as the old part stays on
+    /// disk until the new one gets its name.
+    #[tokio::test]
+    async fn test_largest_part_sent_again_fits_the_default_limit() {
+        const LARGEST: u64 = crate::DEFAULT_MAX_BODY as u64;
+        let dir = tempfile::tempdir().unwrap();
+        let first = Uploads::new(dir.path(), crate::DEFAULT_PARTS_LIMIT);
+        let id = first.initiate("b", "k", BTreeMap::new()).await.unwrap();
+        let part = first
+            .upload_dir(&id)
+            .unwrap()
+            .join(part_name(1, &"c".repeat(64)));
+        // A sparse file: the size counts, and no byte is written.
+        std::fs::File::create(&part)
+            .unwrap()
+            .set_len(LARGEST)
+            .unwrap();
+        let uploads = Uploads::new(dir.path(), crate::DEFAULT_PARTS_LIMIT);
+        assert_eq!(uploads.start().await.unwrap(), LARGEST);
+
+        let again = uploads.begin_part(&id, ("b", "k"), "1", LARGEST).await;
+
+        assert!(again.is_ok(), "{:?}", again.err());
+    }
+
     /// A kill in the middle of a removal can leave parts with no meta: the start removes them,
     /// whatever the name of the directory, so they neither stay for ever nor count.
     #[tokio::test]

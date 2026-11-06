@@ -403,9 +403,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   manifest PUT (none for a manifest of 4 KiB or less, which goes in the entry) and 1 entry
   create. The ack waits for the entry in the remote and its apply in the index, not for a local
   fsync. It reads no pack, so it does not find a damaged pack of the source; a later read of the
-  copy finds it, as a read of the source does. At most 4 copies by reference run at once. Each
-  holds room in the read budget for its manifests in memory: the larger of 2 decoded manifests,
-  or 1 decoded manifest and 2 times its encoding. Measured on macOS, release build, on a local
+  copy finds it, as a read of the source does. At most 4 copies by reference read their source
+  manifest and write the new one at once. Each holds room in the read budget for its manifests
+  in memory: the larger of 2 decoded manifests, or 1 decoded manifest and 2 times its encoding.
+  The commit of the entry waits for a flush in progress, with no room and no slot held. Measured on macOS, release build, on a local
   remote with 30 ms per call, after the first write of the process: a copy by reference made 2
   remote calls and took 100 to 120 ms from 4 MiB to 256 MiB. A spool copy took 61 ms at 16 MiB
   and 539 ms at 256 MiB with the cache on, and 210 ms and 979 ms with the cache off, plus the

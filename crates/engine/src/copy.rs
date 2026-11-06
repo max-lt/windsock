@@ -115,7 +115,7 @@ impl<R: Remote + 'static> Engine<R> {
         };
         // The decoded source is outside the read budget until its room is taken: the slots bound
         // how many copies hold one.
-        let _slot = self
+        let slot = self
             .ref_copies
             .acquire()
             .await
@@ -154,7 +154,7 @@ impl<R: Remote + 'static> Engine<R> {
 
         // At most two manifests in memory, then the new one with its encoding and its sealed form.
         let decoded = (from.chunks.len() * std::mem::size_of::<ChunkRef>()) as u64;
-        let _room = self
+        let room = self
             .room_for((2 * decoded).max(decoded + 2 * encoded), Some(wait))
             .await?;
         let fresh = match tokio::time::timeout(COPY_SYNC_DEADLINE, self.ensure_fresh_sync()).await {
@@ -197,6 +197,15 @@ impl<R: Remote + 'static> Engine<R> {
             .await?;
         crate::sim::action_point(crate::sim::Point::CopyRefManifest);
         crate::sim::crash_point(crate::sim::Point::CopyRefManifest)?;
+        let Manifest {
+            size,
+            content_hash,
+            metadata,
+            ..
+        } = manifest;
+        // A flush holds its lock for its whole backlog: a copy that waits there holds no room and
+        // no slot.
+        drop((room, slot));
         // One intent file: a flush and a copy commit one at a time, each after the recover.
         let _flushing = self.flushing.lock().await;
         self.recover().await?;
@@ -212,9 +221,9 @@ impl<R: Remote + 'static> Engine<R> {
 
         Ok(Ok(ObjectInfo {
             key: target.1.to_string(),
-            size: manifest.size,
-            content_hash: manifest.content_hash,
-            metadata: manifest.metadata,
+            size,
+            content_hash,
+            metadata,
             last_modified: time,
             conflicted: false,
         }))

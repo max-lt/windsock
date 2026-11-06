@@ -21,14 +21,15 @@ const WAIT: Duration = Duration::from_secs(5);
 const SIZE: usize = 8 * 1024 * 1024;
 
 /// A memory remote that counts its calls, fails them all while `down`, and can make the next
-/// log create ambiguous or hold the manifest PUTs.
+/// log create ambiguous or hold the manifest or pack PUTs.
 struct TestRemote {
     inner: MemoryRemote,
     calls: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
     down: AtomicBool,
     ambiguous_log_create: AtomicBool,
     hold_manifests: AtomicBool,
-    /// Manifest PUTs that wait for `release`.
+    hold_packs: AtomicBool,
+    /// Manifest and pack PUTs that wait for `release`.
     held: AtomicU64,
     release: tokio::sync::Semaphore,
 }
@@ -41,6 +42,7 @@ impl Default for TestRemote {
             down: AtomicBool::new(false),
             ambiguous_log_create: AtomicBool::new(false),
             hold_manifests: AtomicBool::new(false),
+            hold_packs: AtomicBool::new(false),
             held: AtomicU64::new(0),
             release: tokio::sync::Semaphore::new(0),
         }
@@ -82,7 +84,10 @@ impl TestRemote {
 impl Remote for TestRemote {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), RemoteError> {
         self.count("put", key)?;
-        if key.starts_with(engine::MANIFESTS_PREFIX) && self.hold_manifests.load(Ordering::SeqCst) {
+        let held = (key.starts_with(engine::MANIFESTS_PREFIX)
+            && self.hold_manifests.load(Ordering::SeqCst))
+            || (key.starts_with(engine::PACKS_PREFIX) && self.hold_packs.load(Ordering::SeqCst));
+        if held {
             self.held.fetch_add(1, Ordering::SeqCst);
             self.release.acquire().await.unwrap().forget();
         }
@@ -741,4 +746,37 @@ async fn test_copy_that_waits_for_its_slot_holds_no_source_manifest() {
     for copied in copied {
         assert_eq!(copied.unwrap().path, CopyPath::Reference);
     }
+}
+
+/// A flush holds its lock for its whole backlog. A copy that waits there must give back its read
+/// room and its slot first, or every GET and copy waits for the flush too.
+#[tokio::test]
+async fn test_copy_that_waits_for_a_flush_holds_no_read_room() {
+    let remote = Arc::new(TestRemote::default());
+    let (a, _) = with_source(&remote, config()).await;
+    let budget = a.engine.read_state().budget_free;
+    put(&a.engine, "other", &data(2, 1024)).await;
+    remote.hold_packs.store(true, Ordering::SeqCst);
+
+    let (flushed, copied, during) = tokio::join!(
+        a.engine.flush(),
+        async {
+            remote.held_manifests(1).await;
+            copy(&a.engine, "dst", WriteMode::Overwrite).await
+        },
+        async {
+            remote.held_manifests(1).await;
+            while remote.calls("put", "manifests") == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let during = a.engine.read_state().budget_free;
+            remote.release.add_permits(1);
+            during
+        }
+    );
+
+    flushed.unwrap();
+    assert_eq!(copied.unwrap().path, CopyPath::Reference);
+    assert_eq!(during, budget);
 }

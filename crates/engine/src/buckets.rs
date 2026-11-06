@@ -42,7 +42,8 @@ impl<R: Remote + 'static> Engine<R> {
         };
         let (found, _) = self.scan_page(&buffer, name, &first)?;
 
-        if !found.is_empty() {
+        // A reference copy is in neither the buffer nor the index until its apply.
+        if !found.is_empty() || self.ref_target_in_bucket(name) {
             return Err(EngineError::BucketNotEmpty(name.to_string()));
         }
 

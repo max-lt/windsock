@@ -304,6 +304,14 @@ impl<R: Remote + 'static> Engine<R> {
             .contains_key(&(bucket.to_string(), key.to_string()))
     }
 
+    pub(crate) fn ref_target_in_bucket(&self, bucket: &str) -> bool {
+        self.ref_targets
+            .lock()
+            .expect("no panic while the lock is held")
+            .keys()
+            .any(|(target, _)| target == bucket)
+    }
+
     async fn copy_by_spool(
         &self,
         source: (&str, &str),

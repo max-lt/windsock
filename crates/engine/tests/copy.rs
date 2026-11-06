@@ -682,3 +682,33 @@ async fn test_reference_copy_holds_read_budget_for_its_manifests() {
     assert!(during < budget, "{during} of {budget}");
     assert_eq!(a.engine.read_state().budget_free, budget);
 }
+
+/// A reference copy into an empty bucket is in no local state until its apply: a delete of that
+/// bucket must still see it, or the bucket comes back with the object in it.
+#[tokio::test]
+async fn test_delete_of_the_target_bucket_during_a_reference_copy_is_refused() {
+    let remote = Arc::new(TestRemote::default());
+    let (a, _) = with_source(&remote, config()).await;
+    a.engine.create_bucket("other", None).await.unwrap();
+    remote.hold_manifests.store(true, Ordering::SeqCst);
+
+    let copy = a.engine.copy(
+        (BUCKET, "src"),
+        ("other", "dst"),
+        None,
+        WriteMode::Overwrite,
+        WAIT,
+    );
+    let (copied, deleted) = tokio::join!(copy, async {
+        remote.held_manifests(1).await;
+        let deleted = a.engine.delete_bucket("other").await;
+        remote.release.add_permits(1);
+        deleted
+    });
+
+    assert_eq!(copied.unwrap().path, CopyPath::Reference);
+    assert!(
+        matches!(deleted, Err(EngineError::BucketNotEmpty(_))),
+        "{deleted:?}"
+    );
+}

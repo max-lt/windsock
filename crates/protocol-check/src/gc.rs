@@ -1,9 +1,10 @@
 //! Model check of the pack sweep: a condemn in the journal, a delete after a horizon.
 //!
 //! Writers put objects. A put either dedups against a pack its index knows, or
-//! uploads a fresh pack: a fresh upload always gets a new pack id. A copy dedups
-//! against the pack of the current source object and uploads a fresh manifest
-//! before its entry: an aborted copy leaves that manifest with no entry. The GC
+//! uploads a fresh pack: a fresh upload always gets a new pack id. A copy of a
+//! current object dedups against a pack its index knows, as each chunk can be in
+//! another pack than the one of the source, and uploads a fresh manifest before
+//! its entry: an aborted copy leaves that manifest with no entry. The GC
 //! appends one condemn for a pack that no current object uses, and deletes the
 //! pack later. A writer that applies a condemn never learns the pack again. A
 //! put from a writer that did not know the condemn can still name the pack: the
@@ -151,17 +152,43 @@ pub struct Puts {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Action {
     Tick,
-    Sync { writer: usize },
-    PlanDedup { writer: usize, key: u8, pack: u8 },
-    PlanFresh { writer: usize, key: u8 },
-    PlanCopy { writer: usize, key: u8, source: u8 },
-    Commit { writer: usize },
-    Abort { writer: usize },
-    Delete { key: u8 },
-    Crash { writer: usize },
+    Sync {
+        writer: usize,
+    },
+    PlanDedup {
+        writer: usize,
+        key: u8,
+        pack: u8,
+    },
+    PlanFresh {
+        writer: usize,
+        key: u8,
+    },
+    PlanCopy {
+        writer: usize,
+        key: u8,
+        source: u8,
+        pack: u8,
+    },
+    Commit {
+        writer: usize,
+    },
+    Abort {
+        writer: usize,
+    },
+    Delete {
+        key: u8,
+    },
+    Crash {
+        writer: usize,
+    },
     GcSync,
-    Condemn { pack: u8 },
-    Sweep { pack: u8 },
+    Condemn {
+        pack: u8,
+    },
+    Sweep {
+        pack: u8,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -211,13 +238,15 @@ impl GcModel {
         true
     }
 
-    /// A copy names the pack of the current source in the writer index, and a fresh manifest.
-    fn plan_copy(&self, s: &mut State, writer: usize, key: u8, source: u8) -> bool {
+    /// A copy of a current source names a pack and a fresh manifest. The index locates a chunk of
+    /// the source in any pack that holds it, also a dead pack that no condemn reached yet: as for
+    /// a dedup, the copy can name any pack that the writer knows.
+    fn plan_copy(&self, s: &mut State, writer: usize, key: u8, source: u8, pack: u8) -> bool {
         let w = &s.writers[writer];
         let view = s.view(w.reader);
-        let Some(Entry::Put { pack, .. }) = head(view, source) else {
+        if !matches!(head(view, source), Some(Entry::Put { .. })) {
             return false;
-        };
+        }
 
         if w.plan.is_some() || s.issued >= self.max_packs || !is_known(view, pack) {
             return false;
@@ -363,11 +392,14 @@ impl Model for GcModel {
                     }
                 }
                 if self.puts.copy {
-                    for source in 0..self.keys {
+                    for (source, pack) in
+                        (0..self.keys).flat_map(|s| (0..state.issued).map(move |p| (s, p)))
+                    {
                         actions.push(Action::PlanCopy {
                             writer,
                             key,
                             source,
+                            pack,
                         });
                     }
                 }
@@ -410,7 +442,8 @@ impl Model for GcModel {
                 writer,
                 key,
                 source,
-            } => self.plan_copy(&mut s, writer, key, source),
+                pack,
+            } => self.plan_copy(&mut s, writer, key, source, pack),
             Action::Commit { writer } => self.commit(&mut s, writer),
             Action::Abort { writer } => s.writers[writer].plan.take().is_some(),
             Action::Delete { key } => {
@@ -516,7 +549,7 @@ impl GcModel {
 mod tests {
     use std::collections::BTreeSet;
 
-    use stateright::{Checker, HasDiscoveries};
+    use stateright::{Checker, Expectation, HasDiscoveries};
 
     use super::*;
 
@@ -629,6 +662,26 @@ mod tests {
             fresh_plan: false,
             ..SAFE
         }));
+    }
+
+    /// Small bounds, in seconds: a copy that names a pack that is not its source's is checked on
+    /// every build, before the full check on a build machine.
+    #[test]
+    fn test_sweep_rules_keep_every_copy_readable_at_small_bounds() {
+        let small = GcModel {
+            max_time: 3,
+            max_entries: 3,
+            ..copy_model(SAFE)
+        };
+        let checked = small.clone().checker().spawn_bfs().join();
+
+        let always = small
+            .properties()
+            .into_iter()
+            .filter(|p| p.expectation == Expectation::Always);
+        for property in always {
+            checked.assert_no_discovery(property.name);
+        }
     }
 
     #[test]

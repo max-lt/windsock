@@ -9,7 +9,6 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-blake3 = { version = "1", features = ["pure"] }
 engine = { path = "../crates/engine" }
 chunking = { path = "../crates/chunking" }
 index = { path = "../crates/index" }

@@ -469,7 +469,6 @@ dependencies = [
 name = "fuzz"
 version = "0.0.0"
 dependencies = [
- "blake3",
  "chunking",
  "engine",
  "index",

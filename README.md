@@ -277,6 +277,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   `EngineError::Stopped`. The host drops the `Node`: it holds the engine, and a new serve of the
   same `data_dir` opens only once it is gone.
 
+- `Node::create_bucket(name, owner)` creates a bucket as CreateBucket over S3 does, with no grant
+  check. `owner` is an access key or `None`. An owner key with `create_bucket` gets `ReadWrite` on
+  the bucket.
 - `Node::metrics()` gives the counters of the S3 port since the start: open and accepted
   connections, the open connections of each client IP, the requests in progress, and one row of
   totals (count, body bytes in and out, duration) for each access key, bucket, operation and

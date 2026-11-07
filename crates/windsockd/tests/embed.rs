@@ -175,6 +175,56 @@ async fn test_node_handle_reads_state_and_sets_the_cache_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_node_creates_a_bucket_that_s3_then_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let config = config_without_keys(dir.path(), port);
+    let keys = common::test_keys();
+    let store = Arc::new(Keys::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert(keys.0.clone(), keys.1.clone());
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(&config, store, shutdown, on_open).await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&address).await;
+
+    let created = node.create_bucket("made", Some(keys.0.clone())).await;
+    let again = node.create_bucket("made", None).await;
+    let invalid = node.create_bucket("Bad_Name", None).await;
+    let object = common::call_at(&address, &keys, "PUT", "/made/k", b"data").await;
+    let buckets = node.buckets().await.unwrap();
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+
+    created.unwrap();
+    assert!(
+        matches!(again, Err(engine::EngineError::BucketAlreadyExists(_))),
+        "{again:?}"
+    );
+    assert!(
+        matches!(invalid, Err(engine::EngineError::InvalidBucketName(_))),
+        "{invalid:?}"
+    );
+    assert_eq!(object.status, StatusCode::OK, "{}", object.text());
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].name, "made");
+    assert_eq!(buckets[0].owner.as_deref(), Some(keys.0.as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_list_page_is_capped_whatever_max_the_caller_asks() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();

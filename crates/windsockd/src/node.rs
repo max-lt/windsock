@@ -1,5 +1,4 @@
-//! A handle on a running node for the process that embeds windsockd. It reads the node state and
-//! sets the cache limit. It writes no object, bucket or configuration.
+//! A running node for its host: state, buckets and cache limit, but no object or configuration.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +50,7 @@ pub struct Page {
 trait NodeOps: Send + Sync {
     async fn status(&self) -> NodeStatus;
     async fn buckets(&self) -> Result<Vec<BucketInfo>, EngineError>;
+    async fn create_bucket(&self, name: &str, owner: Option<String>) -> Result<(), EngineError>;
     async fn list(
         &self,
         bucket: &str,
@@ -91,6 +91,15 @@ impl Node {
 
     pub async fn buckets(&self) -> Result<Vec<BucketInfo>, EngineError> {
         self.0.buckets().await
+    }
+
+    /// As CreateBucket over S3, with no grant check; `owner` is an access key or None.
+    pub async fn create_bucket(
+        &self,
+        name: &str,
+        owner: Option<String>,
+    ) -> Result<(), EngineError> {
+        self.0.create_bucket(name, owner).await
     }
 
     /// At most `max` objects of `bucket` under `prefix`, in key order, after the key `after`. A
@@ -166,6 +175,11 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
     async fn buckets(&self) -> Result<Vec<BucketInfo>, EngineError> {
         self.running()?;
         self.engine.list_buckets().await
+    }
+
+    async fn create_bucket(&self, name: &str, owner: Option<String>) -> Result<(), EngineError> {
+        self.running()?;
+        self.engine.create_bucket(name, owner).await
     }
 
     async fn list(

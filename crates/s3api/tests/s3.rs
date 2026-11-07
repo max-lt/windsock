@@ -2192,6 +2192,17 @@ fn spool_files(server: &Server) -> usize {
         .map_or(0, |entries| entries.count())
 }
 
+fn spool_bytes(server: &Server) -> u64 {
+    let Ok(entries) = std::fs::read_dir(server._dir.path().join("engine/buffer/spool")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
 /// Puts that start together take the room of their declared bodies at once: the one that the
 /// buffer cannot hold gets 503 before its body, not in the middle of it.
 #[tokio::test]
@@ -3778,8 +3789,9 @@ async fn test_request_dropped_before_its_response_counts_as_client_closed() {
     let app = server.app.clone();
     let held = tokio::spawn(app.oneshot(Request::from_parts(parts, Body::from_stream(stream))));
     tx.send(Bytes::from(vec![1u8; 10])).await.unwrap();
+    // The spool file starts with an 8-byte length; past it, the body was read and counted.
     tokio::time::timeout(Duration::from_secs(30), async {
-        while spool_files(&server) == 0 {
+        while spool_bytes(&server) < 8 + 10 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

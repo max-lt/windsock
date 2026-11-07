@@ -3,10 +3,22 @@
 use super::*;
 use engine::ListEntry;
 
+use crate::keys::Owner;
 use crate::list::After;
 
-pub(crate) async fn list_buckets<R: Remote + 'static>(State(state): State<AppState<R>>) -> Reply {
-    xml_reply(xml::list_buckets(&state.engine.list_buckets().await?))
+pub(crate) async fn list_buckets<R: Remote + 'static>(
+    State(state): State<AppState<R>>,
+    Extension(Caller(access_key, grants)): Extension<Caller>,
+) -> Reply {
+    let mut buckets = state.engine.list_buckets().await?;
+    buckets.retain(|bucket| {
+        let owner = match bucket.owner.as_deref() == Some(access_key.as_str()) {
+            true => Owner::Key,
+            false => Owner::Other,
+        };
+        grants.access(&bucket.name, owner).is_some()
+    });
+    xml_reply(xml::list_buckets(&buckets))
 }
 
 pub(crate) async fn bucket_put<R: Remote + 'static>(

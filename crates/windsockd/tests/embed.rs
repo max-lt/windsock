@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyper::StatusCode;
-use s3api::{KeyStore, KeyStoreError, Secret};
+use s3api::{Grants, Key, KeyStore, KeyStoreError, Secret};
 
 /// Keys that the test changes while the daemon runs.
 #[derive(Default)]
@@ -16,11 +16,12 @@ struct Keys(Mutex<HashMap<String, String>>);
 
 #[async_trait::async_trait]
 impl KeyStore for Keys {
-    async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+    async fn key(&self, access_key: &str) -> Result<Option<Key>, KeyStoreError> {
         let keys = self.0.lock().unwrap();
-        Ok(keys
-            .get(access_key)
-            .map(|secret| Secret::new(secret.clone())))
+        Ok(keys.get(access_key).map(|secret| Key {
+            secret: Secret::new(secret.clone()),
+            grants: Grants::full(),
+        }))
     }
 }
 

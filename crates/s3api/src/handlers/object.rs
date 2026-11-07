@@ -127,20 +127,24 @@ fn copy_source(source: &str, headers: &HeaderMap) -> Result<(String, String), S3
         ));
     }
 
-    let source = form_urlencoded::parse(format!("s={}", source.replace('+', "%2B")).as_bytes())
-        .next()
-        .map(|(_, value)| value.into_owned())
-        .unwrap_or_default();
-    let source = source.strip_prefix('/').unwrap_or(&source);
     if source.contains("?versionId=") {
         return Err(S3Error::not_implemented(
             "versioned copy sources are not supported",
         ));
     }
-    let (bucket, key) = source
-        .split_once('/')
-        .ok_or_else(|| S3Error::invalid_argument("x-amz-copy-source must be bucket/key"))?;
-    Ok((bucket.to_string(), key.to_string()))
+    copy_source_path(source)
+        .ok_or_else(|| S3Error::invalid_argument("x-amz-copy-source must be bucket/key"))
+}
+
+/// The bucket and key of an `x-amz-copy-source` value, percent-decoded.
+pub(crate) fn copy_source_path(source: &str) -> Option<(String, String)> {
+    let source = form_urlencoded::parse(format!("s={}", source.replace('+', "%2B")).as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default();
+    let source = source.strip_prefix('/').unwrap_or(&source);
+    let (bucket, key) = source.split_once('/')?;
+    Some((bucket.to_string(), key.to_string()))
 }
 
 /// One of the MAX_COPIES slots of the copies that run at once, or 503.

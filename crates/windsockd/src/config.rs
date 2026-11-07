@@ -37,8 +37,7 @@ pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub remote: RemoteConfig,
-    /// The keys that S3 clients sign with. Every key reaches every bucket. Empty when a
-    /// [`s3api::KeyStore`] gives the keys.
+    /// Keys with [`s3api::Grants::full`]. Empty when a [`s3api::KeyStore`] gives the keys.
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
     #[serde(default = "default_sync_interval")]

@@ -221,7 +221,7 @@ the configuration file.
 | `request_timeout_secs`      | `300`                                | A body upload that receives no byte for this time is cut. Each byte received starts the time again. At least 1                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `uploads_expire_secs`       | `604800` (7 days)                    | A multipart upload with no initiate and no part for this time is removed, with its parts. The check runs every hour. The minimum is 3600. The proxy must also have run for this time since it first saw the upload, so a wall clock step does not remove a fresh upload. A proxy that restarts more often than this never removes an upload: clients list them with ListMultipartUploads and remove them with AbortMultipartUpload                                                                                                                                                        |
 | `remote.type`               | `dir`                                | `dir` (with `path`) or `s3` (with `endpoint`, `bucket`, `prefix`, `region`, `access_key`, `secret_key`, and `ca_file` for a private CA)                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `[[keys]]`                  | one new pair                         | Key pairs that S3 clients sign with. Every key reaches every bucket                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `[[keys]]`                  | one new pair                         | Key pairs that S3 clients sign with. Every key has every grant on every bucket                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `sync_interval_secs`        | `10`                                 | How often the proxy reads the writes of other proxies. At least 1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `engine.cache_bytes`        | 16 GiB                               | Chunk cache size. `0` turns the cache off                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `engine.flush_delay_ms`     | `1000`                               | Longest time a write waits in the buffer before it goes to the remote                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -257,21 +257,34 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - An `https` S3 remote needs the feature `tls`: `cargo build --release -p windsockd --features tls`.
   This feature compiles C (the `ring` crypto provider). The default build has no TLS and refuses an
   `https` endpoint. `ca_file` adds a PEM file of CA certificates to the public roots.
-- Keys come from the configuration file. There are no per-bucket permissions. A process that
-  embeds windsockd gives the keys through a `KeyStore` (`windsockd::serve_with`), and the
-  configuration then has no `[[keys]]` entry. The store is asked on every request, with no cache:
+- Keys come from the configuration file, and each one can do every operation on every bucket. A
+  process that embeds windsockd gives the keys through a `KeyStore` (`windsockd::serve_with`), and
+  the configuration then has no `[[keys]]` entry. The store gives the secret and the `Grants` of
+  each key:
+  - Access on a bucket is `Read` (GET, HEAD, listings) or `ReadWrite` (also the writes, deletes,
+    multipart steps and DeleteBucket). The access of a key on a bucket is the greatest of
+    `all_buckets`, its entry in `buckets`, and `ReadWrite` on a bucket that the key created when
+    `create_bucket` is set.
+  - CreateBucket needs `create_bucket`. A copy needs `Read` on its source bucket and `ReadWrite` on
+    its destination. ListBuckets shows only the buckets that the key can reach.
+  - A request on a bucket that the key cannot reach gets 403 `AccessDenied`, also when the bucket
+    does not exist. A presigned URL takes the same check.
+
+  The store is asked on every request, with no cache:
   a failed lookup, or one that takes more than 2 s (`KEY_STORE_DEADLINE`), gets
   `503 ServiceUnavailable`. When `serve_with` returns or its future is dropped, its tasks and its
   client connections stop, with the requests in progress, and each call of its `Node` gets
   `EngineError::Stopped`. The host drops the `Node`: it holds the engine, and a new serve of the
   same `data_dir` opens only once it is gone.
+
 - `Node::metrics()` gives the counters of the S3 port since the start: open and accepted
   connections, the open connections of each client IP, the requests in progress, and one row of
   totals (count, body bytes in and out, duration) for each access key, bucket, operation and
-  status. A request counts when its response body ends. A refused request has no access key and no
-  bucket. A request whose client goes away before the response has status 499. The table keeps at
-  most 4096 rows. Past that, a new row goes to the row of bucket `<overflow>` for its operation and
-  status. The counters are in memory: a restart sets them to zero.
+  status. A request counts when its response body ends. A request that fails the signature check
+  has no access key and no bucket. A request whose client goes away before the response gets the
+  status 499. The table keeps at most 4096 rows. Past that, a new row goes to the row of bucket
+  `<overflow>` for its operation and status. The counters are in memory: a restart sets them to
+  zero.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.
 - The proxy does not check the value of `Content-MD5` or of `x-amz-checksum-*`, in a header or in
@@ -295,8 +308,8 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   of its wall clock, a presigned request gets `503 SlowDown`: the expiry needs a trusted wall
   clock. A step back of the wall clock under R can make an expired URL valid again for the length
   of the step.
-- Every key reaches every bucket: there are no rights per key. So the holder of a presigned URL
-  has the rights of the key that signed it, on every bucket, until the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
+- The holder of a presigned URL has the grants of the key that signed it, on every bucket that
+  the key can reach, until the expiry. The holder chooses each header that the URL does not sign: Content-Type, user
   metadata, If-Match and If-None-Match. Sign Content-Type when it matters. A PUT URL works many
   times until its expiry, each time for an object up to the buffer limit. Each PUT over 1 MiB
   goes through a spool file (see below).

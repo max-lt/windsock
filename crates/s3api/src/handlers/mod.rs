@@ -7,7 +7,9 @@ mod object;
 pub(crate) use bucket::{
     bucket_delete, bucket_get, bucket_head, bucket_post, bucket_put, list_buckets,
 };
-pub(crate) use object::{object_delete, object_get, object_head, object_post, object_put};
+pub(crate) use object::{
+    copy_source_path, object_delete, object_get, object_head, object_post, object_put,
+};
 
 use std::collections::BTreeMap;
 use std::ops::Range;

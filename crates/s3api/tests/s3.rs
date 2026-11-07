@@ -12,7 +12,7 @@ use engine::sim::Point;
 use engine::{Config, Engine};
 use http_body_util::BodyExt;
 use remote::DirRemote;
-use s3api::{KeyStore, KeyStoreError, S3Config, Secret, sigv4};
+use s3api::{Access, Grants, Key, KeyStore, KeyStoreError, S3Config, Secret, sigv4};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -2486,6 +2486,8 @@ async fn test_copy_body_with_no_length_stops_at_a_small_cap() {
 #[derive(Default)]
 struct LiveKeys {
     keys: std::sync::Mutex<HashMap<String, String>>,
+    /// The grants of a key with no entry are full.
+    grants: std::sync::Mutex<HashMap<String, Grants>>,
     down: std::sync::atomic::AtomicBool,
     /// Every lookup waits for ever.
     hang: std::sync::atomic::AtomicBool,
@@ -2493,7 +2495,7 @@ struct LiveKeys {
 
 #[async_trait::async_trait]
 impl KeyStore for LiveKeys {
-    async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+    async fn key(&self, access_key: &str) -> Result<Option<Key>, KeyStoreError> {
         if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -2501,9 +2503,11 @@ impl KeyStore for LiveKeys {
             return Err(KeyStoreError::new("the key database is locked"));
         }
         let keys = self.keys.lock().unwrap();
-        Ok(keys
-            .get(access_key)
-            .map(|secret| Secret::new(secret.clone())))
+        let grants = self.grants.lock().unwrap();
+        Ok(keys.get(access_key).map(|secret| Key {
+            secret: Secret::new(secret.clone()),
+            grants: grants.get(access_key).cloned().unwrap_or_else(Grants::full),
+        }))
     }
 }
 
@@ -3397,11 +3401,14 @@ struct BlockingKeys {
 
 #[async_trait::async_trait]
 impl KeyStore for BlockingKeys {
-    async fn secret(&self, access_key: &str) -> Result<Option<Secret>, KeyStoreError> {
+    async fn key(&self, access_key: &str) -> Result<Option<Key>, KeyStoreError> {
         let (delay, access_key) = (self.delay, access_key.to_string());
         tokio::task::spawn_blocking(move || {
             std::thread::sleep(delay);
-            (access_key == ACCESS).then(|| Secret::new(SECRET.to_string()))
+            (access_key == ACCESS).then(|| Key {
+                secret: Secret::new(SECRET.to_string()),
+                grants: Grants::full(),
+            })
         })
         .await
         .map_err(|e| KeyStoreError::new(e.to_string()))
@@ -3793,4 +3800,157 @@ async fn test_request_dropped_before_its_response_counts_as_client_closed() {
     .unwrap();
     assert_eq!((closed.count, closed.bytes_in), (1, 10));
     assert_eq!(server.requests.in_flight(), 0);
+}
+
+/// `photos/x` and `backups/x` of another owner; the key gets `grants` after the setup.
+async fn granted(grants: Grants) -> (Server, Arc<LiveKeys>) {
+    let store = Arc::new(LiveKeys::default());
+    let server = with_key_store(store.clone()).await;
+    for bucket in ["photos", "backups"] {
+        server
+            .engine
+            .create_bucket(bucket, Some("admin".into()))
+            .await
+            .unwrap();
+        let reply = run(&server, call("PUT", &format!("/{bucket}/x")).body("data")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    }
+    store.grants.lock().unwrap().insert(ACCESS.into(), grants);
+    (server, store)
+}
+
+fn bucket_grants(list: &[(&str, Access)]) -> Grants {
+    Grants {
+        buckets: list.iter().map(|(b, a)| (b.to_string(), *a)).collect(),
+        ..Grants::default()
+    }
+}
+
+fn assert_denied(reply: &Reply) {
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    assert_eq!(reply.xml("Code").as_deref(), Some("AccessDenied"));
+}
+
+#[tokio::test]
+async fn test_read_grant_allows_reads_of_its_bucket_only() {
+    let (server, _store) = granted(bucket_grants(&[("photos", Access::Read)])).await;
+
+    let get = run(&server, call("GET", "/photos/x")).await;
+    let list = run(&server, call("GET", "/photos?list-type=2")).await;
+    let write = run(&server, call("PUT", "/photos/y").body("data")).await;
+    let delete = run(&server, call("DELETE", "/photos/x")).await;
+    let other = run(&server, call("GET", "/backups/x")).await;
+    let missing = run(&server, call("GET", "/nosuch/x")).await;
+    let head_missing = run(&server, call("HEAD", "/nosuch")).await;
+    let buckets = run(&server, call("GET", "/")).await;
+
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(list.status, StatusCode::OK);
+    for reply in [&write, &delete, &other, &missing] {
+        assert_denied(reply);
+    }
+    assert_eq!(head_missing.status, StatusCode::FORBIDDEN);
+    assert_eq!(buckets.xml_all("Name"), ["photos"]);
+}
+
+#[tokio::test]
+async fn test_key_with_no_grant_lists_no_bucket() {
+    let (server, _store) = granted(Grants::default()).await;
+
+    let buckets = run(&server, call("GET", "/")).await;
+
+    assert_eq!(buckets.status, StatusCode::OK);
+    assert!(buckets.xml_all("Name").is_empty(), "{}", buckets.text());
+}
+
+#[tokio::test]
+async fn test_copy_needs_read_on_the_source_and_write_on_the_destination() {
+    use Access::*;
+    let (server, store) = granted(Grants::default()).await;
+    let copy =
+        |dest: &'static str| call("PUT", dest).header("x-amz-copy-source", "/photos/x".to_string());
+    let mut replies = Vec::new();
+    for grants in [
+        bucket_grants(&[("photos", Read), ("backups", ReadWrite)]),
+        bucket_grants(&[("photos", Read), ("backups", Read)]),
+        bucket_grants(&[("backups", ReadWrite)]),
+    ] {
+        store.grants.lock().unwrap().insert(ACCESS.into(), grants);
+        replies.push(run(&server, copy("/backups/c")).await);
+    }
+
+    assert_eq!(replies[0].status, StatusCode::OK, "{}", replies[0].text());
+    assert_denied(&replies[1]);
+    assert_denied(&replies[2]);
+}
+
+#[tokio::test]
+async fn test_create_bucket_grant_gives_write_on_the_buckets_the_key_creates() {
+    let grants = Grants {
+        create_bucket: true,
+        ..Grants::default()
+    };
+    let (server, store) = granted(grants).await;
+
+    let create = run(&server, call("PUT", "/new")).await;
+    let write = run(&server, call("PUT", "/new/k").body("data")).await;
+    let delete = run(&server, call("DELETE", "/new/k")).await;
+    let other = run(&server, call("GET", "/photos/x")).await;
+    let buckets = run(&server, call("GET", "/")).await;
+    store
+        .grants
+        .lock()
+        .unwrap()
+        .insert(ACCESS.into(), Grants::default());
+    let revoked = run(&server, call("PUT", "/new/k").body("data")).await;
+
+    assert_eq!(create.status, StatusCode::OK, "{}", create.text());
+    assert_eq!(write.status, StatusCode::OK, "{}", write.text());
+    assert_eq!(delete.status, StatusCode::NO_CONTENT);
+    assert_denied(&other);
+    assert_eq!(buckets.xml_all("Name"), ["bkt", "new"]);
+    assert_denied(&revoked);
+}
+
+#[tokio::test]
+async fn test_bucket_create_needs_the_create_grant() {
+    let grants = Grants {
+        all_buckets: Some(Access::ReadWrite),
+        ..Grants::default()
+    };
+    let (server, _store) = granted(grants).await;
+
+    let create = run(&server, call("PUT", "/new")).await;
+    let with_query = run(&server, call("PUT", "/new?acl")).await;
+    let write = run(&server, call("PUT", "/photos/y").body("data")).await;
+
+    assert_denied(&create);
+    assert_denied(&with_query);
+    assert_eq!(write.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_presigned_request_takes_the_grant_check() {
+    let (server, _store) = granted(bucket_grants(&[("photos", Access::Read)])).await;
+
+    let get = presigned(
+        &server,
+        &Presign::new("GET", "/photos/x"),
+        "GET",
+        "/photos/x",
+    )
+    .await;
+    let put_uri = format!("/photos/y?{}", Presign::new("PUT", "/photos/y").query());
+    let put = send_raw(&server, "PUT", &put_uri, "localhost", "data").await;
+    let other = presigned(
+        &server,
+        &Presign::new("GET", "/backups/x"),
+        "GET",
+        "/backups/x",
+    )
+    .await;
+
+    assert_eq!(get.status, StatusCode::OK, "{}", get.text());
+    assert_denied(&put);
+    assert_denied(&other);
 }

@@ -57,9 +57,9 @@ The daemon crate is `windsockd`.
   `snapshot.rs` (snapshots, bootstrap, journal prune) and `sim.rs` (crash points, feature `sim`).
 - `s3api`: S3 over HTTP (axum) on the engine. `auth.rs`: SigV4 in the header (payload hash checked,
   aws-chunked decoded, 15 min clock skew). `presign.rs`: SigV4 in the query (presigned URLs).
-  `keys.rs`: the `KeyStore`, asked on every request. `handlers/`: `bucket.rs`, `object.rs`,
-  `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects v1 and v2
-  paging (no I/O). `multipart.rs`: parts on local disk. `metrics.rs`: request totals by access key,
+  `keys.rs`: the `KeyStore` (secret and grants of a key), asked on every request. `grants.rs`: the
+  grant check before the handler. `handlers/`: `bucket.rs`, `object.rs`, `conditions.rs` (RFC 7232
+  preconditions, RFC 7233 ranges). `list.rs`: ListObjects v1 and v2 paging (no I/O). `multipart.rs`: parts on local disk. `metrics.rs`: request totals by access key,
   bucket, op and status. `xml.rs`. ETag = blake3 hex of the data.
 - `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use tracing::debug;
 
 use crate::S3Error;
-use crate::keys::KeyStore;
+use crate::keys::{Grants, Key, KeyStore};
 use s3proto::sigv4;
 use s3proto::time::parse_amz_date;
 
@@ -35,6 +35,7 @@ pub(crate) const MAX_EXPIRES_SECS: u64 = 7 * 24 * 3600;
 /// A presigned request whose signature matched.
 pub(crate) struct Presigned {
     pub access_key: String,
+    pub grants: Grants,
 }
 
 fn malformed(message: impl Into<String>) -> S3Error {
@@ -230,7 +231,7 @@ pub(crate) async fn verify(
         return Err(S3Error::access_denied("Request has expired"));
     }
 
-    let secret = crate::keys::secret_of(keys, access_key).await?;
+    let Key { secret, grants } = crate::keys::key_of(keys, access_key).await?;
     let payload_hash = payload_hash(&parts.headers)?;
     let headers: Vec<(String, String)> = parts
         .headers
@@ -262,6 +263,7 @@ pub(crate) async fn verify(
 
     Ok(Presigned {
         access_key: access_key.to_string(),
+        grants,
     })
 }
 

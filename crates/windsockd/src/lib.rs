@@ -35,7 +35,7 @@ pub use metrics::{
 };
 pub use model::NodeId;
 pub use node::{MAX_PAGE, Node, NodeStatus, Page};
-pub use s3api::KeyStore;
+pub use s3api::{Access, Grants, Key, KeyStore, Owner};
 
 use config::RemoteConfig;
 use listener::{

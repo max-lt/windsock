@@ -1,5 +1,6 @@
 //! Request authentication: SigV4 on the head, then the payload against its signed hash.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -12,9 +13,9 @@ use bytes::Bytes;
 use remote::Remote;
 use tracing::debug;
 
-use crate::keys::{self, KeyStore};
+use crate::keys::{self, Grants, Key, KeyStore};
 use crate::metrics::CallerSlot;
-use crate::{AppState, Caller, S3Error, StreamedBody, presign};
+use crate::{AppState, Caller, S3Error, StreamedBody, grants, presign};
 use s3proto::sigv4::{self, Authorization, ChunkDecoder, ChunkSigner};
 use s3proto::time::parse_amz_date;
 
@@ -24,6 +25,7 @@ const MAX_SKEW_SECS: u64 = 15 * 60;
 /// A request head whose signature matched.
 struct Verified {
     access_key: String,
+    grants: Grants,
     signing_key: [u8; 32],
     timestamp: String,
     scope: String,
@@ -47,7 +49,7 @@ async fn verify_head(parts: &Parts, keys: &dyn KeyStore, now: u64) -> Result<Ver
         .and_then(Authorization::parse)
         .ok_or_else(|| S3Error::access_denied("a SigV4 Authorization header is required"))?;
 
-    let secret = keys::secret_of(keys, &authorization.access_key).await?;
+    let Key { secret, grants } = keys::key_of(keys, &authorization.access_key).await?;
 
     let timestamp = header(&parts.headers, "x-amz-date")
         .ok_or_else(|| S3Error::access_denied("x-amz-date is required"))?;
@@ -97,6 +99,7 @@ async fn verify_head(parts: &Parts, keys: &dyn KeyStore, now: u64) -> Result<Ver
 
     Ok(Verified {
         access_key: authorization.access_key,
+        grants,
         signing_key,
         timestamp: timestamp.to_string(),
         scope,
@@ -279,7 +282,7 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
     next: Next,
 ) -> Result<Response, S3Error> {
     let (mut parts, body) = request.into_parts();
-    let (access_key, signer) = match presign::is_presigned(parts.uri.query()) {
+    let (access_key, grants, signer) = match presign::is_presigned(parts.uri.query()) {
         true => {
             // The expiry needs a wall clock that the proxy trusts.
             if let Err(engine::EngineError::ClockAhead { wait_secs }) = state.engine.check_clock() {
@@ -291,7 +294,7 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
             }
             let presigned =
                 presign::verify(&parts, state.keys.as_ref(), unix_now(), MAX_SKEW_SECS).await?;
-            (presigned.access_key, None)
+            (presigned.access_key, presigned.grants, None)
         }
         false => {
             let verified = verify_head(&parts, state.keys.as_ref(), unix_now()).await?;
@@ -301,13 +304,16 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
                 scope: verified.scope,
                 previous: verified.signature,
             };
-            (verified.access_key, Some(signer))
+            (verified.access_key, verified.grants, Some(signer))
         }
     };
     if let Some(slot) = parts.extensions.get::<CallerSlot>() {
         slot.set(&access_key);
     }
-    parts.extensions.insert(Caller(access_key));
+    grants::check(&state.engine, &parts, &access_key, &grants).await?;
+    parts
+        .extensions
+        .insert(Caller(access_key, Arc::new(grants)));
     check_framing(&parts)?;
     if let Some(stream) = streamed(&parts, signer.as_ref())? {
         if stream

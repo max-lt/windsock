@@ -1,10 +1,10 @@
 //! S3 API over the engine, with axum.
 //!
-//! Authentication is SigV4 in the `Authorization` header or in the query. The keys come from a
-//! [`KeyStore`], and every key can reach every bucket.
+//! Authentication is SigV4 in a header or the query; a [`KeyStore`] gives the keys and grants.
 
 mod auth;
 mod error;
+mod grants;
 mod handlers;
 mod keys;
 mod list;
@@ -25,7 +25,9 @@ use engine::Engine;
 use remote::Remote;
 
 pub use error::S3Error;
-pub use keys::{KEY_STORE_DEADLINE, KeyStore, KeyStoreError, Secret, StaticKeys};
+pub use keys::{
+    Access, Grants, KEY_STORE_DEADLINE, Key, KeyStore, KeyStoreError, Owner, Secret, StaticKeys,
+};
 pub use s3proto::sigv4;
 
 pub use metrics::{CLIENT_CLOSED, MAX_ROWS, OVERFLOW_BUCKET, RequestOp, RequestRow, RequestStats};
@@ -75,9 +77,9 @@ pub(crate) struct StreamedBody {
     pub decoded_length: Option<u64>,
 }
 
-/// The access key of an authenticated request.
+/// The access key of an authenticated request, and its grants.
 #[derive(Clone, Debug)]
-pub(crate) struct Caller(pub String);
+pub(crate) struct Caller(pub String, pub Arc<Grants>);
 
 pub(crate) struct AppState<R> {
     engine: Arc<Engine<R>>,

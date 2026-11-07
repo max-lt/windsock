@@ -24,6 +24,7 @@ struct Server {
     _dir: TempDir,
     engine: Arc<Engine<DirRemote>>,
     uploads: Arc<s3api::Uploads>,
+    requests: Arc<s3api::RequestStats>,
     app: Router,
 }
 
@@ -60,12 +61,14 @@ async fn server_in(dir: TempDir, config: Config, parts_limit: u64) -> Server {
     config.uploads.start().await.unwrap();
     config.uploads.settle(&engine).await.unwrap();
     let uploads = config.uploads.clone();
+    let requests = config.requests.clone();
     let app = s3api::router(engine.clone(), config);
 
     Server {
         _dir: dir,
         engine,
         uploads,
+        requests,
         app,
     }
 }
@@ -3696,4 +3699,98 @@ async fn test_upload_part_copy_with_no_room_in_the_read_budget_gets_503() {
     assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
     assert_eq!(part_temps(&server, &id), 0);
     assert_eq!(server.uploads.held(), parts_held);
+}
+
+fn row(
+    server: &Server,
+    access_key: Option<&str>,
+    bucket: Option<&str>,
+    op: s3api::RequestOp,
+    status: u16,
+) -> Option<s3api::RequestRow> {
+    server.requests.rows().into_iter().find(|row| {
+        row.access_key.as_deref() == access_key
+            && row.bucket.as_deref() == bucket
+            && row.op == op
+            && row.status == status
+    })
+}
+
+#[tokio::test]
+async fn test_requests_count_by_key_bucket_op_and_status_with_their_bytes() {
+    use s3api::RequestOp::*;
+    let server = with_bucket().await;
+
+    put(&server, "a", "hello").await;
+    put(&server, "b", "hi").await;
+    let read = run(&server, call("GET", "/bkt/a")).await;
+    let missing = run(&server, call("GET", "/bkt/none")).await;
+    let list = run(&server, call("GET", "/")).await;
+
+    assert_eq!(
+        (read.status, missing.status, list.status),
+        (StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::OK)
+    );
+    let write = row(&server, Some(ACCESS), Some("bkt"), Write, 200).unwrap();
+    assert_eq!((write.count, write.bytes_in, write.bytes_out), (3, 7, 0));
+    let get = row(&server, Some(ACCESS), Some("bkt"), Read, 200).unwrap();
+    assert_eq!((get.count, get.bytes_in, get.bytes_out), (1, 0, 5));
+    let not_found = row(&server, Some(ACCESS), Some("bkt"), Read, 404).unwrap();
+    assert_eq!(not_found.bytes_out, missing.body.len() as u64);
+    let buckets = row(&server, Some(ACCESS), None, List, 200).unwrap();
+    assert_eq!(buckets.bytes_out, list.body.len() as u64);
+    assert!(server.requests.rows().iter().all(|row| row.duration_us > 0));
+    assert_eq!(server.requests.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn test_refused_signature_counts_with_no_key_and_no_bucket() {
+    let server = with_bucket().await;
+    let mut bad = call("GET", "/bkt/a");
+    bad.secret = "wrong";
+
+    let reply = run(&server, bad).await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let refused = row(&server, None, None, s3api::RequestOp::Read, 403).unwrap();
+    assert_eq!(refused.count, 1);
+}
+
+#[tokio::test]
+async fn test_request_dropped_before_its_response_counts_as_client_closed() {
+    let server = with_bucket().await;
+    let declared = (2u64 * 1024 * 1024).to_string();
+    let mut put = call("PUT", "/bkt/a").header("content-length", declared);
+    put.payload_hash = Some(sigv4::UNSIGNED_PAYLOAD.to_string());
+    let (parts, _) = put.request().into_parts();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let data = rx.recv().await?;
+        Some((Ok::<_, std::io::Error>(data), rx))
+    });
+    let app = server.app.clone();
+    let held = tokio::spawn(app.oneshot(Request::from_parts(parts, Body::from_stream(stream))));
+    tx.send(Bytes::from(vec![1u8; 10])).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while spool_files(&server) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.requests.in_flight(), 1);
+
+    held.abort();
+    let _ = held.await;
+
+    let closed = row(
+        &server,
+        Some(ACCESS),
+        Some("bkt"),
+        s3api::RequestOp::Write,
+        s3api::CLIENT_CLOSED,
+    )
+    .unwrap();
+    assert_eq!((closed.count, closed.bytes_in), (1, 10));
+    assert_eq!(server.requests.in_flight(), 0);
 }

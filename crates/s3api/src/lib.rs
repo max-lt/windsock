@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 mod keys;
 mod list;
+mod metrics;
 mod multipart;
 mod presign;
 mod xml;
@@ -27,6 +28,7 @@ pub use error::S3Error;
 pub use keys::{KEY_STORE_DEADLINE, KeyStore, KeyStoreError, Secret, StaticKeys};
 pub use s3proto::sigv4;
 
+pub use metrics::{CLIENT_CLOSED, MAX_ROWS, OVERFLOW_BUCKET, RequestOp, RequestRow, RequestStats};
 pub use multipart::Uploads;
 
 /// S3 single PUT limit.
@@ -45,6 +47,7 @@ pub struct S3Config {
     pub uploads: Arc<Uploads>,
     /// Requests with a larger body fail.
     pub max_body: usize,
+    pub requests: Arc<RequestStats>,
 }
 
 impl S3Config {
@@ -54,6 +57,7 @@ impl S3Config {
             keys: Arc::new(StaticKeys::new(keys)),
             uploads: Arc::new(Uploads::new(uploads_dir, DEFAULT_PARTS_LIMIT)),
             max_body: DEFAULT_MAX_BODY,
+            requests: Arc::default(),
         }
     }
 }
@@ -131,4 +135,8 @@ pub fn router<R: Remote + 'static>(engine: Arc<Engine<R>>, config: S3Config) -> 
         // Axum caps extracted bodies at 2 MB unless told otherwise.
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            config.requests,
+            metrics::count,
+        ))
 }

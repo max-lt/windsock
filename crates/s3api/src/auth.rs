@@ -13,6 +13,7 @@ use remote::Remote;
 use tracing::debug;
 
 use crate::keys::{self, KeyStore};
+use crate::metrics::CallerSlot;
 use crate::{AppState, Caller, S3Error, StreamedBody, presign};
 use s3proto::sigv4::{self, Authorization, ChunkDecoder, ChunkSigner};
 use s3proto::time::parse_amz_date;
@@ -303,6 +304,9 @@ pub(crate) async fn authenticate<R: Remote + 'static>(
             (verified.access_key, Some(signer))
         }
     };
+    if let Some(slot) = parts.extensions.get::<CallerSlot>() {
+        slot.set(&access_key);
+    }
     parts.extensions.insert(Caller(access_key));
     check_framing(&parts)?;
     if let Some(stream) = streamed(&parts, signer.as_ref())? {

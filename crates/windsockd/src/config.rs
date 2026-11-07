@@ -112,7 +112,7 @@ pub struct EngineConfig {
     /// Pieces that a GET of the remote reads ahead at most. 0 turns read-ahead off.
     pub read_ahead: usize,
     /// A copy of an object of at least this size writes a new manifest of the stored chunks and
-    /// moves no data. 0, the default, turns it off.
+    /// moves no data. 0 turns it off.
     pub copy_ref_min: u64,
 }
 
@@ -417,6 +417,7 @@ mod tests {
         assert_eq!(config.gc.horizon_secs, 86_400);
         assert_eq!(config.listen, "127.0.0.1:9000");
         assert_eq!(config.engine().gc_horizon, Duration::from_secs(24 * 3600));
+        assert_eq!(config.engine().copy_ref_min, 16 << 20);
     }
 
     #[test]

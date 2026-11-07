@@ -90,7 +90,7 @@ pub struct Config {
     /// of their seen. Off until the model check of the rules passes at its final bounds.
     pub retire_chains: bool,
     /// A copy of an object of at least this size writes a new manifest of the stored chunks and
-    /// moves no data. 0 turns it off: it stays off until the model check of the copy passes.
+    /// moves no data. 0 turns it off.
     pub copy_ref_min: u64,
     /// The longest matching prefix wins. Keys that match none get `default_policy`.
     pub policies: Vec<PrefixPolicy>,
@@ -116,7 +116,7 @@ impl Default for Config {
             read_budget: 1024 * 1024 * 1024,
             read_ahead: 3,
             retire_chains: false,
-            copy_ref_min: 0,
+            copy_ref_min: 16 << 20,
             policies: Vec::new(),
             default_policy: Policy::default(),
         }

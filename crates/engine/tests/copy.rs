@@ -287,7 +287,14 @@ async fn test_reference_copy_onto_itself_replaces_the_metadata() {
 #[tokio::test]
 async fn test_copy_takes_the_spool_when_off_or_small() {
     let remote = Arc::new(TestRemote::default());
-    let (off, _) = with_source(&remote, Config::default()).await;
+    let (off, _) = with_source(
+        &remote,
+        Config {
+            copy_ref_min: 0,
+            ..Config::default()
+        },
+    )
+    .await;
     let small = proxy(
         &remote,
         2,

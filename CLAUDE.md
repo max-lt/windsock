@@ -66,15 +66,15 @@ The daemon crate is `windsockd`.
   Also `diagnose`, `quarantine list` and `export`, `cache-trim` (through the admin socket,
   `admin.rs`) and `--version`. `listener.rs`: the accept loop with the connection limit and the
   timeouts. `serve_with` runs it in the process of a host, with a `KeyStore`; the host gets a
-  `Node` (`node.rs`: status, buckets, list, cache limit, `metrics.rs`). `README.md` has the steps
-  to run it locally.
+  `Node` (`node.rs`: status, buckets, bucket create, list, cache limit, `metrics.rs`).
+  `README.md` has the steps to run it locally.
 - `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with
   `just bench`.
 - `chaos`: `windsock-chaos`, the soak: 3 windsockd processes on one directory remote, traffic,
   kills, restarts, a full disk. macOS only.
 - `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`), of the
   pack sweep (`gc.rs`) and of chain retirement (`retire.rs`). The slow checks are `#[ignore]`:
-  run them in release on a build machine, never on the laptop.
+  run them in release (`cargo test --release -p protocol-check -- --ignored`).
 
 ## Invariants
 

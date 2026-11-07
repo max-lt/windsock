@@ -611,13 +611,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_sweep_rules_keep_every_object_readable() {
         check_safe(model(SAFE));
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_sweep_rules_are_safe_with_a_longer_horizon() {
         check_safe(GcModel {
             horizon: 4,
@@ -629,7 +629,7 @@ mod tests {
 
     /// The one-writer checks cover a crash with a plan in the intent file.
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_sweep_rules_are_safe_with_two_writers() {
         check_safe(GcModel {
             writers: 2,
@@ -681,13 +681,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_sweep_rules_keep_every_copy_readable() {
         check_safe(copy_model(SAFE));
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_sweep_rules_are_safe_for_a_copy_to_another_key() {
         check_safe(GcModel {
             keys: 2,

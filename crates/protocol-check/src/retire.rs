@@ -486,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_retire_rules_keep_knew_causal_and_order_free() {
         model(SAFE)
             .checker()

@@ -427,13 +427,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_one_process_per_node_is_safe() {
         check_safe(model(&[0, 1], 2, EntryWrite::CreateOnly));
     }
 
     #[test]
-    #[ignore = "model check: run on a build machine"]
+    #[ignore = "slow model check: run in release"]
     fn test_zombie_is_safe_with_create_only_writes() {
         check_safe(model(&[0, 1, 0], 1, EntryWrite::CreateOnly));
     }

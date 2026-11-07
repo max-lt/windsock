@@ -1504,9 +1504,7 @@ async fn test_prune_reads_no_actions_of_a_large_entry() {
     );
 }
 
-/// An entry under the snapshot frontier that does not read back does not stop the prune: the
-/// prune marks the chain, goes on, and leaves the bad object as it is. The mark makes the next
-/// sync audit the chain. The audit reads the last entry only, which is whole, so the mark goes.
+/// The mark of a skipped entry lasts one sync: its audit reads only the last entry, which is whole.
 #[tokio::test]
 async fn test_prune_skips_an_entry_that_does_not_read_back() {
     let remote = Arc::new(TestRemote::default());

@@ -738,9 +738,7 @@ impl Index {
     /// Replaces the applied state with `snapshot`. Chunk locations are cleared:
     /// the caller rebuilds them from the manifests.
     pub fn load(&mut self, snapshot: &Snapshot) -> Result<()> {
-        // The frontiers go first: an index with none loads a snapshot at open, so a crash in the
-        // middle of the clear is safe. The rest goes in batches: one batch of every key of a full
-        // index would sit in memory next to the decoded snapshot.
+        // Frontiers first: open loads a snapshot into an index with none. Batches bound the memory.
         for keyspace in [
             &self.frontiers,
             &self.entries,
@@ -1008,8 +1006,6 @@ mod tests {
         assert!(index.bucket("b").unwrap().unwrap().exists);
     }
 
-    /// A sync that fails moves the journal back to the applied frontiers, so it reads a waiting
-    /// entry again: the index must keep one copy of it.
     #[tokio::test]
     async fn test_entry_read_again_while_it_waits_is_kept_once() {
         let remote = Arc::new(MemoryRemote::default());
@@ -1640,7 +1636,6 @@ mod tests {
         );
     }
 
-    /// A load over a full index clears it in several batches: no key of the old state stays.
     #[tokio::test]
     async fn test_load_over_a_full_index_keeps_only_the_snapshot() {
         let remote = Arc::new(MemoryRemote::default());
@@ -1808,8 +1803,6 @@ mod tests {
         assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
     }
 
-    /// The GC proxy leaves a chain out of its own next entry once it retired it: its own Retire,
-    /// earlier in its chain, says that it knew the retired entries.
     #[tokio::test]
     async fn test_put_after_its_writer_retired_a_chain_knew_that_chain() {
         let remote = Arc::new(MemoryRemote::default());
@@ -1841,8 +1834,6 @@ mod tests {
         assert_eq!(snapshot_view(&reversed), snapshot_view(&index));
     }
 
-    /// A GC runner that took over retires the chain of the one before it, which retired others: a
-    /// writer that reached the last Retire knew all the entries that the first one retired.
     #[tokio::test]
     async fn test_put_that_reached_a_retire_of_a_retiring_chain_knew_both() {
         let remote = Arc::new(MemoryRemote::default());

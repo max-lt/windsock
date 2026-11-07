@@ -113,8 +113,7 @@ impl<R: Remote + 'static> Engine<R> {
         let Some(manifest_id) = self.retry_after_sync(|| self.stored_source(source)).await? else {
             return Ok(Err(SpoolReason::BufferedSource));
         };
-        // The decoded source is outside the read budget until its room is taken: the slots bound
-        // how many copies hold one.
+        // The slots bound the decoded sources that wait outside the read budget.
         let slot = self
             .ref_copies
             .acquire()
@@ -203,8 +202,7 @@ impl<R: Remote + 'static> Engine<R> {
             metadata,
             ..
         } = manifest;
-        // A flush holds its lock for its whole backlog: a copy that waits there holds no room and
-        // no slot.
+        // A flush holds the lock for its whole backlog: wait with no room and no slot.
         drop((room, slot));
         // One intent file: a flush and a copy commit one at a time, each after the recover.
         let _flushing = self.flushing.lock().await;

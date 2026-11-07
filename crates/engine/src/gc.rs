@@ -98,8 +98,7 @@ impl<R: Sweep + 'static> Engine<R> {
             warn!(broken = ?sync.broken, "gc refused: a chain is broken");
             return Err(EngineError::BrokenChains(sync.broken));
         }
-        // A retire entry lists only its batch: past the header limit, the later entries of this
-        // run fit only once the retire is applied.
+        // Past the header limit, the other entries of this run fit only once the retire applies.
         let retired_chains = if self.config.retire_chains {
             self.retire_quiet_chains(started).await?
         } else {

@@ -447,8 +447,6 @@ async fn test_own_write_stays_visible_when_the_commit_reads_a_bad_manifest() {
     assert_eq!(&object.data[..], b"mine");
 }
 
-/// As above, but the commit stops at a manifest read that never answers, and its caller drops it,
-/// as a client drops a copy by reference. The entries that it read must come back at a later sync.
 #[tokio::test]
 async fn test_own_write_stays_visible_when_the_commit_is_dropped_in_its_apply() {
     let remote = Arc::new(FaultRemote::default());

@@ -34,8 +34,7 @@ pub(super) fn check_conditions(headers: &HeaderMap) -> Result<(), S3Error> {
     )
 }
 
-/// Refuses a copy header that is not visible ASCII. Read as absent, it would make a copy a PUT
-/// of the empty body, a part copy of a range one of the whole source, and REPLACE a COPY.
+/// Refuses a copy header that is not visible ASCII: read as absent, it changes the request.
 pub(super) fn check_copy_headers(headers: &HeaderMap) -> Result<(), S3Error> {
     check_visible(
         headers,

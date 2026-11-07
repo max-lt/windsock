@@ -1,5 +1,4 @@
-//! Sets WINDSOCKD_VERSION: the package version, plus `+<commit>` in a git checkout of this
-//! workspace.
+//! Sets WINDSOCKD_VERSION: the package version, and `+<commit>` in a git checkout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,8 +16,7 @@ fn main() {
     println!("cargo:rustc-env=WINDSOCKD_VERSION={version}");
 }
 
-/// The short commit of HEAD, if the workspace root is the top of a git checkout. A source tree
-/// unpacked inside another repository must not take that repository's commit.
+/// The short commit of HEAD, only when the workspace root is the top of its git checkout.
 fn commit(workspace: &Path) -> Option<String> {
     let top = git(workspace, &["rev-parse", "--show-toplevel"])?;
     if Path::new(&top).canonicalize().ok()? != workspace.canonicalize().ok()? {

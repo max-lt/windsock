@@ -473,8 +473,6 @@ mod tests {
         assert!(error.contains("uploads_expire_secs"), "{error}");
     }
 
-    /// An interval of 0 runs the sync or the GC back to back against a paid remote, and a
-    /// timeout of 0 cuts every connection at once.
     #[test]
     fn test_zero_interval_or_timeout_is_refused() {
         let dir = tempfile::tempdir().unwrap();

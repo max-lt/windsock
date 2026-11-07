@@ -32,9 +32,7 @@ pub use multipart::Uploads;
 /// S3 single PUT limit.
 const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 
-/// The parts of all multipart uploads together: the largest object, plus a part of the largest size
-/// sent again, which is on disk next to the part it replaces. So one upload of any legal size can
-/// complete. The parts are outside the buffer limit, so plain writes keep their room.
+/// The largest object plus a largest part sent again. Outside the buffer limit, for plain writes.
 pub const DEFAULT_PARTS_LIMIT: u64 = 2 * DEFAULT_MAX_BODY as u64;
 
 /// Copies of any kind at once: a spool copy holds 3 descriptors, and the extra ones fit the reserve.

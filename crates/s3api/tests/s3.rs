@@ -3610,8 +3610,7 @@ async fn test_upload_part_copy_keeps_the_source_version_of_its_start() {
     assert_eq!(copied.xml("ETag").unwrap(), etag);
 }
 
-/// A client that goes away drops the request: the part file goes, no part is listed, and the room
-/// of the parts limit and of the read budget comes back.
+/// A client that goes away drops the request: no part file, no part, and no room held.
 #[tokio::test]
 async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
     let (server, _, id) = with_part_source().await;
@@ -3634,8 +3633,6 @@ async fn test_upload_part_copy_that_the_client_drops_leaves_no_part() {
     assert_eq!(server.engine.read_state().budget_free, budget);
 }
 
-/// A copy header that is not visible ASCII, read as absent, turns a copy into a PUT of the empty
-/// body, a part copy of a range into one of the whole source, and REPLACE into COPY.
 #[tokio::test]
 async fn test_copy_header_that_is_not_ascii_is_refused() {
     let (server, _, id) = with_part_source().await;
@@ -3670,8 +3667,6 @@ async fn test_copy_header_that_is_not_ascii_is_refused() {
     assert!(parts.xml("PartNumber").is_none(), "{}", parts.text());
 }
 
-/// A part copy reads its source as a GET does: with no room in the read budget, its first piece
-/// waits 5 s, then the part copy gets 503 and stores nothing.
 #[tokio::test]
 async fn test_upload_part_copy_with_no_room_in_the_read_budget_gets_503() {
     let server = small_budget().await;

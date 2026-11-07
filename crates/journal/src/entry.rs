@@ -593,8 +593,7 @@ fn header_with_wire_len(fields: &Fields, len: u64) -> Vec<u8> {
     bytes
 }
 
-/// The longest header that an entry of `node` with the chains of `seen` can have: every number at
-/// its largest, the seq of each link too, as the links move on before the entry is signed.
+/// The longest header of an entry of `node` with the chains of `seen`: every number at its largest.
 pub fn header_bound(node: NodeId, seen: &Seen) -> u64 {
     let seen = seen
         .iter()
@@ -634,8 +633,6 @@ pub(crate) fn test_sealer() -> Sealer {
 mod tests {
     use super::*;
 
-    /// A flush checks the bound before its uploads and computes the seen of its entry after them:
-    /// the links can be at higher seqs then, with longer varints.
     #[test]
     fn test_header_bound_covers_links_that_move_on() {
         let nodes: Vec<NodeId> = (0..50u8).map(|n| NodeId::from_bytes([n; 32])).collect();

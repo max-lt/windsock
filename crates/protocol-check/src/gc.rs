@@ -238,9 +238,7 @@ impl GcModel {
         true
     }
 
-    /// A copy of a current source names a pack and a fresh manifest. The index locates a chunk of
-    /// the source in any pack that holds it, also a dead pack that no condemn reached yet: as for
-    /// a dedup, the copy can name any pack that the writer knows.
+    /// As a dedup: the index locates a chunk of the source in any pack that the writer knows.
     fn plan_copy(&self, s: &mut State, writer: usize, key: u8, source: u8, pack: u8) -> bool {
         let w = &s.writers[writer];
         let view = s.view(w.reader);
@@ -664,8 +662,6 @@ mod tests {
         }));
     }
 
-    /// Small bounds, in seconds: a copy that names a pack that is not its source's is checked on
-    /// every build, before the full check on a build machine.
     #[test]
     fn test_sweep_rules_keep_every_copy_readable_at_small_bounds() {
         let small = GcModel {

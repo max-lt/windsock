@@ -10,8 +10,7 @@
 //! An entry keeps two seen maps: `full`, every chain that its writer had applied, and `listed`,
 //! the links that it writes. A writer leaves out a chain that it saw retired at its frontier. A
 //! reader decides that one put knew another from `listed` and the Retire entries that the GC
-//! link of the put reaches. The properties compare that with `full`. A Retire entry lists only
-//! its chain, so a reader applies it once it has that link, as the index does.
+//! link of the put reaches. The properties compare that with `full`.
 //!
 //! Not in the model: a second GC runner (a handover, a Retire in a retired chain) and the skip
 //! of a retired chain in the stable HLC. Unit tests of the index cover them.
@@ -145,8 +144,7 @@ pub fn representative(s: &State) -> State {
 }
 
 impl Entry {
-    /// The entries of chain `m` that a reader applies before this one. A Retire lists only the
-    /// chain that it retires, so a reader waits for that link alone, as the index does.
+    /// The entries of chain `m` that a reader applies first: a Retire waits for its link only.
     fn needs(&self, m: usize) -> u8 {
         match self.kind {
             Kind::Put => self.full[m],
@@ -469,8 +467,6 @@ mod tests {
         );
     }
 
-    /// The same space as the writer symmetry test: a property that no state can keep fails here
-    /// in a second, before the full check on a build machine.
     #[test]
     fn test_retire_rules_hold_at_3_entries() {
         let small = RetireModel {

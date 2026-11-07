@@ -122,8 +122,7 @@ impl Uploads {
             if !entry.file_type().await.map_err(io)?.is_dir() {
                 continue;
             }
-            // No initiate runs at start: a directory with no meta is what a killed removal
-            // left, and a meta that does not decode lost its bytes in a power loss.
+            // No initiate runs at start: a killed removal or a power loss left this directory.
             if !meta_decodes(&entry.path()).await? {
                 remove_dir(&entry.path()).await?;
                 continue;
@@ -919,9 +918,6 @@ mod tests {
         assert_eq!(grown, Some(StatusCode::BAD_REQUEST));
     }
 
-    /// An SDK sends a part again when it loses the answer. Under the default limit, an upload of
-    /// the largest object in one part of the largest size can do that, as the old part stays on
-    /// disk until the new one gets its name.
     #[tokio::test]
     async fn test_largest_part_sent_again_fits_the_default_limit() {
         const LARGEST: u64 = crate::DEFAULT_MAX_BODY as u64;
@@ -945,8 +941,6 @@ mod tests {
         assert!(again.is_ok(), "{:?}", again.err());
     }
 
-    /// A power loss can keep the name of a meta and lose its bytes. Such an upload can never
-    /// complete or abort, so the start removes it, and its parts do not count.
     #[tokio::test]
     async fn test_start_removes_an_upload_whose_meta_does_not_read() {
         let dir = tempfile::tempdir().unwrap();

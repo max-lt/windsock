@@ -991,8 +991,6 @@ async fn test_gc_retires_chains_in_batches_when_the_header_guard_trips() {
     assert!(last_seen(&remote, &a.engine).await.len() < 10);
 }
 
-/// Past the header limit, every entry with the full seen fails: the retire must come before the
-/// condemn, or no GC run ever gets out.
 #[tokio::test]
 async fn test_gc_retires_before_it_condemns_past_the_header_limit() {
     let remote = Arc::new(TestRemote::new());

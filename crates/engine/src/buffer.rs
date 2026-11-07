@@ -485,8 +485,7 @@ pub(crate) struct Buffer {
     bad_data: Vec<BadRecord>,
     #[cfg(test)]
     pub syncs: u64,
-    /// Spool files renamed into the buffer, and how many of those renames a directory fsync
-    /// covers.
+    /// Renames of spool files into the buffer, and how many of them a directory fsync covers.
     renames: u64,
     dir_synced: u64,
     #[cfg(test)]
@@ -896,8 +895,7 @@ impl Buffer {
 
     /// Adds a spooled put as the next segment. The spool file holds the data and then the head,
     /// both fsynced. The active segment is sealed first, so the order of the segments stays the
-    /// order of the acks. Returns the record number, durable at once. `spool` is empty once the
-    /// buffer tracks the segment: the file is then the buffer's to keep or remove.
+    /// order of the acks. Returns the record number. Empties `spool` when it tracks the segment.
     pub async fn adopt(
         &mut self,
         spool: &mut PathBuf,
@@ -945,8 +943,7 @@ impl Buffer {
         self.sealed.insert(seq, size);
         self.written += 1;
         self.track(seq, head, DATA_LEN_LEN as u64, data_len);
-        // A power loss before the directory fsync loses the rename: the record is durable only
-        // after it, here or in the next fsync if this commit is dropped first.
+        // A power loss before the directory fsync loses the rename, and so the record.
         self.renames += 1;
         tokio::fs::rename(&spool, self.segment_path(seq)).await?;
         crate::sim::crash_point(crate::sim::Point::SpoolDirSync)?;

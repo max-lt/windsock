@@ -321,9 +321,6 @@ mod tests {
         assert_eq!(reopened.buffered_bytes().await, 0);
     }
 
-    /// After its rename, a spooled record is durable only once the directory is fsynced. A commit
-    /// dropped in between leaves that fsync to the next reader, which must not see the record
-    /// first.
     #[tokio::test]
     async fn test_record_of_a_commit_dropped_before_its_directory_fsync_waits_for_one() {
         let dir = tempfile::tempdir().unwrap();

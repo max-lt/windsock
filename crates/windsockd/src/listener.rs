@@ -222,9 +222,7 @@ pub async fn track_requests(
     response
 }
 
-/// Serves `router` until `shutdown` returns, then lets each connection end its request in
-/// progress. The connections run in tasks that this future owns: its drop stops them, and so frees
-/// the engine that each router holds.
+/// Serves until `shutdown`, then lets each request end. A drop stops every connection with it.
 pub async fn serve(
     mut listener: LimitedListener,
     router: Router,

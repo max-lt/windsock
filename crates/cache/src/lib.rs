@@ -463,8 +463,6 @@ mod tests {
         assert_eq!(logs.matches("cache writes work again").count(), 1, "{logs}");
     }
 
-    /// The scan at open skips a temporary file, and the bound does not count it: a write that
-    /// fails must remove its own, or a failing disk fills with them.
     #[tokio::test]
     async fn test_failed_write_leaves_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();

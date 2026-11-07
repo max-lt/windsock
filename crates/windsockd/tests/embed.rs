@@ -329,8 +329,6 @@ async fn test_aborted_serve_frees_the_engine_and_stops_its_node() {
     assert!(opened.is_ok(), "the second serve did not open: {opened:?}");
 }
 
-/// A request in progress holds the router, and so the engine: an aborted serve must stop it, or
-/// a new serve of the same data_dir waits for the request timeout of 300 s.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_aborted_serve_stops_the_requests_in_progress() {
     use tokio::io::AsyncWriteExt;

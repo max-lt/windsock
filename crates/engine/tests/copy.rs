@@ -20,9 +20,7 @@ const WAIT: Duration = Duration::from_secs(5);
 /// Large enough for a manifest over the inline limit.
 const SIZE: usize = 8 * 1024 * 1024;
 
-/// A memory remote that counts its calls, fails them all while `down`, and can make the next
-/// log create ambiguous, hold the manifest or pack PUTs, or never answer a read or a create of
-/// the journal.
+/// A memory remote that counts its calls, and can fail, hold or stall them.
 struct TestRemote {
     inner: MemoryRemote,
     calls: std::sync::Mutex<BTreeMap<(&'static str, String), u64>>,
@@ -440,8 +438,6 @@ async fn test_ambiguous_entry_create_fails_the_copy_with_no_spool() {
     assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
 }
 
-/// The open reads the own chain, so it applies the entry that the crash left; the next flush
-/// then only removes the intent.
 #[tokio::test]
 async fn test_crash_after_the_entry_of_a_copy_applies_at_the_next_open() {
     let remote = Arc::new(TestRemote::default());
@@ -726,8 +722,6 @@ async fn test_reference_copy_holds_read_budget_for_its_manifests() {
     assert_eq!(a.engine.read_state().budget_free, budget);
 }
 
-/// A reference copy into an empty bucket is in no local state until its apply: a delete of that
-/// bucket must still see it, or the bucket comes back with the object in it.
 #[tokio::test]
 async fn test_delete_of_the_target_bucket_during_a_reference_copy_is_refused() {
     let remote = Arc::new(TestRemote::default());
@@ -756,8 +750,6 @@ async fn test_delete_of_the_target_bucket_during_a_reference_copy_is_refused() {
     );
 }
 
-/// A decoded source manifest is outside the read budget until the room is taken: a copy that waits
-/// for its slot must not hold one, or 16 copies hold 16 of them.
 #[tokio::test]
 async fn test_copy_that_waits_for_its_slot_holds_no_source_manifest() {
     let remote = Arc::new(TestRemote::default());
@@ -786,8 +778,6 @@ async fn test_copy_that_waits_for_its_slot_holds_no_source_manifest() {
     }
 }
 
-/// A flush holds its lock for its whole backlog. A copy that waits there must give back its read
-/// room and its slot first, or every GET and copy waits for the flush too.
 #[tokio::test]
 async fn test_copy_that_waits_for_a_flush_holds_no_read_room() {
     let remote = Arc::new(TestRemote::default());
@@ -819,8 +809,6 @@ async fn test_copy_that_waits_for_a_flush_holds_no_read_room() {
     assert_eq!(during, budget);
 }
 
-/// A copy marks its target until its apply: a copy that ends, with an ack or with an error,
-/// leaves no mark, or every later conditional write to that key gets Conflict.
 #[tokio::test]
 async fn test_conditional_write_after_a_reference_copy_ends_gets_no_conflict() {
     let remote = Arc::new(TestRemote::default());
@@ -856,8 +844,6 @@ async fn test_conditional_write_after_a_reference_copy_ends_gets_no_conflict() {
     assert!(after_error.is_ok(), "{after_error:?}");
 }
 
-/// A sync that never answers must not hold the copy: after 10 s the copy goes through the
-/// spool, as with a remote that is down.
 #[tokio::test]
 async fn test_copy_whose_sync_hangs_takes_the_spool_after_its_deadline() {
     let remote = Arc::new(TestRemote::default());
@@ -879,9 +865,6 @@ async fn test_copy_whose_sync_hangs_takes_the_spool_after_its_deadline() {
     assert_eq!(get(&a.engine, "dst").await.unwrap(), body);
 }
 
-/// A client can go away at any await of a copy by reference. Dropped at its manifest PUT, the copy
-/// gives back its room, its slot and its target. Dropped in its commit, after its intent, it
-/// gives them back too, and the next flush ends what the intent holds.
 #[tokio::test]
 async fn test_dropped_reference_copy_gives_back_what_it_holds() {
     let remote = Arc::new(TestRemote::default());

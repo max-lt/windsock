@@ -32,38 +32,49 @@ The daemon crate is `windsockd`.
   one-chunk read.
 - `remote`: `Remote` trait (put, create, get, get_range, list, no delete), `Sweep` trait (delete,
   GC only), memory and local directory backends, the contract checks (`contract`, feature `contract`)
-  that every backend passes.
+  that every backend passes, and the storage contract probe (`probe.rs`).
 - `s3proto`: SigV4 (header signing, aws-chunked) and S3 date formats, for the server and the client.
 - `s3remote`: `Remote` and `Sweep` in an S3 bucket: SigV4 with the body hash, create via
   `If-None-Match: *`, retries with backoff and time limits. HTTPS only with the feature `tls`
   (rustls + ring, public roots plus an optional PEM CA file).
 - `journal`: one signed chain per node (`log/<node>/<seq>`, create-only), `seen` links to other
-  chains (causal DAG, no merge entries), redactable actions, chain validation, HLC.
+  chains (causal DAG, no merge entries), redactable actions (Put, Delete, CreateBucket,
+  DeleteBucket, Condemn, Retire), chain validation, HLC.
 - `index`: Fjall view of the journal. Causal apply (an entry waits for its `seen`), per-key versions
   (LWW by (hlc, node), conflicts computed from `seen`), buckets, chunk locations, applied frontiers,
-  condemned packs and manifests, live manifests, stable HLC, version prune, snapshot export and load.
+  condemned packs and manifests, live manifests, retired chains, stable HLC, version prune,
+  snapshot export and load.
 - `cache`: disk cache of raw chunks by ChunkId: LRU by size, blake3 check on every read, one fetch
   per missing chunk (singleflight).
 - `engine`: object operations. `lib.rs`: types, errors, `open`. One module per kind of operation:
   `buckets.rs`, `write.rs` (puts fsynced in the buffer), `read.rs` (buffer, then index, cache and
   remote), `sync.rs` (other chains, manifests, chunk locations, sync on miss), `flush.rs` (plan,
-  upload, intent, commit, group commit). Also `buffer.rs` (NVMe write-back log: segments, replay,
-  intent file, group fsync), `plan.rs` (packs and range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix
-  policy: chunking, compression, create-only, cache), `gc.rs` (condemn, delete after H, version
-  prune) and `snapshot.rs` (snapshots, bootstrap, journal prune).
+  upload, intent, commit, group commit), `copy.rs` (copy by reference, or through a spool file),
+  `list.rs` (paged listings). Also `buffer.rs` (NVMe write-back log: segments, replay, intent file,
+  group fsync), `spool.rs` (puts that stream their body to a spool file), `plan.rs` (packs and
+  range reads, no I/O), `manifest.rs`, `config.rs` (per-prefix policy: chunking, compression,
+  create-only, cache), `gc.rs` (condemn, delete after H, version prune, chain retire),
+  `snapshot.rs` (snapshots, bootstrap, journal prune) and `sim.rs` (crash points, feature `sim`).
 - `s3api`: S3 over HTTP (axum) on the engine. `auth.rs`: SigV4 in the header (payload hash checked,
-  aws-chunked decoded, 15 min clock skew), keys from configuration. `handlers/`: `bucket.rs`,
-  `object.rs`, `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects
-  v1 and v2 paging (no I/O). `multipart.rs`: parts on local disk. `xml.rs`. ETag = blake3 hex of
-  the data.
+  aws-chunked decoded, 15 min clock skew). `presign.rs`: SigV4 in the query (presigned URLs).
+  `keys.rs`: the `KeyStore`, asked on every request. `handlers/`: `bucket.rs`, `object.rs`,
+  `conditions.rs` (RFC 7232 preconditions, RFC 7233 ranges). `list.rs`: ListObjects v1 and v2
+  paging (no I/O). `multipart.rs`: parts on local disk. `metrics.rs`: request totals by access key,
+  bucket, op and status. `xml.rs`. ETag = blake3 hex of the data.
 - `windsockd`: the daemon. `init <dir>` writes a TOML configuration with a new key pair; `run <config>`
   serves S3, syncs, runs the GC when `gc.enabled`, and flushes the buffer on SIGINT or SIGTERM.
-  `README.md` has the steps to run it locally.
+  Also `diagnose`, `quarantine list` and `export`, `cache-trim` (through the admin socket,
+  `admin.rs`) and `--version`. `listener.rs`: the accept loop with the connection limit and the
+  timeouts. `serve_with` runs it in the process of a host, with a `KeyStore`; the host gets a
+  `Node` (`node.rs`: status, buckets, list, cache limit, `metrics.rs`). `README.md` has the steps
+  to run it locally.
 - `bench`: `windsock-bench`, the bench through the S3 API on a counting DirRemote. Rerun with
   `just bench`.
-- `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`) and of the
-  pack sweep (`gc.rs`). The slow checks are `#[ignore]`: run them in release on a build machine,
-  never on the laptop.
+- `chaos`: `windsock-chaos`, the soak: 3 windsockd processes on one directory remote, traffic,
+  kills, restarts, a full disk. macOS only.
+- `protocol-check`: Stateright models of the journal write and sync protocol (`lib.rs`), of the
+  pack sweep (`gc.rs`) and of chain retirement (`retire.rs`). The slow checks are `#[ignore]`:
+  run them in release on a build machine, never on the laptop.
 
 ## Invariants
 
@@ -101,7 +112,8 @@ The daemon crate is `windsockd`.
 - An entry seals its actions with the repository key and signs `blake3(sealed actions)`, not the
   actions: a purge can drop them with no key and keep the chain. The entry header (node, seq,
   prev, hlc, seen) stays in clear.
-- An entry lists in `seen` the last entry of every other chain its writer had applied (not read).
+- An entry lists in `seen` the last entry of every other chain its writer had applied (not read),
+  less each chain that a Retire entry retired at its last entry.
   The index applies an entry only after everything in its `seen`.
 - Index state is a function of the set of applied entries, never of their order. A conflict is
   computed (the head did not know another version), not stored.
@@ -148,7 +160,8 @@ The daemon crate is `windsockd`.
 
 ## Dependencies
 
-No C dependencies. Read the `build.rs` of a crate before you add it.
+No C dependencies in the workspace. The `fuzz/` crate is outside the workspace and may compile C.
+Read the `build.rs` of a crate before you add it.
 Check after each new dependency. The build must pass with no C compiler:
 
 ```bash
@@ -160,36 +173,37 @@ One exception, decided by Maxime: the feature `tls` (`s3remote/tls`, `windsockd/
 `cargo clippy --all-targets --features windsockd/tls,s3remote/tls -- -D warnings`, and
 `cargo test -p s3remote -p windsockd --features tls`.
 
-| Purpose                      | Crate                                                                                 |
-| ---------------------------- | ------------------------------------------------------------------------------------- |
-| Hashing                      | `blake3` with feature `pure` (the default build compiles C and asm)                   |
-| Chunking                     | `fastcdc` v5, `v2020` module                                                          |
-| Compression                  | `ruzstd`, level `Fastest` (standard zstd frames)                                      |
-| Async                        | `tokio`, `async-trait`                                                                |
-| Buffers                      | `bytes`                                                                               |
-| Hex encoding                 | `hex`                                                                                 |
-| Serialization                | `serde`, `postcard`                                                                   |
-| Errors                       | `thiserror`                                                                           |
-| Secret wipe                  | `zeroize` (already a dependency of `chacha20poly1305`)                                |
-| Signatures                   | `ed25519-dalek` v2                                                                    |
-| Encryption                   | `chacha20poly1305` 0.10 (XChaCha20-Poly1305, RustCrypto)                              |
-| Logging                      | `tracing`                                                                             |
-| Local index                  | `fjall` v3                                                                            |
-| Tests                        | `tempfile`                                                                            |
-| Model checking               | `stateright`                                                                          |
-| HTTP server                  | `axum` 0.8                                                                            |
-| HTTP client                  | `hyper` 1, `hyper-util` (`client-legacy`)                                             |
-| Daemon errors                | `anyhow` (only in `windsockd`)                                                        |
-| Configuration                | `toml` 0.8                                                                            |
-| Log output                   | `tracing-subscriber` with `env-filter`                                                |
-| XML                          | `quick-xml` 0.41 with `serialize`                                                     |
-| SigV4                        | `hmac`, `sha2`, `subtle`                                                              |
-| URL form encoding            | `form_urlencoded`                                                                     |
-| fd limit, free disk space    | `rustix` (`fs`, `process`)                                                            |
-| HTTP body type (`windsockd`) | `http-body` 1                                                                         |
-| TLS (feature `tls` only)     | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
-| HTTP tests                   | `tower` (`util`), `http-body-util`                                                    |
-| Streamed bodies (`s3api`)    | `futures-util` (no default features)                                                  |
+| Purpose                   | Crate                                                                                 |
+| ------------------------- | ------------------------------------------------------------------------------------- |
+| Hashing                   | `blake3` with feature `pure` (the default build compiles C and asm)                   |
+| Chunking                  | `fastcdc` v5, `v2020` module                                                          |
+| Compression               | `ruzstd`, level `Fastest` (standard zstd frames)                                      |
+| Async                     | `tokio`, `async-trait`                                                                |
+| Buffers                   | `bytes`                                                                               |
+| Hex encoding              | `hex`                                                                                 |
+| Serialization             | `serde`, `postcard`                                                                   |
+| Errors                    | `thiserror`                                                                           |
+| Secret wipe               | `zeroize` (already a dependency of `chacha20poly1305`)                                |
+| Signatures                | `ed25519-dalek` v2                                                                    |
+| Encryption                | `chacha20poly1305` 0.10 (XChaCha20-Poly1305, RustCrypto)                              |
+| Logging                   | `tracing`                                                                             |
+| Local index               | `fjall` v3                                                                            |
+| Tests                     | `tempfile`                                                                            |
+| Model checking            | `stateright`                                                                          |
+| HTTP server               | `axum` 0.8, served by `hyper-util` (`server`, `service`) in `windsockd`               |
+| HTTP client               | `hyper` 1, `hyper-util` (`client-legacy`)                                             |
+| Daemon errors             | `anyhow` (only in `windsockd`)                                                        |
+| Configuration             | `toml` 0.8                                                                            |
+| Log output                | `tracing-subscriber` with `env-filter`                                                |
+| XML                       | `quick-xml` 0.41 with `serialize`                                                     |
+| SigV4                     | `hmac`, `sha2`, `subtle`                                                              |
+| URL form encoding         | `form_urlencoded`                                                                     |
+| fd limit, free disk space | `rustix` (`fs`, `process`)                                                            |
+| HTTP body type            | `http-body` 1 (`windsockd`, `s3api`)                                                  |
+| TLS (feature `tls` only)  | `rustls` 0.23 with `ring`, `hyper-rustls` 0.27, `tokio-rustls` 0.26, `webpki-roots` 1 |
+| HTTP tests                | `tower` (`util`), `http-body-util`                                                    |
+| Streamed bodies (`s3api`) | `futures-util` (no default features)                                                  |
+| Fuzzing (`fuzz/` only)    | `libfuzzer-sys` (compiles C++)                                                        |
 
 Add a crate to this table when a milestone adds it.
 
@@ -211,7 +225,8 @@ Add a crate to this table when a milestone adds it.
 - A golden test pins each storage format. It must not depend on the zstd encoder output.
 - Every backend runs `remote::contract::check` (feature `contract`).
 - `windsockd/tests` run the binary as a process through `tests/common`; a failing test prints the
-  daemon log. The cluster tests run one at a time.
+  daemon log. `embed.rs` runs `serve_with` in the test process. The cluster tests run one at a
+  time.
 
 ## Bug fixes
 

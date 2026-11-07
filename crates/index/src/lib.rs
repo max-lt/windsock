@@ -829,7 +829,7 @@ impl Index {
     ///
     /// A chain retired at its frontier does not count once its Retire entry is at least `quiet`
     /// above its last HLC, and another entry, of another chain or later in the chain of the Retire,
-    /// is at or above the Retire entry: the reader checks the quiet time and trusts no writer.
+    /// is at or above the Retire entry. Writers set both HLCs: M and the late limit keep it safe.
     pub fn stable_hlc(&self, quiet: u64) -> Result<u64> {
         Ok(self.stable(quiet)?.0)
     }

@@ -34,13 +34,9 @@ impl Snapshot {
         bytes
     }
 
-    /// Checks `bytes` against their blake3 `hash` and decodes them.
-    pub fn decode(hash: &[u8; 32], bytes: &[u8]) -> Result<Self, IndexError> {
+    /// Decodes `bytes`. The seal of the snapshot already proved them whole.
+    pub fn decode(bytes: &[u8]) -> Result<Self, IndexError> {
         let bad = || IndexError::Corrupt(postcard::Error::DeserializeBadEncoding);
-
-        if blake3::hash(bytes).as_bytes() != hash {
-            return Err(bad());
-        }
 
         let Some((&version, body)) = bytes.split_first() else {
             return Err(bad());

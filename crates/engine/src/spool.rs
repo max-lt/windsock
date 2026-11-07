@@ -3,8 +3,8 @@
 //!
 //! Durability order: the data is fsynced, then the head is written after it and fsynced, then the
 //! file is renamed to a segment and the directory is fsynced. Only then the put is acknowledged.
-//! A valid head on disk always follows durable data. The commit holds the buffer lock from the head write to
-//! the directory fsync: the other writes and the reads of the buffer wait for it.
+//! A valid head on disk always follows durable data. The commit holds the buffer lock from the
+//! head write to the directory fsync: the other writes and the reads of the buffer wait for it.
 
 use std::sync::atomic::AtomicU64;
 

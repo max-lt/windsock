@@ -1525,7 +1525,7 @@ mod tests {
         .encode();
         bytes[0] = 1;
 
-        let result = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes);
+        let result = Snapshot::decode(&bytes);
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("snapshot has format 1"), "{error}");
@@ -1609,7 +1609,7 @@ mod tests {
         let (source, _) = busy_index(&remote).await;
         let snapshot = source.snapshot().unwrap();
         let bytes = snapshot.encode();
-        let decoded = Snapshot::decode(blake3::hash(&bytes).as_bytes(), &bytes).unwrap();
+        let decoded = Snapshot::decode(&bytes).unwrap();
 
         let mut target = Index::open_temporary().unwrap();
         let stray = Entry::sign(
@@ -1650,17 +1650,6 @@ mod tests {
 
         assert_eq!(cleared, empty);
         assert_eq!(target.snapshot().unwrap(), snapshot);
-    }
-
-    #[test]
-    fn test_snapshot_decode_rejects_a_wrong_hash() {
-        let bytes = Index::open_temporary()
-            .unwrap()
-            .snapshot()
-            .unwrap()
-            .encode();
-
-        assert!(Snapshot::decode(&[0u8; 32], &bytes).is_err());
     }
 
     /// After a load, the index has no hash for the entries under the frontier.

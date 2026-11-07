@@ -363,7 +363,7 @@ impl<R: Remote + 'static> Engine<R> {
             // The decode holds the plain blob and the state: the sealed blob goes first.
             drop(sealed);
 
-            match Snapshot::decode(blake3::hash(&plain).as_bytes(), &plain) {
+            match Snapshot::decode(&plain) {
                 Ok(snapshot) => return Ok(Ok((snapshot, time))),
                 Err(e) => skip(format!("it does not decode: {e}")),
             }

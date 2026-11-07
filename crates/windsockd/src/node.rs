@@ -89,7 +89,7 @@ impl Node {
     }
 
     /// At most `max` objects of `bucket` under `prefix`, in key order, after the key `after`. A
-    /// `max` over [`MAX_PAGE`] gets [`MAX_PAGE`].
+    /// `max` over [`MAX_PAGE`] gets [`MAX_PAGE`], and a `max` of 0 gets InvalidArgument.
     pub async fn list(
         &self,
         bucket: &str,

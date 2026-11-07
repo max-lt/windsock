@@ -106,7 +106,7 @@ pub struct EngineConfig {
     pub cache_bytes: u64,
     pub flush_delay_ms: u64,
     pub buffer_limit_bytes: u64,
-    /// The parts of all open multipart uploads together. A part over it gets 503.
+    /// The parts of all open multipart uploads together.
     pub parts_limit_bytes: u64,
     /// The bytes of GET pieces in flight on all connections together.
     pub read_budget_bytes: u64,

@@ -66,7 +66,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
         .expect("a hex ETag is a valid header value"))
 }
 
-/// CopyObject: the engine reads the source and writes it again.
+/// CopyObject: by reference to the stored chunks of the source, or through a spool file.
 async fn copy_object<R: Remote + 'static>(
     state: &AppState<R>,
     source: &str,

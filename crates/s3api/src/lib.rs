@@ -37,9 +37,7 @@ const DEFAULT_MAX_BODY: usize = 5 * 1024 * 1024 * 1024;
 /// complete. The parts are outside the buffer limit, so plain writes keep their room.
 pub const DEFAULT_PARTS_LIMIT: u64 = 2 * DEFAULT_MAX_BODY as u64;
 
-/// Spool copies that run at once. A copy of a buffered source holds 3 descriptors: its socket, its
-/// spool file and the source segment. More get 503 SlowDown, and the extra descriptor of each
-/// fits in the engine reserve.
+/// Copies of any kind at once: a spool copy holds 3 descriptors, and the extra ones fit the reserve.
 pub const MAX_COPIES: usize = 16;
 
 pub struct S3Config {

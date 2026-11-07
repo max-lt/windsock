@@ -263,7 +263,7 @@ impl<R: Sweep + 'static> Engine<R> {
     async fn retire_quiet_chains(&self, now: u64) -> Result<usize> {
         let quiet = self.config.retire_quiet().as_nanos() as u64;
         let mut retired: BTreeMap<model::NodeId, u64> = BTreeMap::new();
-        for mark in self.index().retire_marks()? {
+        for mark in self.index().retire_marks() {
             let upto = retired.entry(mark.node).or_default();
             *upto = (*upto).max(mark.upto);
         }

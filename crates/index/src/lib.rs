@@ -89,6 +89,8 @@ pub struct Index {
     redacted: Keyspace,
     /// `retired node | writer | seq` of each valid Retire action, to its point and entry HLC.
     retired: Keyspace,
+    /// The rows of `retired`: the apply of each entry reads them all.
+    marks: BTreeMap<[u8; 72], RetireMark>,
     /// Entries that wait for a dependency, by node and seq: a sync can read one again.
     pending: BTreeMap<(NodeId, u64), Entry>,
     _temp: Option<tempfile::TempDir>,
@@ -184,6 +186,16 @@ const CLEAR_BATCH: usize = if cfg!(test) { 2 } else { 65_536 };
 const FORMAT: u32 = 2;
 const FORMAT_KEY: &str = "format";
 
+fn read_marks(retired: &Keyspace) -> Result<BTreeMap<[u8; 72], RetireMark>> {
+    let mut marks = BTreeMap::new();
+    for guard in retired.iter() {
+        let (key, value) = guard.into_inner()?;
+        let mark = RetireMark::decode(&key, &value)?;
+        marks.insert(mark.key(), mark);
+    }
+    Ok(marks)
+}
+
 impl Index {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::builder(path)
@@ -219,6 +231,7 @@ impl Index {
             });
         }
 
+        let retired = db.keyspace("retired", KeyspaceCreateOptions::default)?;
         Ok(Self {
             frontiers,
             entries: db.keyspace("entries", KeyspaceCreateOptions::default)?,
@@ -229,7 +242,8 @@ impl Index {
             manifests: db.keyspace("manifests", KeyspaceCreateOptions::default)?,
             condemned: db.keyspace("condemned", KeyspaceCreateOptions::default)?,
             redacted: db.keyspace("redacted", KeyspaceCreateOptions::default)?,
-            retired: db.keyspace("retired", KeyspaceCreateOptions::default)?,
+            marks: read_marks(&retired)?,
+            retired,
             db,
             pending: BTreeMap::new(),
             _temp: temp,
@@ -284,7 +298,7 @@ impl Index {
         let mut seen = journal::seen_from(&self.frontiers()?, own);
         // A later entry knows a chain at its retired point through the Retire entry.
         let mut retired: BTreeMap<NodeId, u64> = BTreeMap::new();
-        for mark in self.retire_marks()? {
+        for mark in self.retire_marks() {
             let upto = retired.entry(mark.node).or_default();
             *upto = (*upto).max(mark.upto);
         }
@@ -382,8 +396,11 @@ impl Index {
         Ok(Readiness::Ready)
     }
 
-    fn apply_one(&self, entry: &Entry) -> Result<()> {
+    fn apply_one(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = self.db.batch();
+        // The marks change only at the commit, so one seen serves every action.
+        let seen = self.reached_seen(entry);
+        let mut marks = Vec::new();
 
         for action in entry.actions.iter().flatten() {
             match action {
@@ -394,10 +411,11 @@ impl Index {
                     hlc,
                     ..
                 } => {
-                    self.record_version(&mut batch, entry, *hlc, bucket, key, Some(*manifest_id))?
+                    let version = (*hlc, Some(*manifest_id));
+                    self.record_version(&mut batch, entry, &seen, bucket, key, version)?
                 }
                 Action::Delete { bucket, key, hlc } => {
-                    self.record_version(&mut batch, entry, *hlc, bucket, key, None)?
+                    self.record_version(&mut batch, entry, &seen, bucket, key, (*hlc, None))?
                 }
                 Action::CreateBucket { bucket, owner, hlc } => {
                     self.record_bucket(&mut batch, entry, *hlc, bucket, Some(owner.clone()))?
@@ -426,6 +444,7 @@ impl Index {
                             hlc: entry.hlc,
                         };
                         batch.insert(&self.retired, mark.key(), encode(&(mark.upto, mark.hlc)));
+                        marks.push(mark);
                     }
                 }
             }
@@ -440,31 +459,27 @@ impl Index {
         batch.insert(&self.entries, entry_key(entry.node, entry.seq), hash);
         batch.insert(&self.frontiers, entry.node.as_bytes(), encode(&frontier));
         batch.commit()?;
+        self.marks
+            .extend(marks.into_iter().map(|mark| (mark.key(), mark)));
 
         debug!(node = %entry.node, seq = entry.seq, "applied entry");
         Ok(())
     }
 
     /// Every valid Retire action that the index applied.
-    pub fn retire_marks(&self) -> Result<Vec<RetireMark>> {
-        let mut marks = Vec::new();
-        for guard in self.retired.iter() {
-            let (key, value) = guard.into_inner()?;
-            marks.push(RetireMark::decode(&key, &value)?);
-        }
-        Ok(marks)
+    pub fn retire_marks(&self) -> Vec<RetireMark> {
+        self.marks.values().copied().collect()
     }
 
     /// The seen of `entry`, with a link for each chain that a Retire reached by its links covers.
     /// Its writer applied that Retire, so it knew the retired entries: the state stays the one of
     /// a full seen, whatever chain the writer left out.
-    fn reached_seen(&self, entry: &Entry) -> Result<Seen> {
-        let marks = self.retire_marks()?;
+    fn reached_seen(&self, entry: &Entry) -> Seen {
         let mut seen = entry.seen.clone();
         // A Retire entry can itself be in a retired chain: go on until no link changes.
         loop {
             let mut changed = false;
-            for mark in &marks {
+            for mark in self.marks.values() {
                 let reached = (mark.by == entry.node && mark.seq < entry.seq)
                     || seen.get(&mark.by).is_some_and(|link| link.seq >= mark.seq);
                 let known = seen.get(&mark.node).map_or(0, |link| link.seq + 1);
@@ -479,7 +494,7 @@ impl Index {
                 changed = true;
             }
             if !changed {
-                return Ok(seen);
+                return seen;
             }
         }
     }
@@ -488,16 +503,15 @@ impl Index {
         &self,
         batch: &mut fjall::OwnedWriteBatch,
         entry: &Entry,
-        hlc: u64,
+        seen: &Seen,
         bucket: &str,
         key: &str,
-        manifest_id: Option<ObjectId>,
+        (hlc, manifest_id): (u64, Option<ObjectId>),
     ) -> Result<()> {
         let storage_key = object_key(bucket, key);
         let mut state = self.object(bucket, key)?.unwrap_or_default();
 
-        let seen = self.reached_seen(entry)?;
-        if state.record_seen(entry, hlc, manifest_id, seen) {
+        if state.record_seen(entry, hlc, manifest_id, seen.clone()) {
             batch.insert(&self.objects, storage_key, encode(&state));
         }
 
@@ -729,13 +743,20 @@ impl Index {
             buckets,
             condemned,
             manifests: manifests.into_iter().collect(),
-            retired: self.retire_marks()?,
+            retired: self.retire_marks(),
         })
     }
 
     /// Replaces the applied state with `snapshot`. Chunk locations are cleared:
     /// the caller rebuilds them from the manifests.
     pub fn load(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let loaded = self.load_rows(snapshot);
+        // Also after an error: a clear can stop between two of its batches.
+        self.marks = read_marks(&self.retired)?;
+        loaded
+    }
+
+    fn load_rows(&mut self, snapshot: &Snapshot) -> Result<()> {
         // Frontiers first: open loads a snapshot into an index with none. Batches bound the memory.
         for keyspace in [
             &self.frontiers,
@@ -835,7 +856,7 @@ impl Index {
     /// [`Index::stable_hlc`], and the count of retired chains that it leaves out.
     pub fn stable(&self, quiet: u64) -> Result<(u64, usize)> {
         let frontiers = self.frontiers()?;
-        let marks = self.retire_marks()?;
+        let marks = self.retire_marks();
         let skipped = |node: &NodeId, frontier: &Frontier| {
             marks.iter().any(|mark| {
                 mark.node == *node
@@ -1988,6 +2009,37 @@ mod tests {
             .unwrap();
 
         assert!(conflicted(&index));
+    }
+
+    #[tokio::test]
+    async fn test_reopened_index_keeps_the_retired_entries() {
+        let entries = retired_history(1).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = Index::open(dir.path()).unwrap();
+        first.apply(entries[..2].to_vec()).unwrap();
+        first.persist().unwrap();
+        drop(first);
+        let mut reopened = Index::open(dir.path()).unwrap();
+
+        reopened.apply(entries[2..].to_vec()).unwrap();
+
+        assert!(!conflicted(&reopened));
+    }
+
+    #[tokio::test]
+    async fn test_load_drops_the_retired_entries_that_the_snapshot_lacks() {
+        let entries = retired_history(1).await;
+        let mut index = Index::open_temporary().unwrap();
+        index.apply(entries[..2].to_vec()).unwrap();
+        let empty = Index::open_temporary().unwrap().snapshot().unwrap();
+
+        index.load(&empty).unwrap();
+
+        assert_eq!(index.retire_marks(), []);
+        assert_eq!(
+            index.seen(NodeId::from_bytes([9; 32])).unwrap(),
+            Seen::new()
+        );
     }
 
     #[tokio::test]

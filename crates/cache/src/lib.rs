@@ -412,9 +412,16 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let (bytes, temps) = on_disk(dir.path());
+        // The dropped writes end in their own tasks: wait for them, with a bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (bytes, temps) = loop {
+            let (bytes, temps) = on_disk(dir.path());
+            let settled = temps == 0 && cache.bytes() == bytes;
+            if settled || std::time::Instant::now() > deadline {
+                break (bytes, temps);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         assert_eq!(temps, 0);
         assert_eq!(cache.bytes(), bytes);
         assert!(bytes <= 64 * 1024, "{bytes}");

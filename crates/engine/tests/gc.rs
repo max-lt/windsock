@@ -858,11 +858,8 @@ fn version_count(engine: &Engine<TestRemote>, key: &str) -> usize {
         .map_or(0, |state| state.versions.len())
 }
 
-/// Proxy `a`, which retires quiet chains, writes two versions of k, 10 s apart, runs the GC 10 s
-/// later, writes once more, and runs the GC again, with R = 1 s. Returns the versions of k that
-/// stay. With `stopped`, a second proxy wrote once before and stopped for good: the first GC
-/// retires it, and the later write is the entry above the Retire that a reader needs.
-async fn prune_with(stopped: bool) -> usize {
+/// The versions of k that stay after two GC runs with R = 1 s.
+async fn prune_with(other: OtherProxy) -> usize {
     let remote = Arc::new(TestRemote::new());
     let config = Config {
         retire_chains: true,
@@ -871,7 +868,7 @@ async fn prune_with(stopped: bool) -> usize {
     let a = proxy_with(&remote, 1, config).await;
     a.engine.create_bucket(BUCKET, None).await.unwrap();
     a.engine.flush().await.unwrap();
-    if stopped {
+    if let OtherProxy::Stopped = other {
         let b = proxy(&remote, 2).await;
         put(&b.engine, "other", b"b").await;
         b.engine.flush().await.unwrap();
@@ -893,14 +890,26 @@ async fn prune_with(stopped: bool) -> usize {
 
 #[tokio::test]
 async fn test_version_prune_drops_an_old_version_with_live_chains_only() {
-    assert_eq!(prune_with(false).await, 1);
+    assert_eq!(prune_with(OtherProxy::None).await, 1);
 }
 
 /// The stable HLC skips a chain that stopped for good once the GC retired it: the version prune
 /// goes on.
 #[tokio::test]
 async fn test_stopped_chain_does_not_block_the_version_prune() {
-    assert_eq!(prune_with(true).await, 1);
+    assert_eq!(prune_with(OtherProxy::Stopped).await, 1);
+}
+
+/// A second proxy for [`prune_with`]: none, or one that wrote once and stopped for good.
+enum OtherProxy {
+    None,
+    Stopped,
+}
+
+/// The retire setting of [`retire_after`].
+enum Retire {
+    On,
+    Off,
 }
 
 /// The seen of the last entry of `engine` in the remote.
@@ -922,10 +931,10 @@ async fn last_seen(remote: &TestRemote, engine: &Engine<TestRemote>) -> journal:
 
 /// Proxy b writes once and stops; proxy a runs the GC after `quiet`, with the retire setting
 /// `retire`, then writes once. The retired chain count and the seen of that write.
-async fn retire_after(quiet: Duration, retire: bool) -> (usize, bool) {
+async fn retire_after(quiet: Duration, retire: Retire) -> (usize, bool) {
     let remote = Arc::new(TestRemote::new());
     let config = Config {
-        retire_chains: retire,
+        retire_chains: matches!(retire, Retire::On),
         ..config(Duration::ZERO)
     };
     let a = proxy_with(&remote, 1, config).await;
@@ -949,19 +958,19 @@ async fn retire_after(quiet: Duration, retire: bool) -> (usize, bool) {
 async fn test_gc_retires_a_chain_quiet_for_q_and_writers_leave_it_out() {
     // Q is max(R, H) + M: here max(1 s, 0.6 s) + 0.
     let past = SHORT_RETENTION + Duration::from_millis(500);
-    assert_eq!(retire_after(past, true).await, (1, false));
+    assert_eq!(retire_after(past, Retire::On).await, (1, false));
 }
 
 #[tokio::test]
 async fn test_gc_keeps_a_chain_that_is_not_quiet_for_q() {
     let early = SHORT_RETENTION - Duration::from_millis(300);
-    assert_eq!(retire_after(early, true).await, (0, true));
+    assert_eq!(retire_after(early, Retire::On).await, (0, true));
 }
 
 #[tokio::test]
 async fn test_gc_retires_nothing_with_the_setting_off() {
     let past = SHORT_RETENTION + Duration::from_millis(500);
-    assert_eq!(retire_after(past, false).await, (0, true));
+    assert_eq!(retire_after(past, Retire::Off).await, (0, true));
 }
 
 /// With more chains than one header holds, a flush stops before its plan. The GC can still retire

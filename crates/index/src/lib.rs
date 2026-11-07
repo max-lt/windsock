@@ -282,9 +282,7 @@ impl Index {
     /// What this node has applied from the other chains: the `seen` of its next entry.
     pub fn seen(&self, own: NodeId) -> Result<Seen> {
         let mut seen = journal::seen_from(&self.frontiers()?, own);
-        // A chain at its highest retired point is known through the Retire entry, which a later
-        // entry reaches by its own links: leave it out, so the header stays small. A chain that
-        // wrote past that point is listed again.
+        // A later entry knows a chain at its retired point through the Retire entry.
         let mut retired: BTreeMap<NodeId, u64> = BTreeMap::new();
         for mark in self.retire_marks()? {
             let upto = retired.entry(mark.node).or_default();
@@ -1746,11 +1744,16 @@ mod tests {
     /// A put of k by node 1, a Retire of it by node 3 that applied it, and a later put of k by
     /// node 2 that links node 3 only: the entries in write order.
     async fn retired_history(upto: u64) -> Vec<Entry> {
-        retired_history_with(upto, true).await
+        retired_history_with(upto, RetireLink::Linked).await
     }
 
-    /// [`retired_history`], where the second put links the Retire entry only with `link`.
-    async fn retired_history_with(upto: u64, link_retire: bool) -> Vec<Entry> {
+    /// Whether the second put of [`retired_history`] links the Retire entry.
+    enum RetireLink {
+        Linked,
+        Unlinked,
+    }
+
+    async fn retired_history_with(upto: u64, link_retire: RetireLink) -> Vec<Entry> {
         let remote = Arc::new(MemoryRemote::default());
         let mut a = journal(&remote, 1);
         let mut gc = journal(&remote, 3);
@@ -1767,8 +1770,8 @@ mod tests {
         let seen = Seen::from([(first.node, link(&first))]);
         let retired = gc.append(retire, seen).await.unwrap();
         let seen = match link_retire {
-            true => Seen::from([(retired.node, link(&retired))]),
-            false => Seen::new(),
+            RetireLink::Linked => Seen::from([(retired.node, link(&retired))]),
+            RetireLink::Unlinked => Seen::new(),
         };
         let second = b.append(put("k", 2), seen).await.unwrap();
         vec![first, retired, second]
@@ -1980,7 +1983,9 @@ mod tests {
     async fn test_writer_that_did_not_reach_a_retire_keeps_the_conflict() {
         let mut index = Index::open_temporary().unwrap();
 
-        index.apply(retired_history_with(1, false).await).unwrap();
+        index
+            .apply(retired_history_with(1, RetireLink::Unlinked).await)
+            .unwrap();
 
         assert!(conflicted(&index));
     }

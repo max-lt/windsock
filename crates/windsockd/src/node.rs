@@ -10,6 +10,8 @@ use engine::{
 use model::NodeId;
 use remote::Sweep;
 
+use crate::metrics::{Meters, Metrics};
+
 /// The state of a node, cheap to read at any time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -57,6 +59,7 @@ trait NodeOps: Send + Sync {
         max: usize,
     ) -> Result<Page, EngineError>;
     async fn set_cache_limit(&self, bytes: u64) -> Result<CacheState, EngineError>;
+    fn metrics(&self) -> Metrics;
 }
 
 /// A running node. Clone it freely: every clone reaches the same engine.
@@ -70,6 +73,7 @@ impl Node {
         limits: Limits,
         admin_socket: bool,
         stopped: Arc<AtomicBool>,
+        meters: Meters,
     ) -> Self {
         Self(Arc::new(EngineNode {
             engine,
@@ -77,6 +81,7 @@ impl Node {
             limits,
             admin_socket,
             stopped,
+            meters,
         }))
     }
 
@@ -104,6 +109,11 @@ impl Node {
     pub async fn set_cache_limit(&self, bytes: u64) -> Result<CacheState, EngineError> {
         self.0.set_cache_limit(bytes).await
     }
+
+    /// The counters of the S3 port since the start, also after the serve ends.
+    pub fn metrics(&self) -> Metrics {
+        self.0.metrics()
+    }
 }
 
 /// The limits of the configuration that the status shows.
@@ -121,6 +131,7 @@ struct EngineNode<R> {
     admin_socket: bool,
     /// Set when the serve ends: the calls that act on the engine stop.
     stopped: Arc<AtomicBool>,
+    meters: Meters,
 }
 
 impl<R> EngineNode<R> {
@@ -195,5 +206,9 @@ impl<R: Sweep + 'static> NodeOps for EngineNode<R> {
     async fn set_cache_limit(&self, bytes: u64) -> Result<CacheState, EngineError> {
         self.running()?;
         self.engine.set_cache_limit(bytes).await
+    }
+
+    fn metrics(&self) -> Metrics {
+        self.meters.read()
     }
 }

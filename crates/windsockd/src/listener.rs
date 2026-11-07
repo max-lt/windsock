@@ -31,6 +31,8 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 use tracing::debug;
 
+use crate::metrics::{ConnectionCounts, OpenConnection};
+
 /// Descriptors kept for the engine: buffer segments, index files, cache files, remote calls.
 pub const FD_RESERVE: u64 = 256;
 
@@ -108,14 +110,21 @@ pub struct LimitedListener {
     inner: TcpListener,
     permits: Arc<Semaphore>,
     timeouts: Timeouts,
+    counts: Arc<ConnectionCounts>,
 }
 
 impl LimitedListener {
-    pub fn new(inner: TcpListener, max_connections: usize, timeouts: Timeouts) -> Self {
+    pub fn new(
+        inner: TcpListener,
+        max_connections: usize,
+        timeouts: Timeouts,
+        counts: Arc<ConnectionCounts>,
+    ) -> Self {
         Self {
             inner,
             permits: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
             timeouts,
+            counts,
         }
     }
 }
@@ -289,6 +298,7 @@ impl Listener for LimitedListener {
         let connection = Connection {
             stream,
             _permit: permit,
+            _open: self.counts.open(address.ip()),
             timer: Box::pin(tokio::time::sleep(self.timeouts.idle)),
             timeouts: self.timeouts,
             activity,
@@ -305,6 +315,7 @@ impl Listener for LimitedListener {
 pub struct Connection {
     stream: TcpStream,
     _permit: OwnedSemaphorePermit,
+    _open: OpenConnection,
     timer: Pin<Box<Sleep>>,
     timeouts: Timeouts,
     activity: Arc<Activity>,
@@ -455,7 +466,7 @@ mod tests {
             idle: Duration::from_secs(60),
             upload: Duration::from_secs(60),
         };
-        let mut listener = LimitedListener::new(tcp, 1, timeouts);
+        let mut listener = LimitedListener::new(tcp, 1, timeouts, Arc::default());
         let _a = TcpStream::connect(address).await.unwrap();
         let _b = TcpStream::connect(address).await.unwrap();
 

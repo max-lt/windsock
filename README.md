@@ -265,6 +265,13 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   client connections stop, with the requests in progress, and each call of its `Node` gets
   `EngineError::Stopped`. The host drops the `Node`: it holds the engine, and a new serve of the
   same `data_dir` opens only once it is gone.
+- `Node::metrics()` gives the counters of the S3 port since the start: open and accepted
+  connections, the open connections of each client IP, the requests in progress, and one row of
+  totals (count, body bytes in and out, duration) for each access key, bucket, operation and
+  status. A request counts when its response body ends. A refused request has no access key and no
+  bucket. A request whose client goes away before the response has status 499. The table keeps at
+  most 4096 rows. Past that, a new row goes to the row of bucket `<overflow>` for its operation and
+  status. The counters are in memory: a restart sets them to zero.
 - The ETag is the blake3 hash of the data, not an MD5. Tools that compare the ETag with a local
   MD5, such as `rclone --checksum`, see a difference.
 - The proxy does not check the value of `Content-MD5` or of `x-amz-checksum-*`, in a header or in

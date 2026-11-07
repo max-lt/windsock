@@ -5,6 +5,7 @@ mod admin;
 pub mod config;
 mod disk;
 mod listener;
+mod metrics;
 mod node;
 pub mod quarantine;
 
@@ -29,6 +30,9 @@ use zeroize::Zeroizing;
 
 pub use config::{Config, KeySource};
 pub use engine::{BucketInfo, CacheState, EngineError, ObjectInfo};
+pub use metrics::{
+    CLIENT_CLOSED, Client, Connections, MAX_ROWS, Metrics, OVERFLOW_BUCKET, RequestOp, RequestRow,
+};
 pub use model::NodeId;
 pub use node::{MAX_PAGE, Node, NodeStatus, Page};
 pub use s3api::KeyStore;
@@ -449,12 +453,19 @@ async fn serve<R: Sweep + 'static>(
     };
     let socket = admin::prepare(&config.data_dir)?;
     running.socket = socket.clone();
+    let max_connections = connections(config)?;
+    let meters = metrics::Meters {
+        connections: Arc::default(),
+        requests: s3.requests.clone(),
+        limit: max_connections,
+    };
     let node = Node::new(
         engine.clone(),
         s3.uploads.clone(),
         limits,
         socket.is_some(),
         running.stopped.clone(),
+        meters.clone(),
     );
     if let Some(socket) = &socket {
         running.tasks.push(tokio::spawn(admin::serve(
@@ -491,7 +502,6 @@ async fn serve<R: Sweep + 'static>(
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("cannot listen on {}", config.listen))?;
-    let max_connections = connections(config)?;
     info!(
         address = %listener.local_addr()?,
         max_connections,
@@ -503,7 +513,7 @@ async fn serve<R: Sweep + 'static>(
         idle: Duration::from_secs(config.idle_timeout_secs),
         upload: Duration::from_secs(config.request_timeout_secs),
     };
-    let listener = LimitedListener::new(listener, max_connections, timeouts);
+    let listener = LimitedListener::new(listener, max_connections, timeouts, meters.connections);
     let draining = Arc::new(Notify::new());
     let server = listener::serve(
         listener,

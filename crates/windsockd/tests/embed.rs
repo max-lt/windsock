@@ -376,3 +376,78 @@ async fn test_aborted_serve_stops_the_requests_in_progress() {
     assert!(opened.is_ok(), "the second serve did not open: {opened:?}");
     drop(upload);
 }
+
+async fn metrics_until(
+    node: &windsockd::Node,
+    done: impl Fn(&windsockd::Metrics) -> bool,
+) -> windsockd::Metrics {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let metrics = node.metrics();
+        if done(&metrics) {
+            return metrics;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{metrics:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_node_metrics_count_connections_clients_and_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let config = config_without_keys(dir.path(), port);
+    let keys = common::test_keys();
+    let store = Arc::new(Keys::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert(keys.0.clone(), keys.1.clone());
+    let (node_tx, node_rx) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        let shutdown = async {
+            let _ = stopped.await;
+        };
+        let on_open = move |node| {
+            let _ = node_tx.send(node);
+        };
+        windsockd::serve_with(&config, store, shutdown, on_open).await
+    });
+    let node: windsockd::Node = node_rx.await.unwrap();
+    wait_until_listening(&address).await;
+    common::call_at(&address, &keys, "PUT", "/demo", b"").await;
+    common::call_at(&address, &keys, "PUT", "/demo/k", b"data").await;
+    let held = tokio::net::TcpStream::connect(&address).await.unwrap();
+
+    let busy = metrics_until(&node, |m| m.connections.open == 1 && m.in_flight == 0).await;
+    drop(held);
+    let idle = metrics_until(&node, |m| m.connections.open == 0).await;
+    stop.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+
+    let localhost: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    assert_eq!(
+        busy.clients,
+        [windsockd::Client {
+            ip: localhost,
+            connections: 1
+        }]
+    );
+    assert!(busy.connections.accepted >= 4, "{busy:?}");
+    assert!(busy.connections.limit > 0);
+    let writes = busy
+        .requests
+        .iter()
+        .find(|row| {
+            row.access_key.as_deref() == Some(keys.0.as_str())
+                && row.bucket.as_deref() == Some("demo")
+                && row.op == windsockd::RequestOp::Write
+                && row.status == 200
+        })
+        .unwrap();
+    assert_eq!((writes.count, writes.bytes_in), (2, 4));
+    assert!(idle.clients.is_empty());
+}

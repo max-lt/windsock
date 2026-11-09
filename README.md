@@ -308,6 +308,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   (`x-amz-object-lock-*`), `x-amz-write-offset-bytes` or `x-amz-tagging` gets
   `501 NotImplemented`. So does a CreateBucket with `x-amz-bucket-object-lock-enabled` other than
   `false`.
+- GET and HEAD of an object take the `response-*` query parameters (`cache-control`,
+  `content-disposition`, `content-encoding`, `content-language`, `content-type`, `expires`). Each
+  one sets its header in place of the stored one. A presigned URL signs them.
 - This build writes buffer records of format 3. It refuses at start a buffer of format 2, from an
   earlier build. Start the earlier build, stop it with SIGTERM (it flushes the buffer, and exits 0
   when the buffer is empty), then start this build. There is no conversion.

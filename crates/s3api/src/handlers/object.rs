@@ -227,7 +227,8 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         return xml_reply(xml::list_parts(&bucket, &key, upload_id, &parts));
     }
 
-    only(&params, &[])?;
+    only(&params, RESPONSE_KEYS)?;
+    let overrides = response_headers(&params)?;
     check_conditions(&headers)?;
     // The head decides the preconditions and the range; the read must return the same object.
     loop {
@@ -252,7 +253,7 @@ pub(crate) async fn object_get<R: Remote + 'static>(
         let length = range
             .as_ref()
             .map_or(info.size, |range| range.end - range.start);
-        let mut builder = object_headers(reply(StatusCode::OK), &reader.info)
+        let mut builder = object_headers(reply(StatusCode::OK), &reader.info, &overrides)
             .header("content-length", length.to_string());
         if let Some(range) = range {
             builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
@@ -273,8 +274,9 @@ pub(crate) async fn object_head<R: Remote + 'static>(
     Query(params): Params,
     headers: HeaderMap,
 ) -> Reply {
-    only(&params, &[])?;
+    only(&params, RESPONSE_KEYS)?;
     only_read_headers(&headers)?;
+    let overrides = response_headers(&params)?;
     check_conditions(&headers)?;
     let info = state.engine.head(&bucket, &key).await?;
     match precondition(&headers, &info) {
@@ -283,7 +285,7 @@ pub(crate) async fn object_head<R: Remote + 'static>(
         Precondition::Proceed => {}
     }
 
-    Ok(object_headers(reply(StatusCode::OK), &info)
+    Ok(object_headers(reply(StatusCode::OK), &info, &overrides)
         .header("content-length", info.size.to_string())
         .body(Body::empty())
         .expect("object headers are valid"))

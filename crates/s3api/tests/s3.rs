@@ -2024,6 +2024,8 @@ struct Presign {
     access: String,
     secret: String,
     host: &'static str,
+    /// Query parameters signed with the presigned ones.
+    extra: String,
 }
 
 impl Presign {
@@ -2036,6 +2038,7 @@ impl Presign {
             access: ACCESS.into(),
             secret: SECRET.into(),
             host: "localhost",
+            extra: String::new(),
         }
     }
 
@@ -2051,6 +2054,10 @@ impl Presign {
             encode(&credential),
             encode(&self.expires),
         );
+        let query = match self.extra.is_empty() {
+            true => query,
+            false => format!("{}&{query}", self.extra),
+        };
         let headers = [("host".to_string(), self.host.to_string())];
         let canonical = sigv4::canonical_request(
             self.method,
@@ -2081,6 +2088,66 @@ async fn send_raw(server: &Server, method: &str, uri: &str, host: &str, body: &s
 async fn presigned(server: &Server, sign: &Presign, method: &str, path: &str) -> Reply {
     let uri = format!("{path}?{}", sign.query());
     send_raw(server, method, &uri, "localhost", "").await
+}
+
+#[tokio::test]
+async fn test_response_parameters_set_the_headers_of_get_and_head() {
+    let server = with_bucket().await;
+    let stored = call("PUT", "/bkt/k")
+        .header("content-type", "text/plain")
+        .body("data");
+    run(&server, stored).await;
+    let query = "response-content-type=text%2Fcsv&response-content-disposition=attachment%3B%20\
+                 filename%3D%22a.csv%22&response-cache-control=no-store&response-expires=0\
+                 &response-content-language=fr&response-content-encoding=identity";
+
+    for method in ["GET", "HEAD"] {
+        let reply = run(&server, call(method, &format!("/bkt/k?{query}"))).await;
+        let header = |name: &str| reply.headers[name].to_str().unwrap().to_string();
+        assert_eq!(reply.status, StatusCode::OK, "{method}");
+        assert_eq!(header("content-type"), "text/csv");
+        assert_eq!(
+            header("content-disposition"),
+            "attachment; filename=\"a.csv\""
+        );
+        assert_eq!(header("cache-control"), "no-store");
+        assert_eq!(header("expires"), "0");
+        assert_eq!(header("content-language"), "fr");
+        assert_eq!(header("content-encoding"), "identity");
+    }
+    let plain = run(&server, call("GET", "/bkt/k")).await;
+    assert_eq!(plain.headers["content-type"], "text/plain");
+}
+
+#[tokio::test]
+async fn test_response_parameter_that_is_no_header_value_is_refused() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+
+    let reply = run(
+        &server,
+        call("GET", "/bkt/k?response-content-disposition=a%0Ab"),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.xml("Code").unwrap(), "InvalidArgument");
+}
+
+#[tokio::test]
+async fn test_presigned_get_sets_the_signed_content_disposition() {
+    let server = with_bucket().await;
+    put(&server, "k", "data").await;
+    let sign = Presign {
+        extra: "response-content-disposition=attachment".into(),
+        ..Presign::new("GET", "/bkt/k")
+    };
+
+    let reply = presigned(&server, &sign, "GET", "/bkt/k").await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.headers["content-disposition"], "attachment");
+    assert_eq!(reply.text(), "data");
 }
 
 #[tokio::test]

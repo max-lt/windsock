@@ -57,6 +57,32 @@ const LIST_KEYS: &[&str] = &[
 /// The query keys of UploadPart and UploadPartCopy.
 const PART_KEYS: &[&str] = &["uploadId", "partNumber"];
 
+/// The query keys of GetObject and HeadObject: each one sets the header named after `response-`.
+const RESPONSE_KEYS: &[&str] = &[
+    "response-cache-control",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-content-type",
+    "response-expires",
+];
+
+/// The headers that the `response-*` query keys set in place of the stored ones.
+fn response_headers(
+    params: &BTreeMap<String, String>,
+) -> Result<Vec<(HeaderName, HeaderValue)>, S3Error> {
+    RESPONSE_KEYS
+        .iter()
+        .filter_map(|key| Some((*key, params.get(*key)?)))
+        .map(|(key, value)| {
+            let value = HeaderValue::from_str(value).map_err(|_| {
+                S3Error::invalid_argument(format!("{key} is not a valid header value"))
+            })?;
+            Ok((HeaderName::from_static(&key["response-".len()..]), value))
+        })
+        .collect()
+}
+
 /// How long the first piece of a GET waits for room in the read budget before a 503.
 const FIRST_PIECE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_KEYS: usize = 1000;
@@ -170,10 +196,11 @@ fn metadata(headers: &HeaderMap) -> Result<BTreeMap<String, String>, S3Error> {
     Ok(stored)
 }
 
-/// ETag, Last-Modified, Content-Type and the stored metadata of an object.
+/// ETag, Last-Modified, Content-Type and the stored metadata of an object, then `overrides`.
 fn object_headers(
     mut builder: axum::http::response::Builder,
     info: &ObjectInfo,
+    overrides: &[(HeaderName, HeaderValue)],
 ) -> axum::http::response::Builder {
     builder = builder
         .header("etag", xml::quoted(&etag(info)))
@@ -194,6 +221,10 @@ fn object_headers(
         }
     }
 
+    let headers = builder.headers_mut().expect("object headers are valid");
+    for (name, value) in overrides {
+        headers.insert(name, value.clone());
+    }
     builder
 }
 

@@ -93,6 +93,32 @@ fn only(params: &BTreeMap<String, String>, read: &[&str]) -> Result<(), S3Error>
     }
 }
 
+/// Object request headers that change what S3 does, and that Windsock does not read.
+const UNREAD_HEADERS: &[&str] = &["x-amz-write-offset-bytes", "x-amz-tagging"];
+
+/// The prefixes of the same kind of headers.
+const UNREAD_HEADER_PREFIXES: &[&str] = &[
+    "x-amz-server-side-encryption-customer-",
+    "x-amz-copy-source-server-side-encryption-customer-",
+    "x-amz-object-lock-",
+];
+
+/// 501 for an object request header that Windsock does not read: a 2xx would hide what S3 does.
+fn only_read_headers(headers: &HeaderMap) -> Result<(), S3Error> {
+    let unread = headers.keys().map(HeaderName::as_str).find(|name| {
+        UNREAD_HEADERS.contains(name)
+            || UNREAD_HEADER_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    });
+    match unread {
+        Some(name) => Err(S3Error::not_implemented(format!(
+            "the header {name} is not supported"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }

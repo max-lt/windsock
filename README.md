@@ -304,6 +304,10 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
 - Each operation reads a fixed set of query parameters. Any other parameter gets
   `501 NotImplemented`, so a request that S3 reads in another way never gets a 2xx. Each request
   can also carry the presigned URL parameters and `x-id`, which AWS SDKs add.
+- An object request with SSE-C (`x-amz-server-side-encryption-customer-*`), object lock
+  (`x-amz-object-lock-*`), `x-amz-write-offset-bytes` or `x-amz-tagging` gets
+  `501 NotImplemented`. So does a CreateBucket with `x-amz-bucket-object-lock-enabled` other than
+  `false`.
 - This build writes buffer records of format 3. It refuses at start a buffer of format 2, from an
   earlier build. Start the earlier build, stop it with SIGTERM (it flushes the buffer, and exits 0
   when the buffer is empty), then start this build. There is no conversion.

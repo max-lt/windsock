@@ -16,6 +16,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
 ) -> Reply {
     let part = params.get("uploadId").zip(params.get("partNumber"));
     only(&params, if part.is_some() { PART_KEYS } else { &[] })?;
+    only_read_headers(&headers)?;
     check_copy_headers(&headers)?;
     if let Some(Extension(streamed)) = streamed {
         if let Some((upload_id, number)) = part {
@@ -219,6 +220,7 @@ pub(crate) async fn object_get<R: Remote + 'static>(
     Query(params): Params,
     headers: HeaderMap,
 ) -> Reply {
+    only_read_headers(&headers)?;
     if let Some(upload_id) = params.get("uploadId") {
         only(&params, &["uploadId"])?;
         let parts = state.uploads.parts(upload_id, &bucket, &key).await?;
@@ -272,6 +274,7 @@ pub(crate) async fn object_head<R: Remote + 'static>(
     headers: HeaderMap,
 ) -> Reply {
     only(&params, &[])?;
+    only_read_headers(&headers)?;
     check_conditions(&headers)?;
     let info = state.engine.head(&bucket, &key).await?;
     match precondition(&headers, &info) {
@@ -359,6 +362,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
+    only_read_headers(&headers)?;
     if params.contains_key("uploads") {
         only(&params, &["uploads"])?;
         state.engine.bucket(&bucket).await?;

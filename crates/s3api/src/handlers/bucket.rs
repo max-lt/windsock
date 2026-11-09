@@ -28,8 +28,12 @@ pub(crate) async fn bucket_put<R: Remote + 'static>(
     Extension(caller): Extension<Caller>,
     Path(bucket): Path<String>,
     Query(params): Params,
+    headers: HeaderMap,
 ) -> Reply {
     only(&params, &[])?;
+    if header(&headers, "x-amz-bucket-object-lock-enabled").is_some_and(|v| v != "false") {
+        return Err(S3Error::not_implemented("object lock is not supported"));
+    }
     state.engine.create_bucket(&bucket, Some(caller.0)).await?;
     info!(bucket, "create bucket");
     Ok(reply(StatusCode::OK)

@@ -875,6 +875,67 @@ async fn test_sdk_operation_name_in_the_query_is_accepted() {
     assert_eq!(read.text(), "v");
 }
 
+#[tokio::test]
+async fn test_unread_write_header_is_not_implemented() {
+    let server = with_bucket().await;
+    put(&server, "k", "v").await;
+
+    for (name, value) in [
+        ("x-amz-write-offset-bytes", "1"),
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-object-lock-mode", "COMPLIANCE"),
+        ("x-amz-object-lock-legal-hold", "ON"),
+        ("x-amz-tagging", "a=b"),
+    ] {
+        let reply = run(&server, call("PUT", "/bkt/k").header(name, value).body("w")).await;
+        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{name}");
+    }
+    let copy = call("PUT", "/bkt/c")
+        .header("x-amz-copy-source", "/bkt/k")
+        .header("x-amz-tagging", "a=b");
+    let upload = call("POST", "/bkt/m?uploads").header("x-amz-object-lock-mode", "GOVERNANCE");
+    let read =
+        call("GET", "/bkt/k").header("x-amz-server-side-encryption-customer-algorithm", "AES256");
+
+    assert_eq!(run(&server, copy).await.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        run(&server, upload).await.status,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_eq!(run(&server, read).await.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(run(&server, call("GET", "/bkt/k")).await.text(), "v");
+}
+
+#[tokio::test]
+async fn test_copy_with_a_tagging_directive_is_accepted() {
+    let server = with_bucket().await;
+    put(&server, "k", "v").await;
+
+    let copy = call("PUT", "/bkt/c")
+        .header("x-amz-copy-source", "/bkt/k")
+        .header("x-amz-tagging-directive", "COPY");
+
+    assert_eq!(run(&server, copy).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_bucket_with_object_lock_is_not_implemented() {
+    let server = server().await;
+
+    let locked = call("PUT", "/locked").header("x-amz-bucket-object-lock-enabled", "true");
+    let unlocked = call("PUT", "/plain").header("x-amz-bucket-object-lock-enabled", "false");
+
+    assert_eq!(
+        run(&server, locked).await.status,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_eq!(run(&server, unlocked).await.status, StatusCode::OK);
+    assert_eq!(
+        run(&server, call("HEAD", "/locked")).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
 // ----------------------------------------------------------------------
 // Listing
 // ----------------------------------------------------------------------

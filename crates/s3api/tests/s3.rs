@@ -2120,6 +2120,20 @@ async fn test_response_parameters_set_the_headers_of_get_and_head() {
 }
 
 #[tokio::test]
+async fn test_head_answers_the_range_as_get_does() {
+    let server = with_bucket().await;
+    put(&server, "k", "0123456789").await;
+
+    let part = run(&server, call("HEAD", "/bkt/k").header("range", "bytes=2-5")).await;
+    let outside = run(&server, call("HEAD", "/bkt/k").header("range", "bytes=20-")).await;
+
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.headers["content-range"], "bytes 2-5/10");
+    assert_eq!(part.headers["content-length"], "4");
+    assert_eq!(outside.status, StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[tokio::test]
 async fn test_response_parameter_that_is_no_header_value_is_refused() {
     let server = with_bucket().await;
     put(&server, "k", "data").await;

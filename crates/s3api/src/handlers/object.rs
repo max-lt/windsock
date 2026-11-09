@@ -250,19 +250,8 @@ pub(crate) async fn object_get<R: Remote + 'static>(
             continue;
         }
 
-        let length = range
-            .as_ref()
-            .map_or(info.size, |range| range.end - range.start);
-        let mut builder = object_headers(reply(StatusCode::OK), &reader.info, &overrides)
-            .header("content-length", length.to_string());
-        if let Some(range) = range {
-            builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
-                "content-range",
-                format!("bytes {}-{}/{}", range.start, range.end - 1, info.size),
-            );
-        }
-
-        return Ok(builder
+        let builder = object_headers(reply(StatusCode::OK), &reader.info, &overrides);
+        return Ok(sized(builder, range, info.size)
             .body(object_body(state.engine.clone(), reader, room, bucket, key))
             .expect("object headers are valid"));
     }
@@ -285,10 +274,29 @@ pub(crate) async fn object_head<R: Remote + 'static>(
         Precondition::Proceed => {}
     }
 
-    Ok(object_headers(reply(StatusCode::OK), &info, &overrides)
-        .header("content-length", info.size.to_string())
+    let range = byte_range(&headers, info.size)?;
+    let builder = object_headers(reply(StatusCode::OK), &info, &overrides);
+    Ok(sized(builder, range, info.size)
         .body(Body::empty())
         .expect("object headers are valid"))
+}
+
+/// Content-Length, and with a range the status 206 and Content-Range.
+fn sized(
+    builder: axum::http::response::Builder,
+    range: Option<Range<u64>>,
+    size: u64,
+) -> axum::http::response::Builder {
+    let Some(range) = range else {
+        return builder.header("content-length", size.to_string());
+    };
+    builder
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header("content-length", (range.end - range.start).to_string())
+        .header(
+            "content-range",
+            format!("bytes {}-{}/{size}", range.start, range.end - 1),
+        )
 }
 
 pub(crate) async fn object_delete<R: Remote + 'static>(

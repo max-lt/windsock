@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::multipart::{Claim, PartWriter};
 use crate::xml::{self, ListPage, ListedObject};
-use crate::{AppState, Caller, S3Error, StreamedBody};
+use crate::{AppState, Caller, S3Error, StreamedBody, presign};
 use s3proto::time::http_date;
 
 type Reply = Result<axum::response::Response, S3Error>;
@@ -42,41 +42,20 @@ const STORED_HEADERS: &[&str] = &[
     "expires",
 ];
 
-/// Bucket sub-resources that Windsock does not implement.
-const BUCKET_UNSUPPORTED: &[&str] = &[
-    "accelerate",
-    "acl",
-    "analytics",
-    "cors",
-    "encryption",
-    "intelligent-tiering",
-    "inventory",
-    "lifecycle",
-    "logging",
-    "metrics",
-    "notification",
-    "object-lock",
-    "ownershipControls",
-    "policy",
-    "publicAccessBlock",
-    "replication",
-    "requestPayment",
-    "tagging",
-    "versions",
-    "website",
+/// The query keys of ListObjects and ListObjectsV2.
+const LIST_KEYS: &[&str] = &[
+    "list-type",
+    "prefix",
+    "delimiter",
+    "max-keys",
+    "encoding-type",
+    "continuation-token",
+    "start-after",
+    "marker",
 ];
 
-/// Object sub-resources that Windsock does not implement.
-const OBJECT_UNSUPPORTED: &[&str] = &[
-    "acl",
-    "attributes",
-    "legal-hold",
-    "restore",
-    "retention",
-    "select",
-    "tagging",
-    "torrent",
-];
+/// The query keys of UploadPart and UploadPartCopy.
+const PART_KEYS: &[&str] = &["uploadId", "partNumber"];
 
 /// How long the first piece of a GET waits for room in the read budget before a 503.
 const FIRST_PIECE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -100,12 +79,16 @@ fn xml_reply(body: String) -> Reply {
         .expect("static headers are valid"))
 }
 
-fn reject_unsupported(
-    params: &BTreeMap<String, String>,
-    unsupported: &[&str],
-) -> Result<(), S3Error> {
-    match unsupported.iter().find(|op| params.contains_key(**op)) {
-        Some(op) => Err(S3Error::not_implemented(format!("'{op}' is not supported"))),
+/// 501 for a query key that the operation does not read: a 2xx would hide what S3 does with it.
+fn only(params: &BTreeMap<String, String>, read: &[&str]) -> Result<(), S3Error> {
+    // The authentication checked the presigned parameters; AWS SDKs add x-id.
+    let unread = params.keys().find(|key| {
+        !read.contains(&key.as_str()) && key.as_str() != "x-id" && !presign::is_parameter(key)
+    });
+    match unread {
+        Some(key) => Err(S3Error::not_implemented(format!(
+            "'{key}' is not supported"
+        ))),
         None => Ok(()),
     }
 }

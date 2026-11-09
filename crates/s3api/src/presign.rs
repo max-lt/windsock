@@ -46,6 +46,10 @@ fn malformed(message: impl Into<String>) -> S3Error {
     )
 }
 
+pub(crate) fn is_parameter(key: &str) -> bool {
+    REQUIRED.contains(&key)
+}
+
 /// True when the query carries one of the presigned parameters, in any case and any encoding:
 /// then a missing one is an error, not a request with no authentication.
 pub(crate) fn is_presigned(query: Option<&str>) -> bool {

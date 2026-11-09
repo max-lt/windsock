@@ -14,11 +14,11 @@ pub(crate) async fn object_put<R: Remote + 'static>(
     headers: HeaderMap,
     body: Body,
 ) -> Reply {
-    reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
+    let part = params.get("uploadId").zip(params.get("partNumber"));
+    only(&params, if part.is_some() { PART_KEYS } else { &[] })?;
     check_copy_headers(&headers)?;
     if let Some(Extension(streamed)) = streamed {
-        if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber"))
-        {
+        if let Some((upload_id, number)) = part {
             let part = (upload_id.as_str(), number.as_str());
             let etag = streamed_part(&state, (&bucket, &key), part, body, streamed).await?;
             return Ok(reply(StatusCode::OK)
@@ -44,7 +44,7 @@ pub(crate) async fn object_put<R: Remote + 'static>(
     })?;
 
     // Every other upload part streams: here only a part copy comes.
-    if let (Some(upload_id), Some(number)) = (params.get("uploadId"), params.get("partNumber")) {
+    if let Some((upload_id, number)) = part {
         let source = header(&headers, "x-amz-copy-source")
             .ok_or_else(|| S3Error::invalid_argument("a part with no body stream is a copy"))?;
         let part = (upload_id.as_str(), number.as_str());
@@ -219,13 +219,13 @@ pub(crate) async fn object_get<R: Remote + 'static>(
     Query(params): Params,
     headers: HeaderMap,
 ) -> Reply {
-    reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
-
     if let Some(upload_id) = params.get("uploadId") {
+        only(&params, &["uploadId"])?;
         let parts = state.uploads.parts(upload_id, &bucket, &key).await?;
         return xml_reply(xml::list_parts(&bucket, &key, upload_id, &parts));
     }
 
+    only(&params, &[])?;
     check_conditions(&headers)?;
     // The head decides the preconditions and the range; the read must return the same object.
     loop {
@@ -268,8 +268,10 @@ pub(crate) async fn object_get<R: Remote + 'static>(
 pub(crate) async fn object_head<R: Remote + 'static>(
     State(state): State<AppState<R>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Params,
     headers: HeaderMap,
 ) -> Reply {
+    only(&params, &[])?;
     check_conditions(&headers)?;
     let info = state.engine.head(&bucket, &key).await?;
     match precondition(&headers, &info) {
@@ -289,13 +291,13 @@ pub(crate) async fn object_delete<R: Remote + 'static>(
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Params,
 ) -> Reply {
-    reject_unsupported(&params, OBJECT_UNSUPPORTED)?;
-
     if let Some(upload_id) = params.get("uploadId") {
+        only(&params, &["uploadId"])?;
         state.uploads.abort(upload_id, &bucket, &key).await?;
         return empty(StatusCode::NO_CONTENT);
     }
 
+    only(&params, &[])?;
     state.engine.delete(&bucket, &key).await?;
     empty(StatusCode::NO_CONTENT)
 }
@@ -358,6 +360,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
     body: Bytes,
 ) -> Reply {
     if params.contains_key("uploads") {
+        only(&params, &["uploads"])?;
         state.engine.bucket(&bucket).await?;
         let upload_id = state
             .uploads
@@ -372,6 +375,7 @@ pub(crate) async fn object_post<R: Remote + 'static>(
             "this POST on an object is not supported",
         ));
     };
+    only(&params, &["uploadId"])?;
 
     let mode = write_mode(&headers)?;
     let requested = xml::parse_complete(&body)?;

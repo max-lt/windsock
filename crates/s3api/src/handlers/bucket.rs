@@ -9,7 +9,9 @@ use crate::list::After;
 pub(crate) async fn list_buckets<R: Remote + 'static>(
     State(state): State<AppState<R>>,
     Extension(Caller(access_key, grants)): Extension<Caller>,
+    Query(params): Params,
 ) -> Reply {
+    only(&params, &[])?;
     let mut buckets = state.engine.list_buckets().await?;
     buckets.retain(|bucket| {
         let owner = match bucket.owner.as_deref() == Some(access_key.as_str()) {
@@ -27,11 +29,7 @@ pub(crate) async fn bucket_put<R: Remote + 'static>(
     Path(bucket): Path<String>,
     Query(params): Params,
 ) -> Reply {
-    reject_unsupported(&params, BUCKET_UNSUPPORTED)?;
-    if params.contains_key("versioning") {
-        return Err(S3Error::not_implemented("versioning cannot be enabled"));
-    }
-
+    only(&params, &[])?;
     state.engine.create_bucket(&bucket, Some(caller.0)).await?;
     info!(bucket, "create bucket");
     Ok(reply(StatusCode::OK)
@@ -45,7 +43,7 @@ pub(crate) async fn bucket_delete<R: Remote + 'static>(
     Path(bucket): Path<String>,
     Query(params): Params,
 ) -> Reply {
-    reject_unsupported(&params, BUCKET_UNSUPPORTED)?;
+    only(&params, &[])?;
     state.engine.delete_bucket(&bucket).await?;
     info!(bucket, "delete bucket");
     empty(StatusCode::NO_CONTENT)
@@ -54,7 +52,9 @@ pub(crate) async fn bucket_delete<R: Remote + 'static>(
 pub(crate) async fn bucket_head<R: Remote + 'static>(
     State(state): State<AppState<R>>,
     Path(bucket): Path<String>,
+    Query(params): Params,
 ) -> Reply {
+    only(&params, &[])?;
     state.engine.bucket(&bucket).await?;
     empty(StatusCode::OK)
 }
@@ -64,21 +64,24 @@ pub(crate) async fn bucket_get<R: Remote + 'static>(
     Path(bucket): Path<String>,
     Query(params): Params,
 ) -> Reply {
-    reject_unsupported(&params, BUCKET_UNSUPPORTED)?;
+    let sub = ["versioning", "location", "uploads"]
+        .into_iter()
+        .find(|name| params.contains_key(*name));
+    match sub {
+        Some(name) => only(&params, &[name])?,
+        None => only(&params, LIST_KEYS)?,
+    }
     state.engine.bucket(&bucket).await?;
 
-    if params.contains_key("versioning") {
-        return xml_reply(xml::versioning());
+    match sub {
+        Some("versioning") => xml_reply(xml::versioning()),
+        Some("location") => xml_reply(xml::location()),
+        Some(_) => {
+            let uploads = state.uploads.list(&bucket).await?;
+            xml_reply(xml::list_uploads(&bucket, &uploads))
+        }
+        None => list_objects(&state, &bucket, &params).await,
     }
-    if params.contains_key("location") {
-        return xml_reply(xml::location());
-    }
-    if params.contains_key("uploads") {
-        let uploads = state.uploads.list(&bucket).await?;
-        return xml_reply(xml::list_uploads(&bucket, &uploads));
-    }
-
-    list_objects(&state, &bucket, &params).await
 }
 
 /// ListObjectsV2 with `list-type=2`, ListObjects (v1) without.
@@ -189,6 +192,7 @@ pub(crate) async fn bucket_post<R: Remote + 'static>(
             "this POST on a bucket is not supported",
         ));
     }
+    only(&params, &["delete"])?;
 
     state.engine.bucket(&bucket).await?;
     let (keys, quiet) = xml::parse_delete(&body)?;

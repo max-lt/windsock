@@ -301,6 +301,9 @@ The log goes to standard error. Set `RUST_LOG=debug` for more detail.
   stays possible across proxies. The check costs one manifest read when the manifest is not in
   the index, done outside the buffer lock.
 - Object tags, bucket lifecycle rules and ACLs are not supported.
+- Each operation reads a fixed set of query parameters. Any other parameter gets
+  `501 NotImplemented`, so a request that S3 reads in another way never gets a 2xx. Each request
+  can also carry the presigned URL parameters and `x-id`, which AWS SDKs add.
 - This build writes buffer records of format 3. It refuses at start a buffer of format 2, from an
   earlier build. Start the earlier build, stop it with SIGTERM (it flushes the buffer, and exits 0
   when the buffer is empty), then start this build. There is no conversion.

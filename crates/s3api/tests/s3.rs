@@ -806,6 +806,75 @@ async fn test_unsupported_sub_resource_is_not_implemented() {
     );
 }
 
+#[tokio::test]
+async fn test_write_with_an_unread_query_key_is_not_implemented() {
+    let server = with_bucket().await;
+    put(&server, "k", "v").await;
+
+    for uri in [
+        "/bkt/k?renameObject",
+        "/bkt/k?partNumber=1",
+        "/bkt/k?uploadId=x",
+    ] {
+        let reply = run(&server, call("PUT", uri).body("other")).await;
+        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+    }
+    let deleted = run(&server, call("DELETE", "/bkt/k?versionId=x")).await;
+    let kept = run(&server, call("GET", "/bkt/k")).await;
+
+    assert_eq!(deleted.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(kept.text(), "v");
+}
+
+#[tokio::test]
+async fn test_bucket_delete_with_an_unread_query_key_is_not_implemented() {
+    let server = with_bucket().await;
+
+    for uri in ["/bkt?metadataTable", "/bkt?metadataConfiguration"] {
+        let reply = run(&server, call("DELETE", uri)).await;
+        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+    }
+
+    assert_eq!(
+        run(&server, call("HEAD", "/bkt")).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn test_read_with_an_unread_query_key_is_not_implemented() {
+    let server = with_bucket().await;
+    put(&server, "k", "v").await;
+
+    for (method, uri) in [
+        ("GET", "/bkt/k?versionId=x"),
+        ("HEAD", "/bkt/k?versionId=x"),
+        ("GET", "/bkt/k?partNumber=1"),
+        ("HEAD", "/bkt/k?partNumber=1"),
+        ("GET", "/bkt?policyStatus"),
+        ("GET", "/bkt?metadataTable"),
+        ("GET", "/bkt?list-type=2&fetch-owner=true"),
+        ("GET", "/bkt?uploads&prefix=a"),
+        ("HEAD", "/bkt?acl"),
+        ("PUT", "/bkt?abac"),
+        ("GET", "/?prefix=a"),
+    ] {
+        let reply = run(&server, call(method, uri)).await;
+        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn test_sdk_operation_name_in_the_query_is_accepted() {
+    let server = with_bucket().await;
+
+    let written = run(&server, call("PUT", "/bkt/k?x-id=PutObject").body("v")).await;
+    let read = run(&server, call("GET", "/bkt/k?x-id=GetObject")).await;
+
+    assert_eq!(written.status, StatusCode::OK);
+    assert_eq!(read.text(), "v");
+}
+
 // ----------------------------------------------------------------------
 // Listing
 // ----------------------------------------------------------------------
